@@ -412,12 +412,15 @@ function App() {
   const [mutationError, setMutationError] = useState<string | null>(null)
   const [streamAtBottom, setStreamAtBottom] = useState(true)
   const streamRef = useRef<VirtuosoHandle>(null)
+  const initialTaskSelected = useRef(false)
 
   useEffect(() => {
-    if (snapshot && selectedTaskId === 'all' && snapshot.tasks.length === 1) {
+    if (!snapshot || initialTaskSelected.current) return
+    initialTaskSelected.current = true
+    if (snapshot.tasks.length === 1) {
       setSelectedTaskId(text(snapshot.tasks[0]?.['id'], 'all'))
     }
-  }, [selectedTaskId, snapshot])
+  }, [snapshot])
 
   useEffect(() => setStreamAtBottom(true), [selectedTaskId])
 
