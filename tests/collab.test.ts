@@ -7,6 +7,7 @@ import test from 'node:test';
 import { initializeDatabase, openDatabase } from '../collab/database.js';
 import { GitError, GitRepository } from '../collab/git.js';
 import { CollaborationError, CollaborationService } from '../collab/service.js';
+import { createCollaborationHttpServer } from '../collab/http.js';
 
 function git(path: string, args: string[]): string {
   return execFileSync('git', ['-C', path, ...args], { encoding: 'utf8' }).trim();
@@ -462,6 +463,84 @@ test('sync returns actionable durable state and never leaks sealed proposals', (
       'Restart recovery needs a focused test.',
     ]);
   } finally {
+    close();
+  }
+});
+
+test('snapshot is side-effect free, decodes JSON, and redacts sealed proposal content', () => {
+  const { service, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-SNAPSHOT', goal: 'Expose canonical state', acceptance: ['no side effects'], actor: 'human' });
+    service.submitProposal({ taskId: 'TASK-SNAPSHOT', agent: 'grok', content: 'Keep this sealed.' });
+    const before = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    const after = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    assert.deepEqual(before['tasks']?.[0]?.['acceptance'], ['no side effects']);
+    assert.equal(before['tasks']?.[0]?.['acceptance_json'], undefined);
+    assert.equal(before['proposals']?.[0]?.['content'], undefined);
+    assert.equal(before['proposals']?.[0]?.['visibility'], 'sealed');
+    assert.deepEqual(after, before);
+    assert.equal(after['agents']?.find((agent) => agent['id'] === 'human')?.['last_seen_at'], null);
+
+    service.revealProposals('TASK-SNAPSHOT', 'human');
+    const revealed = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    assert.equal(revealed['proposals']?.[0]?.['content'], 'Keep this sealed.');
+  } finally {
+    close();
+  }
+});
+
+test('HTTP bridge exposes snapshots and delegates human mutations to the service', async () => {
+  const { service, close } = harness();
+  const server = createCollaborationHttpServer(service);
+  try {
+    service.createTask({ id: 'TASK-HTTP', goal: 'Expose the service', acceptance: [], actor: 'human' });
+    service.submitProposal({ taskId: 'TASK-HTTP', agent: 'claude', content: 'Reveal through the service.' });
+    const decision = service.proposeDecision({
+      taskId: 'TASK-HTTP',
+      actor: 'codex',
+      statement: 'Keep HTTP thin.',
+      rationale: 'The service owns authority.',
+    });
+    await new Promise<void>((resolveListening) => server.listen(0, '127.0.0.1', resolveListening));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const origin = `http://127.0.0.1:${address.port}`;
+
+    const initialResponse = await fetch(`${origin}/api/snapshot`);
+    const initial = (await initialResponse.json()) as Record<string, Array<Record<string, unknown>>>;
+    assert.equal(initialResponse.status, 200);
+    assert.equal(initial['proposals']?.[0]?.['content'], undefined);
+
+    const rejectedOrigin = await fetch(`${origin}/api/tasks/TASK-HTTP/reveal-proposals`, {
+      method: 'POST',
+      headers: { origin: 'https://example.invalid' },
+    });
+    assert.equal(rejectedOrigin.status, 403);
+
+    const revealResponse = await fetch(`${origin}/api/tasks/TASK-HTTP/reveal-proposals`, {
+      method: 'POST',
+      headers: { origin },
+    });
+    const revealed = (await revealResponse.json()) as Record<string, Array<Record<string, unknown>>>;
+    assert.equal(revealResponse.status, 200);
+    assert.equal(revealed['proposals']?.[0]?.['content'], 'Reveal through the service.');
+
+    const acceptResponse = await fetch(`${origin}/api/decisions/${String(decision['id'])}/accept`, {
+      method: 'POST',
+      headers: { origin },
+    });
+    const accepted = (await acceptResponse.json()) as Record<string, Array<Record<string, unknown>>>;
+    assert.equal(acceptResponse.status, 200);
+    assert.equal(accepted['decisions']?.[0]?.['status'], 'accepted');
+
+    const invalidAccept = await fetch(`${origin}/api/tasks/TASK-HTTP/accept`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin },
+      body: JSON.stringify({}),
+    });
+    assert.equal(invalidAccept.status, 400);
+  } finally {
+    await new Promise<void>((resolveClosed) => server.close(() => resolveClosed()));
     close();
   }
 });

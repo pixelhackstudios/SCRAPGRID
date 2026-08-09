@@ -99,6 +99,49 @@ export class CollaborationService {
     return { project, repository, agents: this.listAgents(), tasks, active_leases: activeLeases, worktrees };
   }
 
+  snapshot(): JsonObject {
+    const project = this.db.prepare('SELECT status, version, updated_at FROM project_state WHERE singleton = 1').get() as Row;
+    const repository = this.db.prepare('SELECT * FROM project_repository WHERE singleton = 1').get() as Row;
+    const tasks = (this.db.prepare('SELECT * FROM tasks ORDER BY created_at').all() as Row[]).map((task) => {
+      const { acceptance_json: storedAcceptance, ...plainTask } = task;
+      return { ...plainTask, acceptance: parseJsonOrNull(storedAcceptance) };
+    });
+    const proposals = (this.db.prepare('SELECT * FROM proposals ORDER BY created_at').all() as Row[]).map(
+      (proposal) => {
+        if (proposal['visibility'] === 'revealed') return proposal;
+        const { content: _sealedContent, ...sealedProposal } = proposal;
+        return sealedProposal;
+      },
+    );
+    const verifications = (
+      this.db.prepare('SELECT * FROM verifications ORDER BY created_at').all() as Row[]
+    ).map((verification) => {
+      const { command: _legacyCommand, command_argv_json: storedCommand, ...plainVerification } = verification;
+      return { ...plainVerification, command_argv: parseJsonOrNull(storedCommand) };
+    });
+    const events = (this.db.prepare('SELECT * FROM events ORDER BY id').all() as Row[]).map((event) => ({
+      ...event,
+      payload: parseJsonOrNull(event['payload']),
+    }));
+
+    return {
+      project,
+      repository,
+      agents: this.listAgents(),
+      tasks,
+      leases: this.db.prepare('SELECT * FROM leases ORDER BY acquired_at').all() as Row[],
+      worktrees: this.db.prepare('SELECT * FROM managed_worktrees ORDER BY agent_id').all() as Row[],
+      messages: this.db.prepare('SELECT * FROM messages ORDER BY created_at').all() as Row[],
+      proposals,
+      decisions: this.db.prepare('SELECT * FROM decisions ORDER BY created_at').all() as Row[],
+      blockers: this.db.prepare('SELECT * FROM blockers ORDER BY created_at').all() as Row[],
+      reviews: this.db.prepare('SELECT * FROM reviews ORDER BY created_at').all() as Row[],
+      findings: this.db.prepare('SELECT * FROM review_findings ORDER BY created_at').all() as Row[],
+      verifications,
+      events,
+    };
+  }
+
   sync(agentId: string, afterEvent = 0): JsonObject {
     this.requireAgent(agentId);
     const timestamp = now();
