@@ -6,8 +6,9 @@ SCRAPGRID will prove local collaboration among Grok Build, Claude Code, and Code
 The three model agents are peers. Each receives a stable identity, its own terminal/session, and eventually its
 own Git worktree. The human project owner assigns, pauses, overrides, rejects, and accepts work.
 
-The collaboration report in `docs/Frame Work/01-AI-Colloboration-Report.md` is the architectural starting
-artifact, not gospel. Current code, direct execution evidence, and explicit human decisions can correct it.
+The collaboration report in `docs/framework-documentation/01-AI-Colloboration-Report.md` is the architectural
+starting artifact, not gospel. Current code, direct execution evidence, and explicit human decisions can correct
+it.
 
 In scope for the harness:
 
@@ -70,22 +71,32 @@ Status: first usable slice implemented.
 - Require a human actor plus approved same-candidate review and verification before acceptance.
 - Return machine-readable JSON from a universal CLI.
 
-Current limitation: commit identifiers are recorded but not yet checked against the local Git object database.
-The CLI accesses the domain service directly; a single long-running daemon does not yet serialize application
-operations.
+Current limitation: the CLI accesses the domain service directly; a single long-running daemon does not yet
+serialize application operations.
 
 Completion gate: implementation-proximate tests and a disposable CLI flow demonstrate three distinct agents,
 one implementation lease, independent review, same-candidate verification, and human acceptance.
 
 ### Phase 2 — Git and worktree integration
 
-Status: planned.
+Status: Git-truth slice implemented; ownership and recovery rules remain planned.
 
 - Validate candidate commits and verification commits with Git before recording them.
 - Record repository identity and immutable base/candidate SHAs.
+- Require every candidate commit to descend from its task's immutable base commit.
 - Bootstrap one linked worktree and branch namespace for each of `grok`, `claude`, and `codex`.
+- Run verification commands in disposable detached worktrees at the claimed SHA and record the repository,
+  normalized SHA, exact command argv as JSON, and exit code.
 - Refuse shared mutable worktree ownership and stale post-review edits.
 - Add safe recovery for expired leases without deleting agent work.
+
+Implemented boundary: repository binding, real reachable descendant validation, stable managed worktrees, and
+detached-SHA verification execution with exact argv evidence. Required-check policy, lease/worktree coupling,
+stale post-review edit handling, and expired-lease recovery remain deliberately deferred.
+
+Observed limitation: `collab verify ... -- npm test` reaches the repository test script in the detached worktree
+but exits `2` because untracked installed dependencies are unavailable there. Dependency provisioning is a
+concrete pilot prerequisite and remains deliberately unresolved in this slice.
 
 Completion gate: three terminals operate in separate worktrees against the same repository, and the gateway
 rejects an unknown SHA, a wrong-repository SHA, and evidence for an older candidate.

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
-import { spawnSync } from 'node:child_process';
-import { initializeDatabase, openDatabase } from './database.js';
+import { resolve } from 'node:path';
+import { DatabaseError, defaultDatabasePath, initializeDatabase, openDatabase } from './database.js';
+import { GitError, GitRepository } from './git.js';
 import { CollaborationError, CollaborationService } from './service.js';
 
 type Options = Record<string, string | string[]>;
@@ -65,12 +66,14 @@ function help(): void {
 
 Global option:
   --db PATH                              SQLite path (default .collab/collab.db)
+  --repo PATH                            Path inside the bound repository (default current directory)
 
 Commands:
   init
   status
   sync --agent ID [--after EVENT_ID]
   agent list
+  worktree bootstrap [--root PATH] [--base SHA]
   task create ID --goal TEXT [--acceptance TEXT ...] [--actor human]
   task claim ID --agent ID --expected-version N [--ttl 900]
   task accept ID --actor human --expected-version N
@@ -89,22 +92,37 @@ Commands:
 `);
 }
 
-function run(): void {
+async function run(): Promise<void> {
   const parsed = parseArguments(process.argv.slice(2));
+  const repository = GitRepository.discover(optional(parsed.options, 'repo'));
   const dbPath = optional(parsed.options, 'db');
-  const db = openDatabase(dbPath);
+  const db = openDatabase(dbPath ?? defaultDatabasePath(repository.binding.rootPath));
   try {
-    initializeDatabase(db);
-    const service = new CollaborationService(db);
+    initializeDatabase(db, repository.binding, repository.headCommit());
+    const service = new CollaborationService(db, repository);
     const [area, action, id] = parsed.words;
 
     if (!area || area === 'help') return help();
-    if (area === 'init') return print({ database: dbPath ?? '.collab/collab.db', agents: service.listAgents() });
+    if (area === 'init') {
+      return print({
+        database: dbPath ?? defaultDatabasePath(repository.binding.rootPath),
+        repository: repository.binding,
+        agents: service.listAgents(),
+      });
+    }
     if (area === 'status') return print(service.status());
     if (area === 'sync') {
       return print(service.sync(required(parsed.options, 'agent'), integer(parsed.options, 'after', 0)));
     }
     if (area === 'agent' && action === 'list') return print(service.listAgents());
+    if (area === 'worktree' && action === 'bootstrap') {
+      return print(
+        service.bootstrapWorktrees({
+          rootPath: optional(parsed.options, 'root') ?? resolve(repository.binding.rootPath, 'worktrees'),
+          baseCommit: optional(parsed.options, 'base') ?? repository.headCommit(),
+        }),
+      );
+    }
 
     if (area === 'task' && action === 'create' && id) {
       return print(
@@ -219,16 +237,14 @@ function run(): void {
     if (area === 'verify' && action && parsed.command.length > 0) {
       const command = parsed.command[0];
       if (!command) throw new Error('missing verification command after --');
-      const result = spawnSync(command, parsed.command.slice(1), { stdio: 'inherit', shell: false });
-      const exitCode = result.status ?? 1;
-      const record = service.recordVerification({
+      const record = await service.runVerification({
         taskId: action,
         agent: required(parsed.options, 'agent'),
         commit: required(parsed.options, 'commit'),
-        command: parsed.command.join(' '),
-        exitCode,
+        command: parsed.command,
       });
       print(record);
+      const exitCode = Number(record['exit_code']);
       if (exitCode !== 0) process.exitCode = exitCode;
       return;
     }
@@ -240,9 +256,12 @@ function run(): void {
 }
 
 try {
-  run();
+  await run();
 } catch (error) {
-  const code = error instanceof CollaborationError ? error.code : 'usage_error';
+  const code =
+    error instanceof CollaborationError || error instanceof GitError || error instanceof DatabaseError
+      ? error.code
+      : 'usage_error';
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`${JSON.stringify({ error: code, message })}\n`);
   process.exitCode = 1;

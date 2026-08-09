@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import type { RepositoryBinding } from './git.js';
 import { SCHEMA_SQL, SCHEMA_VERSION } from './schema.js';
 
 const DEFAULT_AGENTS = [
@@ -10,8 +11,18 @@ const DEFAULT_AGENTS = [
   ['codex', 'Codex', 'model'],
 ] as const;
 
-export function defaultDatabasePath(): string {
-  return resolve(process.env['COLLAB_DB'] ?? '.collab/collab.db');
+export class DatabaseError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+  ) {
+    super(message);
+    this.name = 'DatabaseError';
+  }
+}
+
+export function defaultDatabasePath(repositoryRoot = process.cwd()): string {
+  return resolve(process.env['COLLAB_DB'] ?? resolve(repositoryRoot, '.collab/collab.db'));
 }
 
 export function openDatabase(path = defaultDatabasePath()): DatabaseSync {
@@ -24,7 +35,7 @@ export function openDatabase(path = defaultDatabasePath()): DatabaseSync {
   return db;
 }
 
-export function initializeDatabase(db: DatabaseSync): void {
+export function initializeDatabase(db: DatabaseSync, repository: RepositoryBinding, baseCommit: string): void {
   const version = Number((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
   if (version > SCHEMA_VERSION) {
     throw new Error(`database schema ${version} is newer than supported schema ${SCHEMA_VERSION}`);
@@ -33,6 +44,24 @@ export function initializeDatabase(db: DatabaseSync): void {
   db.exec('BEGIN IMMEDIATE');
   try {
     db.exec(SCHEMA_SQL);
+    const taskColumns = db.prepare('PRAGMA table_info(tasks)').all() as Array<{ name: string }>;
+    if (!taskColumns.some((column) => column.name === 'repository_identity')) {
+      db.exec('ALTER TABLE tasks ADD COLUMN repository_identity TEXT');
+    }
+    if (!taskColumns.some((column) => column.name === 'base_commit')) {
+      db.exec('ALTER TABLE tasks ADD COLUMN base_commit TEXT');
+    }
+    const reviewColumns = db.prepare('PRAGMA table_info(reviews)').all() as Array<{ name: string }>;
+    if (!reviewColumns.some((column) => column.name === 'repository_identity')) {
+      db.exec('ALTER TABLE reviews ADD COLUMN repository_identity TEXT');
+    }
+    const verificationColumns = db.prepare('PRAGMA table_info(verifications)').all() as Array<{ name: string }>;
+    if (!verificationColumns.some((column) => column.name === 'repository_identity')) {
+      db.exec('ALTER TABLE verifications ADD COLUMN repository_identity TEXT');
+    }
+    if (!verificationColumns.some((column) => column.name === 'command_argv_json')) {
+      db.exec('ALTER TABLE verifications ADD COLUMN command_argv_json TEXT');
+    }
     const findingColumns = db.prepare('PRAGMA table_info(review_findings)').all() as Array<{ name: string }>;
     if (!findingColumns.some((column) => column.name === 'raised_by')) {
       db.exec('ALTER TABLE review_findings ADD COLUMN raised_by TEXT REFERENCES agents(id)');
@@ -45,6 +74,24 @@ export function initializeDatabase(db: DatabaseSync): void {
     );
     for (const agent of DEFAULT_AGENTS) insertAgent.run(...agent);
     const now = new Date().toISOString();
+    const existingRepository = db
+      .prepare('SELECT identity, common_git_dir FROM project_repository WHERE singleton = 1')
+      .get() as { identity: string; common_git_dir: string } | undefined;
+    if (existingRepository && existingRepository.identity !== repository.identity) {
+      throw new DatabaseError(
+        `collaboration database belongs to a different repository: ${existingRepository.common_git_dir}`,
+        'repository_mismatch',
+      );
+    }
+    db.prepare(
+      `INSERT OR IGNORE INTO project_repository
+       (singleton, identity, root_path, common_git_dir, object_format, bound_at)
+       VALUES (1, ?, ?, ?, ?, ?)`,
+    ).run(repository.identity, repository.rootPath, repository.commonGitDir, repository.objectFormat, now);
+    db.prepare(
+      `UPDATE tasks SET repository_identity = COALESCE(repository_identity, ?),
+         base_commit = COALESCE(base_commit, ?)`,
+    ).run(repository.identity, baseCommit);
     db.prepare(
       'INSERT OR IGNORE INTO project_state (singleton, status, version, updated_at) VALUES (1, \'active\', 1, ?)',
     ).run(now);

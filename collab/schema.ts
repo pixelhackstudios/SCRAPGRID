@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
@@ -18,6 +18,15 @@ CREATE TABLE IF NOT EXISTS project_state (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS project_repository (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  identity TEXT NOT NULL UNIQUE,
+  root_path TEXT NOT NULL,
+  common_git_dir TEXT NOT NULL,
+  object_format TEXT NOT NULL,
+  bound_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
   goal TEXT NOT NULL,
@@ -26,6 +35,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   owner_agent_id TEXT REFERENCES agents(id),
   version INTEGER NOT NULL DEFAULT 1,
   acceptance_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(acceptance_json)),
+  repository_identity TEXT NOT NULL,
+  base_commit TEXT NOT NULL,
   candidate_commit TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -85,6 +96,7 @@ CREATE TABLE IF NOT EXISTS reviews (
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   requester TEXT NOT NULL REFERENCES agents(id),
   reviewer TEXT REFERENCES agents(id),
+  repository_identity TEXT NOT NULL,
   commit_sha TEXT NOT NULL,
   verdict TEXT NOT NULL DEFAULT 'pending' CHECK (verdict IN ('pending', 'approved', 'needs_revision')),
   created_at TEXT NOT NULL,
@@ -105,11 +117,23 @@ CREATE TABLE IF NOT EXISTS review_findings (
 CREATE TABLE IF NOT EXISTS verifications (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  repository_identity TEXT NOT NULL,
   commit_sha TEXT NOT NULL,
   command TEXT NOT NULL,
+  command_argv_json TEXT NOT NULL CHECK (json_valid(command_argv_json)),
   exit_code INTEGER NOT NULL,
   runner TEXT NOT NULL REFERENCES agents(id),
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS managed_worktrees (
+  agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+  repository_identity TEXT NOT NULL,
+  branch_name TEXT NOT NULL UNIQUE,
+  worktree_path TEXT NOT NULL UNIQUE,
+  head_commit TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS events (

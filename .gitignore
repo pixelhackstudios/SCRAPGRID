@@ -15,6 +15,7 @@ dist-collab
 
 # Local collaboration state
 .collab/
+/worktrees/
 
 # Editor directories and files
 .vscode/*

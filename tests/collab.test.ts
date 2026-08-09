@@ -1,15 +1,57 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { initializeDatabase, openDatabase } from '../collab/database.js';
+import { GitError, GitRepository } from '../collab/git.js';
 import { CollaborationError, CollaborationService } from '../collab/service.js';
 
-function harness(): { service: CollaborationService; close: () => void } {
-  const db = openDatabase(':memory:');
-  initializeDatabase(db);
-  return { service: new CollaborationService(db), close: () => db.close() };
+function git(path: string, args: string[]): string {
+  return execFileSync('git', ['-C', path, ...args], { encoding: 'utf8' }).trim();
 }
 
-test('schema version 1 upgrades finding authorship and proposal uniqueness metadata', () => {
+function createRepository(): { path: string; repository: GitRepository; close: () => void } {
+  const path = mkdtempSync(join(tmpdir(), 'scrapgrid-repository-test-'));
+  git(path, ['init', '-b', 'main']);
+  git(path, ['config', 'user.name', 'SCRAPGRID Test']);
+  git(path, ['config', 'user.email', 'test@scrapgrid.invalid']);
+  writeFileSync(join(path, 'artifact.txt'), 'base\n');
+  git(path, ['add', 'artifact.txt']);
+  git(path, ['commit', '-m', 'Base artifact']);
+  return { path, repository: GitRepository.discover(path), close: () => rmSync(path, { recursive: true, force: true }) };
+}
+
+function commitArtifact(path: string, content: string): string {
+  writeFileSync(join(path, 'artifact.txt'), content);
+  git(path, ['add', 'artifact.txt']);
+  git(path, ['commit', '-m', `Artifact ${content.trim()}`]);
+  return git(path, ['rev-parse', 'HEAD']);
+}
+
+function harness(): {
+  service: CollaborationService;
+  repository: GitRepository;
+  repositoryPath: string;
+  close: () => void;
+} {
+  const fixture = createRepository();
+  const db = openDatabase(':memory:');
+  initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
+  return {
+    service: new CollaborationService(db, fixture.repository),
+    repository: fixture.repository,
+    repositoryPath: fixture.path,
+    close: () => {
+      db.close();
+      fixture.close();
+    },
+  };
+}
+
+test('schema version 1 upgrades finding authorship, repository binding, and proposal uniqueness metadata', () => {
+  const fixture = createRepository();
   const db = openDatabase(':memory:');
   try {
     db.exec(`
@@ -34,17 +76,20 @@ test('schema version 1 upgrades finding authorship and proposal uniqueness metad
       );
       PRAGMA user_version = 1;
     `);
-    initializeDatabase(db);
+    initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
     const version = db.prepare('PRAGMA user_version').get() as { user_version: number };
     const columns = db.prepare('PRAGMA table_info(review_findings)').all() as Array<{ name: string }>;
+    const verificationColumns = db.prepare('PRAGMA table_info(verifications)').all() as Array<{ name: string }>;
     const uniqueIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'proposals_task_agent_unique'")
       .get() as { name: string } | undefined;
-    assert.equal(version.user_version, 2);
+    assert.equal(version.user_version, 3);
     assert.ok(columns.some((column) => column.name === 'raised_by'));
+    assert.ok(verificationColumns.some((column) => column.name === 'command_argv_json'));
     assert.equal(uniqueIndex?.name, 'proposals_task_agent_unique');
   } finally {
     db.close();
+    fixture.close();
   }
 });
 
@@ -55,6 +100,105 @@ test('initialization creates the neutral human plus three stable model identitie
       service.listAgents().map((agent) => agent['id']),
       ['human', 'claude', 'codex', 'grok'],
     );
+  } finally {
+    close();
+  }
+});
+
+test('a collaboration database is bound to one Git object database', () => {
+  const first = createRepository();
+  const second = createRepository();
+  const databasePath = join(first.path, 'bound.db');
+  const firstDb = openDatabase(databasePath);
+  try {
+    initializeDatabase(firstDb, first.repository.binding, first.repository.headCommit());
+  } finally {
+    firstDb.close();
+  }
+  const secondDb = openDatabase(databasePath);
+  try {
+    assert.throws(
+      () => initializeDatabase(secondDb, second.repository.binding, second.repository.headCommit()),
+      /different repository/,
+    );
+  } finally {
+    secondDb.close();
+    first.close();
+    second.close();
+  }
+});
+
+test('review requests reject invented, missing, non-commit, unreachable, and foreign SHAs', () => {
+  const { service, repository, repositoryPath, close } = harness();
+  const foreign = createRepository();
+  try {
+    service.createTask({ id: 'TASK-GIT', goal: 'Trust Git objects', acceptance: [], actor: 'human' });
+    service.claimTask({ taskId: 'TASK-GIT', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+    assert.throws(
+      () => service.requestReview({ taskId: 'TASK-GIT', agent: 'codex', commit: 'proof-sha' }),
+      (error: unknown) => error instanceof GitError && error.code === 'invalid_commit_sha',
+    );
+    assert.throws(
+      () => service.requestReview({ taskId: 'TASK-GIT', agent: 'codex', commit: 'deadbee' }),
+      (error: unknown) => error instanceof GitError && error.code === 'unknown_commit',
+    );
+    const tree = git(repositoryPath, ['rev-parse', 'HEAD^{tree}']);
+    assert.throws(
+      () => service.requestReview({ taskId: 'TASK-GIT', agent: 'codex', commit: tree }),
+      (error: unknown) => error instanceof GitError && error.code === 'unknown_commit',
+    );
+    const unreachable = git(repositoryPath, ['commit-tree', tree, '-m', 'Unreachable artifact']);
+    assert.throws(
+      () => service.requestReview({ taskId: 'TASK-GIT', agent: 'codex', commit: unreachable }),
+      (error: unknown) => error instanceof GitError && error.code === 'foreign_commit',
+    );
+    const foreignCommit = commitArtifact(foreign.path, 'foreign\n');
+    assert.throws(
+      () => service.requestReview({ taskId: 'TASK-GIT', agent: 'codex', commit: foreignCommit }),
+      (error: unknown) => error instanceof GitError && error.code === 'unknown_commit',
+    );
+    const review = service.requestReview({ taskId: 'TASK-GIT', agent: 'codex', commit: repository.headCommit().slice(0, 8) });
+    assert.equal(review['commit_sha'], repository.headCommit());
+    assert.equal(review['repository_identity'], repository.binding.identity);
+  } finally {
+    foreign.close();
+    close();
+  }
+});
+
+test('review candidate must descend from the immutable task base', () => {
+  const { service, repositoryPath, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-LINEAGE', goal: 'Enforce task lineage', acceptance: [], actor: 'human' });
+    service.claimTask({ taskId: 'TASK-LINEAGE', agent: 'grok', expectedVersion: 1, ttlSeconds: 900 });
+    const tree = git(repositoryPath, ['rev-parse', 'HEAD^{tree}']);
+    const unrelatedCommit = git(repositoryPath, ['commit-tree', tree, '-m', 'Reachable unrelated root']);
+    git(repositoryPath, ['update-ref', 'refs/heads/unrelated', unrelatedCommit]);
+    assert.throws(
+      () => service.requestReview({ taskId: 'TASK-LINEAGE', agent: 'grok', commit: unrelatedCommit }),
+      (error: unknown) => error instanceof GitError && error.code === 'candidate_not_descendant',
+    );
+  } finally {
+    close();
+  }
+});
+
+test('worktree bootstrap creates stable isolated branches and is idempotent', () => {
+  const { service, repository, repositoryPath, close } = harness();
+  try {
+    const rootPath = join(repositoryPath, 'worktrees');
+    const first = service.bootstrapWorktrees({ rootPath, baseCommit: repository.headCommit() });
+    assert.deepEqual(first.map((item) => item['agent_id']), ['claude', 'codex', 'grok']);
+    for (const agent of ['grok', 'claude', 'codex']) {
+      const path = join(rootPath, agent);
+      assert.equal(git(path, ['branch', '--show-current']), `collab/${agent}`);
+      assert.equal(
+        git(path, ['rev-parse', '--path-format=absolute', '--git-common-dir']),
+        repository.binding.commonGitDir,
+      );
+    }
+    const second = service.bootstrapWorktrees({ rootPath, baseCommit: repository.headCommit() });
+    assert.deepEqual(second.map((item) => item['worktree_path']), first.map((item) => item['worktree_path']));
   } finally {
     close();
   }
@@ -100,12 +244,12 @@ test('proposal sealing allows one proposal per agent and only a human can reveal
 });
 
 test('review request requires the requester to still hold an unexpired lease', () => {
-  const { service, close } = harness();
+  const { service, repository, close } = harness();
   try {
     service.createTask({ id: 'TASK-LEASE', goal: 'Reject expired owners', acceptance: [], actor: 'human' });
     service.claimTask({ taskId: 'TASK-LEASE', agent: 'codex', expectedVersion: 1, ttlSeconds: 0 });
     assert.throws(
-      () => service.requestReview({ taskId: 'TASK-LEASE', agent: 'codex', commit: 'expired-sha' }),
+      () => service.requestReview({ taskId: 'TASK-LEASE', agent: 'codex', commit: repository.headCommit() }),
       (error: unknown) => error instanceof CollaborationError && error.code === 'lease_required',
     );
   } finally {
@@ -113,8 +257,8 @@ test('review request requires the requester to still hold an unexpired lease', (
   }
 });
 
-test('three agents can propose, implement, communicate, verify, review, and reach human acceptance', () => {
-  const { service, close } = harness();
+test('three agents can propose, implement, communicate, verify, review, and reach human acceptance', async () => {
+  const { service, repository, close } = harness();
   try {
     service.createTask({
       id: 'TASK-ROOM',
@@ -136,14 +280,23 @@ test('three agents can propose, implement, communicate, verify, review, and reac
       taskId: 'TASK-ROOM',
       body: 'Please review commit abc123.',
     });
-    service.recordVerification({
+    const candidate = repository.headCommit();
+    const verification = await service.runVerification({
       taskId: 'TASK-ROOM',
       agent: 'codex',
-      commit: 'abc123',
-      command: 'npm test',
-      exitCode: 0,
+      commit: candidate,
+      command: ['node', '-e', "process.exit(require('fs').readFileSync('artifact.txt', 'utf8') === 'base\\n' ? 0 : 1)"],
     });
-    const review = service.requestReview({ taskId: 'TASK-ROOM', agent: 'codex', commit: 'abc123' });
+    assert.equal(verification['commit_sha'], candidate);
+    assert.equal(verification['repository_identity'], repository.binding.identity);
+    assert.equal(verification['exit_code'], 0);
+    assert.deepEqual(JSON.parse(String(verification['command'])), [
+      'node',
+      '-e',
+      "process.exit(require('fs').readFileSync('artifact.txt', 'utf8') === 'base\\n' ? 0 : 1)",
+    ]);
+    assert.equal(verification['command_argv_json'], verification['command']);
+    const review = service.requestReview({ taskId: 'TASK-ROOM', agent: 'codex', commit: candidate });
 
     assert.throws(
       () => service.acceptTask({ taskId: 'TASK-ROOM', actor: 'human', expectedVersion: 3 }),
@@ -153,26 +306,35 @@ test('three agents can propose, implement, communicate, verify, review, and reac
     const accepted = service.acceptTask({ taskId: 'TASK-ROOM', actor: 'human', expectedVersion: 3 });
     assert.equal(accepted['status'], 'accepted');
 
-    const sync = service.sync('grok') as { events: Array<Record<string, unknown>> };
+    const sync = service.sync('grok') as {
+      events: Array<Record<string, unknown>>;
+      verifications: Array<Record<string, unknown>>;
+    };
     assert.ok(sync.events.some((event) => event['action'] === 'task_accepted'));
+    assert.deepEqual(sync.verifications[0]?.['command_argv'], [
+      'node',
+      '-e',
+      "process.exit(require('fs').readFileSync('artifact.txt', 'utf8') === 'base\\n' ? 0 : 1)",
+    ]);
   } finally {
     close();
   }
 });
 
-test('verification for a different commit cannot satisfy acceptance', () => {
-  const { service, close } = harness();
+test('verification for a different commit cannot satisfy acceptance', async () => {
+  const { service, repository, repositoryPath, close } = harness();
   try {
     service.createTask({ id: 'TASK-SHA', goal: 'Bind evidence to SHA', acceptance: [], actor: 'human' });
     service.claimTask({ taskId: 'TASK-SHA', agent: 'grok', expectedVersion: 1, ttlSeconds: 900 });
-    service.recordVerification({
+    const oldCommit = repository.headCommit();
+    await service.runVerification({
       taskId: 'TASK-SHA',
       agent: 'grok',
-      commit: 'old-sha',
-      command: 'npm test',
-      exitCode: 0,
+      commit: oldCommit,
+      command: ['node', '-e', 'process.exit(0)'],
     });
-    const review = service.requestReview({ taskId: 'TASK-SHA', agent: 'grok', commit: 'new-sha' });
+    const newCommit = commitArtifact(repositoryPath, 'candidate\n');
+    const review = service.requestReview({ taskId: 'TASK-SHA', agent: 'grok', commit: newCommit });
     service.submitReview({ reviewId: String(review['id']), agent: 'codex', verdict: 'approved' });
     assert.throws(
       () => service.acceptTask({ taskId: 'TASK-SHA', actor: 'human', expectedVersion: 3 }),
@@ -186,8 +348,8 @@ test('verification for a different commit cannot satisfy acceptance', () => {
   }
 });
 
-test('finding author or human can resolve a finding, while the implementer cannot', () => {
-  const { service, close } = harness();
+test('finding author or human can resolve a finding, while the implementer cannot', async () => {
+  const { service, repository, close } = harness();
   try {
     service.createTask({ id: 'TASK-FINDING', goal: 'Close findings', acceptance: [], actor: 'human' });
     const decision = service.proposeDecision({
@@ -203,14 +365,14 @@ test('finding author or human can resolve a finding, while the implementer canno
     assert.equal(service.acceptDecision(String(decision['id']), 'human')['status'], 'accepted');
 
     service.claimTask({ taskId: 'TASK-FINDING', agent: 'grok', expectedVersion: 1, ttlSeconds: 900 });
-    service.recordVerification({
+    const candidate = repository.headCommit();
+    await service.runVerification({
       taskId: 'TASK-FINDING',
       agent: 'codex',
-      commit: 'finding-sha',
-      command: 'npm test',
-      exitCode: 0,
+      commit: candidate,
+      command: ['node', '-e', 'process.exit(0)'],
     });
-    const review = service.requestReview({ taskId: 'TASK-FINDING', agent: 'grok', commit: 'finding-sha' });
+    const review = service.requestReview({ taskId: 'TASK-FINDING', agent: 'grok', commit: candidate });
     const finding = service.addReviewFinding({
       reviewId: String(review['id']),
       agent: 'claude',
@@ -239,7 +401,7 @@ test('finding author or human can resolve a finding, while the implementer canno
     const humanReview = service.requestReview({
       taskId: 'TASK-HUMAN-RESOLVE',
       agent: 'grok',
-      commit: 'human-sha',
+      commit: candidate,
     });
     const humanFinding = service.addReviewFinding({
       reviewId: String(humanReview['id']),
@@ -254,7 +416,7 @@ test('finding author or human can resolve a finding, while the implementer canno
 });
 
 test('sync returns actionable durable state and never leaks sealed proposals', () => {
-  const { service, close } = harness();
+  const { service, repository, close } = harness();
   try {
     service.createTask({ id: 'TASK-CONTEXT', goal: 'Recover context', acceptance: [], actor: 'human' });
     service.submitProposal({ taskId: 'TASK-CONTEXT', agent: 'grok', content: 'Visible after human reveal.' });
@@ -276,7 +438,8 @@ test('sync returns actionable durable state and never leaks sealed proposals', (
 
     service.createTask({ id: 'TASK-REVIEW', goal: 'Expose pending review', acceptance: [], actor: 'human' });
     service.claimTask({ taskId: 'TASK-REVIEW', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
-    const review = service.requestReview({ taskId: 'TASK-REVIEW', agent: 'codex', commit: 'context-sha' });
+    const candidate = repository.headCommit();
+    const review = service.requestReview({ taskId: 'TASK-REVIEW', agent: 'codex', commit: candidate });
     service.addReviewFinding({
       reviewId: String(review['id']),
       agent: 'grok',
@@ -294,7 +457,7 @@ test('sync returns actionable durable state and never leaks sealed proposals', (
     assert.deepEqual(synced['open_blockers']?.map((item) => item['description']), [
       'A concrete dependency is missing.',
     ]);
-    assert.deepEqual(synced['pending_reviews']?.map((item) => item['commit_sha']), ['context-sha']);
+    assert.deepEqual(synced['pending_reviews']?.map((item) => item['commit_sha']), [candidate]);
     assert.deepEqual(synced['open_findings']?.map((item) => item['description']), [
       'Restart recovery needs a focused test.',
     ]);
