@@ -108,7 +108,8 @@ combines messages and typed domain events into one chronological stream, with ta
 left rail. Decisions, proposals, reviews, findings, verification runs, claims, and other system activity keep
 their domain-specific presentation without acquiring frontend-owned workflow semantics. The desktop shell keeps
 the header and human-authority controls visible while the activity region scrolls; narrow screens return to
-normal document flow.
+normal document flow. The activity stream uses [React Virtuoso](https://virtuoso.dev/react-virtuoso/) to
+virtualize long histories while preserving follow-at-bottom and jump-to-latest behavior.
 
 The boundary is intentionally thin:
 

@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertCircleIcon,
+  ArrowDownIcon,
   CheckIcon,
   CircleDotIcon,
   GitBranchIcon,
@@ -9,6 +10,7 @@ import {
   TerminalSquareIcon,
   TriangleAlertIcon,
 } from 'lucide-react'
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -31,14 +33,6 @@ import {
   MessageFooter,
   MessageHeader,
 } from '@/components/ui/message'
-import {
-  MessageScroller,
-  MessageScrollerButton,
-  MessageScrollerContent,
-  MessageScrollerItem,
-  MessageScrollerProvider,
-  MessageScrollerViewport,
-} from '@/components/ui/message-scroller'
 import {
   Select,
   SelectContent,
@@ -68,6 +62,15 @@ interface Snapshot {
   verifications: Row[]
   events: Row[]
 }
+
+const StreamList = forwardRef<HTMLDivElement, React.ComponentPropsWithoutRef<'div'>>(
+  ({ className, ...props }, ref) => (
+    <div ref={ref} className={['stream-content', className].filter(Boolean).join(' ')} {...props} />
+  ),
+)
+StreamList.displayName = 'StreamList'
+
+const virtuosoComponents = { List: StreamList }
 
 const actorNames: Record<string, string> = {
   claude: 'Claude',
@@ -407,12 +410,16 @@ function App() {
   const [selectedTaskId, setSelectedTaskId] = useState<string>('all')
   const [pending, setPending] = useState<string | null>(null)
   const [mutationError, setMutationError] = useState<string | null>(null)
+  const [streamAtBottom, setStreamAtBottom] = useState(true)
+  const streamRef = useRef<VirtuosoHandle>(null)
 
   useEffect(() => {
     if (snapshot && selectedTaskId === 'all' && snapshot.tasks.length === 1) {
       setSelectedTaskId(text(snapshot.tasks[0]?.['id'], 'all'))
     }
   }, [selectedTaskId, snapshot])
+
+  useEffect(() => setStreamAtBottom(true), [selectedTaskId])
 
   const selectedTask = snapshot?.tasks.find((task) => task['id'] === selectedTaskId)
   const stream = useMemo(() => {
@@ -540,24 +547,41 @@ function App() {
           {!snapshot ? (
             <LoadingShell />
           ) : (
-            <MessageScrollerProvider autoScroll>
-              <MessageScroller>
-                <MessageScrollerViewport>
-                  <MessageScrollerContent className="stream-content">
-                    {stream.length === 0 ? (
-                      <MessageScrollerItem messageId="empty">
-                        <Marker variant="separator"><MarkerContent>No records in this channel yet</MarkerContent></Marker>
-                      </MessageScrollerItem>
-                    ) : stream.map((event) => (
-                      <MessageScrollerItem key={String(event['id'])} messageId={String(event['id'])}>
-                        <StreamEvent event={event} snapshot={snapshot} pending={pending} runMutation={runMutation} />
-                      </MessageScrollerItem>
-                    ))}
-                  </MessageScrollerContent>
-                </MessageScrollerViewport>
-                <MessageScrollerButton />
-              </MessageScroller>
-            </MessageScrollerProvider>
+            <div className="stream-scroller">
+              {stream.length === 0 ? (
+                <div className="stream-empty" data-slot="message-scroller-item">
+                  <Marker variant="separator"><MarkerContent>No records in this channel yet</MarkerContent></Marker>
+                </div>
+              ) : (
+                <Virtuoso
+                  key={selectedTaskId}
+                  ref={streamRef}
+                  className="stream-virtuoso"
+                  data={stream}
+                  components={virtuosoComponents}
+                  computeItemKey={(_index, event) => String(event['id'])}
+                  initialTopMostItemIndex={{ index: stream.length - 1, align: 'end' }}
+                  followOutput="auto"
+                  atBottomStateChange={setStreamAtBottom}
+                  itemContent={(_index, event) => (
+                    <div className="stream-item" data-slot="message-scroller-item">
+                      <StreamEvent event={event} snapshot={snapshot} pending={pending} runMutation={runMutation} />
+                    </div>
+                  )}
+                />
+              )}
+              {!streamAtBottom && stream.length > 0 && (
+                <Button
+                  className="stream-latest"
+                  variant="secondary"
+                  size="icon-sm"
+                  onClick={() => streamRef.current?.scrollToIndex({ index: stream.length - 1, align: 'end' })}
+                >
+                  <ArrowDownIcon />
+                  <span className="sr-only">Scroll to latest activity</span>
+                </Button>
+              )}
+            </div>
           )}
         </section>
       </div>
