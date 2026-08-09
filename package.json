@@ -5,8 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "npm run build:collab && tsc -b && vite build",
+    "build:collab": "tsc -p tsconfig.collab.json",
+    "collab": "npm run build:collab --silent && node dist-collab/collab/cli.js",
     "lint": "oxlint",
+    "test": "npm run build:collab --silent && node --test dist-collab/tests/*.test.js",
     "preview": "vite preview"
   },
   "dependencies": {

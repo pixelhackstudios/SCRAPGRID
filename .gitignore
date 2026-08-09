@@ -10,7 +10,11 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+dist-collab
 *.local
+
+# Local collaboration state
+.collab/
 
 # Editor directories and files
 .vscode/*
