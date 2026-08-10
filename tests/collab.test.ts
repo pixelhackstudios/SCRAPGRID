@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { initializeDatabase, openDatabase } from '../collab/database.js';
 import { GitError, GitRepository } from '../collab/git.js';
@@ -33,6 +34,7 @@ function commitArtifact(path: string, content: string): string {
 
 function harness(): {
   service: CollaborationService;
+  db: DatabaseSync;
   repository: GitRepository;
   repositoryPath: string;
   close: () => void;
@@ -42,6 +44,7 @@ function harness(): {
   initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
   return {
     service: new CollaborationService(db, fixture.repository),
+    db,
     repository: fixture.repository,
     repositoryPath: fixture.path,
     close: () => {
@@ -159,6 +162,37 @@ test('operation ledger preserves accepted, rejected, and failed attempts with ca
   }
 });
 
+test('accepted operation completion commits atomically with domain mutations and events', () => {
+  const { service, db, close } = harness();
+  try {
+    db.exec(`
+      CREATE TRIGGER reject_accepted_task_create
+      BEFORE UPDATE OF outcome ON operation_attempts
+      WHEN NEW.outcome = 'accepted' AND OLD.operation = 'task.create'
+      BEGIN
+        SELECT RAISE(FAIL, 'accepted outcome unavailable');
+      END;
+    `);
+
+    assert.throws(
+      () => service.createTask({ id: 'TASK-ATOMIC', goal: 'Commit atomically', acceptance: [], actor: 'human' }),
+      /accepted outcome unavailable/,
+    );
+
+    const snapshot = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    const operation = snapshot['operations']?.find(
+      (item) => item['operation'] === 'task.create' && item['subject_id'] === 'TASK-ATOMIC',
+    );
+
+    assert.equal(operation?.['outcome'], 'failed');
+    assert.ok(operation?.['completed_at']);
+    assert.ok(!snapshot['tasks']?.some((task) => task['id'] === 'TASK-ATOMIC'));
+    assert.ok(!snapshot['events']?.some((event) => event['operation_id'] === operation?.['id']));
+  } finally {
+    close();
+  }
+});
+
 test('asynchronous verification events carry the operation that caused them', async () => {
   const { service, repository, close } = harness();
   try {
@@ -177,6 +211,41 @@ test('asynchronous verification events carry the operation that caused them', as
     assert.equal(event?.['operation_id'], operation?.['id']);
     assert.equal(event?.['action'], 'verification_failed');
     assert.equal(verification['exit_code'], 7);
+  } finally {
+    close();
+  }
+});
+
+test('accepted verification completion commits atomically with verification evidence and its event', async () => {
+  const { service, db, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-ASYNC-ATOMIC', goal: 'Commit verification atomically', acceptance: [], actor: 'human' });
+    db.exec(`
+      CREATE TRIGGER reject_accepted_verification
+      BEFORE UPDATE OF outcome ON operation_attempts
+      WHEN NEW.outcome = 'accepted' AND OLD.operation = 'verification.run'
+      BEGIN
+        SELECT RAISE(FAIL, 'accepted outcome unavailable');
+      END;
+    `);
+
+    await assert.rejects(
+      service.runVerification({
+        taskId: 'TASK-ASYNC-ATOMIC',
+        agent: 'claude',
+        commit: repository.headCommit(),
+        command: ['node', '-e', 'process.exit(0)'],
+      }),
+      /accepted outcome unavailable/,
+    );
+
+    const snapshot = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    const operation = snapshot['operations']?.find((item) => item['operation'] === 'verification.run');
+
+    assert.equal(operation?.['outcome'], 'failed');
+    assert.ok(operation?.['completed_at']);
+    assert.equal(snapshot['verifications']?.length, 0);
+    assert.ok(!snapshot['events']?.some((event) => event['operation_id'] === operation?.['id']));
   } finally {
     close();
   }
