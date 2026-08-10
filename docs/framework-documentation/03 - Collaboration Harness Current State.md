@@ -87,7 +87,7 @@ The database is bound to one Git object database using a repository identity der
 
 ### 3.2 Operation boundary and causal ledger
 
-Every coordination operation opens an attempt row before its domain transaction and closes it afterward. Attempt bookkeeping lives outside the rolled-back domain transaction, so a rejection or failure is still recorded when its mutation is discarded, and a successful operation commits its outcome atomically with the domain rows and events it produced. Events carry the `operation_id` that caused them, so a completed task can be reconstructed causally rather than by timestamp correlation.
+Every mutating coordination operation opens an attempt row before its domain transaction and closes it afterward. The four read operations bypass the ledger, matching the service methods they call. Attempt bookkeeping lives outside the rolled-back domain transaction, so a rejection or failure is still recorded when its mutation is discarded, and a successful operation commits its outcome atomically with the domain rows and events it produced. Events carry the `operation_id` that caused them, so a completed task can be reconstructed causally rather than by timestamp correlation.
 
 An attempt left unfinished by a crashed writer is resolved as `abandoned` with reason `daemon_restart` the next time a daemon acquires ownership.
 
@@ -156,7 +156,9 @@ The daemon publishes `.collab/collabd.json` at mode `0600` with its URL, pid, re
 
 The CLI is a pure client. It opens no database, constructs no service, and has no fallback path; it resolves a command to one registry operation and sends it to the daemon. It fails closed when the daemon is missing, when its recorded process is gone, when it is bound to a different repository, when it serves a different schema, or when its credential is refused.
 
-The operation registry is shared by the CLI and the daemon, so the two surfaces cannot drift. It exposes four read operations (`daemon.info`, `status`, `snapshot`, `agents.list`) and nineteen mutating operations covering synchronization, worktree bootstrap, task creation, role assignment, claims, proposals, decisions, messages, blockers, reviews, findings, check-policy override, task acceptance, and verification.
+The daemon owns the authoritative operation registry, which validates wire input and maps operation names to `CollaborationService` calls. The CLI separately translates command-line syntax into `{operation, input}` requests; the daemon re-validates every request, so CLI translation cannot bypass service authority. The two can therefore drift in usability — a stale CLI can send a shape the daemon rejects — but not in authority, because nothing reaches canonical state without passing the daemon's own validation.
+
+The registry exposes four read operations (`daemon.info`, `status`, `snapshot`, `agents.list`) and nineteen mutating operations covering synchronization, worktree bootstrap, task creation, role assignment, claims, proposals, decisions, messages, blockers, reviews, findings, check-policy override, task acceptance, and verification.
 
 Every operation answers as a newline-delimited JSON stream: `output` frames as a check produces them, `keepalive` frames across silent stretches, and exactly one terminal `result` or `error` frame. Uniform framing is what allows a long check to hold the connection open without tripping client timeouts.
 
