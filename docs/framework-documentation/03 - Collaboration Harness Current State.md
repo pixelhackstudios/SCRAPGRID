@@ -2,7 +2,7 @@
 
 **Status date:** 2026-08-10
 
-**Repository baseline:** `08964d3` (`main`, synchronized with `origin/main` when this document was written)
+**Repository baseline:** `9794626` (`main`, synchronized with `origin/main` when this document was written)
 
 **Purpose:** Record what SCRAPGRID currently is, what has been demonstrated, and what remains unresolved.
 
@@ -15,7 +15,7 @@ This is a current-state record, not a replacement architecture or a new roadmap.
 - [04 — Pilot 002 Implementation Charter](./04%20-%20Pilot%20002%20Implementation%20Charter.md) is **authoritative for Pilot 002 preparation**. Where this document and the charter disagree about what happens next, the charter governs.
 - This document reconciles those intentions with the repository and Pilot 001 as they exist now.
 
-The implementation did not follow the original phase order exactly. The CLI collaboration core and Git truth work were followed by a thin HTTP bridge and a React field terminal before an authoritative daemon was built. A real three-model pilot was then completed using the CLI-first system. The ten-step charter was written afterward to replace ad-hoc sequencing, and steps 1 through 7 have since been implemented and accepted in order.
+The implementation did not follow the original phase order exactly. The CLI collaboration core and Git truth work were followed by a thin HTTP bridge and a React field terminal before an authoritative daemon was built. A real three-model pilot was then completed using the CLI-first system. The ten-step charter was written afterward to replace ad-hoc sequencing, and steps 1 through 8 have since been implemented and accepted in order.
 
 Two kinds of claim appear throughout, and they are not interchangeable:
 
@@ -62,13 +62,15 @@ create task (pins base commit + required-check policy)
 
 The frontend is a live, chronological view of that backend state. It is best understood as a **collaboration field terminal**, not a dashboard and not a general-purpose chat client. Messages, decisions, claims, Git candidates, reviews, findings, verification results, and human actions share one task-filterable activity channel.
 
-The system is coherent, daemon-owned, and session-authenticated, but it is still not the full architecture described in the original report. There is no dispatcher, no context-bundle identity, no MCP adapter, no complete human control plane, and no agent launching or scheduling. Session liveness is deliberately not model-process liveness: a live session means an authenticated identity has communicated recently or currently has accepted work in flight, not that SCRAPGRID has proven a Claude Code, Codex, or Grok process is running.
+Canonical state now also derives what each agent is obliged to do next. The dispatcher is deterministic and deliberately narrow: it reads canonical rows and reports the single permitted action per (agent, task), or reports why there is not one. It ranks nothing, selects no task, and constructs no context.
+
+The system is coherent, daemon-owned, session-authenticated, and deterministically dispatched, but it is still not the full architecture described in the original report. There is no context-bundle identity, no MCP adapter, no complete human control plane, and no agent launching or scheduling. Session liveness is deliberately not model-process liveness: a live session means an authenticated identity has communicated recently or currently has accepted work in flight, not that SCRAPGRID has proven a Claude Code, Codex, or Grok process is running.
 
 ## 3. What Exists in the Repository
 
 ### 3.1 Durable collaboration model
 
-The SQLite schema is at version 8 and stores:
+The SQLite schema is at version 9 and stores:
 
 - stable human and model identities;
 - authenticated model collaboration sessions, holding a hash of each bearer credential rather than the credential itself;
@@ -85,7 +87,8 @@ The SQLite schema is at version 8 and stores:
 - verification records with exact argument vectors and check identity;
 - candidate-scoped human check-policy overrides;
 - managed worktree registrations;
-- operation attempts, recording accepted, rejected, failed, and abandoned outcomes;
+- dispatch records, holding the action delivered to one session for one task, the contract version that derived it, and the immutable basis it was derived from;
+- operation attempts, recording accepted, rejected, failed, and abandoned outcomes, and the dispatch that caused each one where the agent echoed it;
 - an append-only event timeline carrying the `operation_id` that caused each event.
 
 The database is bound to one Git object database using a repository identity derived from its common Git directory and object format. This prevents a collaboration database from being casually reused against a different repository.
@@ -94,7 +97,7 @@ One current session per model agent is enforced by a partial unique index rather
 
 ### 3.2 Operation boundary and causal ledger
 
-Every mutating coordination operation opens an attempt row before its domain transaction and closes it afterward. The five read operations bypass the ledger, matching the service methods they call; `session.heartbeat` is among them precisely so presence never floods the causal record. Attempt bookkeeping lives outside the rolled-back domain transaction, so a rejection or failure is still recorded when its mutation is discarded, and a successful operation commits its outcome atomically with the domain rows and events it produced. Events carry the `operation_id` that caused them, so a completed task can be reconstructed causally rather than by timestamp correlation.
+Every mutating coordination operation opens an attempt row before its domain transaction and closes it afterward. The six read operations bypass the ledger, matching the service methods they call; `session.heartbeat` and `dispatch.derive` are among them precisely so presence and polling never flood the causal record. Attempt bookkeeping lives outside the rolled-back domain transaction, so a rejection or failure is still recorded when its mutation is discarded, and a successful operation commits its outcome atomically with the domain rows and events it produced. Events carry the `operation_id` that caused them, so a completed task can be reconstructed causally rather than by timestamp correlation.
 
 An attempt left unfinished by a crashed writer is resolved as `abandoned` with reason `daemon_restart` the next time a daemon acquires ownership.
 
@@ -169,9 +172,9 @@ Which credential it presents is decided by where it is run. A model running insi
 
 The daemon owns the authoritative operation registry, which validates wire input and maps operation names to `CollaborationService` calls. The CLI separately translates command-line syntax into `{operation, input}` requests; the daemon re-validates every request, so CLI translation cannot bypass service authority. The two can therefore drift in usability — a stale CLI can send a shape the daemon rejects — but not in authority, because nothing reaches canonical state without passing the daemon's own validation.
 
-The registry exposes five read operations (`daemon.info`, `status`, `snapshot`, `agents.list`, `session.heartbeat`) and twenty-two mutating operations covering session lifecycle, synchronization, worktree bootstrap, task creation, role assignment, claims, proposals, decisions, messages, blockers, reviews, findings, check-policy override, task acceptance, and verification.
+The registry exposes six read operations (`daemon.info`, `status`, `snapshot`, `agents.list`, `session.heartbeat`, `dispatch.derive`) and twenty-three mutating operations covering session lifecycle, synchronization, worktree bootstrap, task creation, role assignment, claims, proposals, decisions, messages, blockers, reviews, findings, check-policy override, task acceptance, verification, and dispatch issuance.
 
-Each operation declares how it is authenticated: four are control-only (`session.open`, `session.replace`, `session.close`, `worktree.bootstrap`), one requires a model session (`session.heartbeat`), and eighteen name the input key whose claimed identity must match the authenticated principal.
+Each operation declares how it is authenticated: four are control-only (`session.open`, `session.replace`, `session.close`, `worktree.bootstrap`), two require a model session (`session.heartbeat`, `dispatch.issue`), nineteen name the input key whose claimed identity must match the authenticated principal, and one — `dispatch.derive` — uses the bounded `identityOrControl` rule, meaning control may inspect any agent while a session may inspect only itself. That rule exists because the two existing ones cannot express it between them: `control: true` rejects sessions outright, and `identity` compares the claim against the literal `human` a control principal carries.
 
 Every operation answers as a newline-delimited JSON stream: `output` frames as a check produces them, `keepalive` frames across silent stretches, and exactly one terminal `result` or `error` frame. Uniform framing is what allows a long check to hold the connection open without tripping client timeouts.
 
@@ -242,7 +245,53 @@ session         live, stale, or none
 last heartbeat  a timestamp
 ```
 
-### 3.10 Collaboration field terminal
+### 3.10 Deterministic dispatch
+
+The dispatcher answers one question per (agent, task): what does canonical state oblige this agent to do on this task right now? It is a derivation, not a decision. Where canonical state does not yield exactly one permitted action, the result says which kind of absence applies rather than manufacturing a choice.
+
+The dispatchable vocabulary is four actions, and they are a strict subset of the workflow actions:
+
+```text
+WorkflowAction   assign_roles | claim | implement | review | verify
+               | resolve_finding | unblock | accept
+DispatchAction   claim | implement | review | verify
+```
+
+An action is dispatchable only when canonical state both shows it must occur for the task to reach `accepted` **and** names exactly which agent must perform it. `resolve_finding` and `unblock` fail the second clause — `resolveReviewFinding()` authorizes the author or any human, and `resolveBlocker()` authorizes any active agent — so the contract reports the unaddressable obligation rather than selecting an addressee. Nothing is dispatched to the human; human obligation is a result, not a dispatch.
+
+Each action carries only identifiers, versions, and commits: no prose, no advice, no ambient conversation. `implement` is folded onto `review.request` as its terminal operation, because canonical state cannot know when an implementation is complete.
+
+A result is one of `action`, `waiting`, `blocked`, `none`, or `indeterminate`. The last is reserved for a derivation that failed to reduce to one action, and is deliberately never collapsed into `waiting` or `none`: when the state table is wrong, the result says the state table is wrong.
+
+Derivation is per (agent, task), never global across agents, and the schema is what makes that total: `task_roles` carries `UNIQUE (task_id, agent_id)`, so one agent holds at most one role on a task, and every dispatchable action is role-gated. Where an agent holds obligations on several tasks, the envelope lists them in a stated non-semantic order and declares it unranked. The API cannot pick one:
+
+- `dispatch.derive {agent, task?}` is read-only, writes nothing, and leaves no ledger entry;
+- `dispatch.issue {agent, task}` is mutating, session-bound, and requires an explicit task.
+
+There is no `dispatch.next`, because an operation asked for *the* next action would have to rank tasks that canonical state offers no way to rank. The actor reads its own obligations and names the one it takes up; a harness choosing for it would be a scheduler.
+
+Two properties keep the dispatcher from becoming a second copy of the workflow rules. First, the acceptance gates are enumerated once: `acceptTask()` rejects over the same gap list the `in_review` dispatch rows project onto roles. Second, the lease and reservation expiry comparisons are evaluated once, by shared predicates that both service authority and dispatch consume. The binding guarantee is one-way and is asserted per row in the suite:
+
+```text
+dispatcher returns ACTION  ⇒  the terminal operation is permitted now
+service operation succeeds ⇏  the dispatcher must have returned ACTION
+```
+
+Legal is not due, and the inverse is deliberately not asserted: the service permits many things at once, which is exactly why dispatchability is narrower than permission.
+
+Dispatch mirrors the service's own asymmetries rather than helpfully blocking everything. `claimTask()` consults project pause, so a paused project blocks claims; `requestReview()`, `submitReview()`, and `runVerification()` do not, so review and verification proceed under a paused project. A task whose acceptance gaps are empty under a paused project reports that it awaits a resume rather than a human decision.
+
+A durable record is written only when an action is issued to a **deliverable** session, which requires two separate facts: the session is live *and* has no accepted daemon work in flight. Step 7 reports work in flight as liveness, so liveness alone would allow a second action to be issued from pre-completion state while the first is still running inside `collabd`. Because an issuing operation is itself mutating, it registers its own activity before its body runs; the issuance predicate therefore reads a value sampled before that registration, passed through the operation context.
+
+Delivery identity is idempotent while operation history is not. The uniqueness rule is `(session_id, task_id, dispatch_contract_version, basis_digest)`, and the digest covers workflow state alone — no session, no agent, no timestamp. Unchanged state re-polled by the same session returns the existing record; the same obligation reaching a replacement session is a new, separately attributable delivery. That split matches the step 7 identity model: the durable agent owns the workflow, the session owns the delivery. The contract version joins the key so that a change to the derivation rules can re-dispatch state that has not otherwise moved.
+
+The record stores the basis it was derived from, because `tasks.version` cannot stand in for it — verification evidence, approved reviews, findings, overrides, and above all a lease crossing its expiry all change what is dispatchable while bumping nothing on `tasks`. The stored basis holds the evaluated comparison (`lease_live: false`), not the clock reading that produced it, and one instant is captured per derivation and used for every expiry comparison within it. `basis_json` is immutable historical evidence: it is never read as current authority and never fed back into derivation, and it is expected to disagree with the domain tables over time.
+
+`operation_attempts.dispatch_id` closes the causal loop, turning "told X to do Y" and "X did Y" into a hard edge rather than a timestamp-and-subject join that is ambiguous in exactly the retry cases Pilot 002 measures. The echoed id is validated, never trusted: it attaches only when the referenced dispatch matches the authenticated agent, the operation's **resolved** task, the terminal operation, and the workflow generation. The resolved task matters because `review.submit` records its subject as the review and reaches the task through the review row. The generation matters because agent, task, and operation all survive a review-to-revision-to-re-claim cycle unchanged, which allowed a dispatch from an earlier cycle to attach to a later operation until Doc 05 revision 6 closed it. Session is deliberately not matched: recovery replaces a session while the workflow stands still, whereas a revision cycle moves the workflow while the session stands still. Attachment is advisory in both directions — a mismatched or absent id costs provenance, never work.
+
+Design authority for all of the above is [05 — Step 8 Dispatch Contract](./05%20-%20Step%208%20Dispatch%20Contract.md), including revision 5, which moved the defensive claim guards inside the claim branch and into the order `claimTask()` actually rejects, and revision 6, which added the generation clause above.
+
+### 3.11 Collaboration field terminal
 
 The React 19, Tailwind CSS 4, and shadcn-based frontend polls `/api/snapshot` every two seconds and renders backend state without implementing a client-side workflow engine.
 
@@ -265,7 +314,7 @@ The interface has been manually exercised at desktop and mobile sizes with both 
 
 ## 4. Automated Evidence at This Baseline
 
-At `08964d3`, the repository test suite contains 45 passing Node tests. Beyond the original schema, identity, Git-truth, lease, proposal, review, and snapshot coverage, they now include:
+At `9794626`, the repository test suite contains 61 passing Node tests. Beyond the original schema, identity, Git-truth, lease, proposal, review, and snapshot coverage, they now include:
 
 - operation-ledger preservation of accepted, rejected, and failed attempts with causal event linkage;
 - atomic commitment of operation outcomes alongside domain mutations, including the asynchronous verification path;
@@ -292,12 +341,26 @@ At `08964d3`, the repository test suite contains 45 passing Node tests. Beyond t
 - agreement between that refusal and the projection, so a working session is never reported as stale;
 - refusal of a request whose session was replaced after it authenticated but before its body arrived, proven against the pre-fix code to have otherwise acquired a lease;
 - credential hygiene: the session descriptor is delivered to the model worktree at mode `0600`, and the raw credential appears in neither the database files nor the snapshot;
-- liveness refreshed by ordinary authenticated activity and by an explicit heartbeat, with neither adding operation attempts or domain events.
+- liveness refreshed by ordinary authenticated activity and by an explicit heartbeat, with neither adding operation attempts or domain events;
+- every dispatchable action row asserted against the state table and then proven permitted by invoking its terminal operation, which is the direction that catches drift between dispatch and service authority;
+- the non-action rows asserted by exact kind and reason, with the reasons that name a service rejection additionally asserted to match that service error code;
+- agreement between the shared acceptance gates and the dispatcher, so empty gaps, the awaiting-acceptance row, and a successful acceptance stand or fall together;
+- a lease crossing its expiry changing the derived action while the task version does not move, proving the basis records the evaluated fact rather than a version;
+- the pause asymmetry in both directions: claims blocked under a paused project while review and verification proceed, and acceptance reported as awaiting a resume rather than a decision;
+- the defensive claim guards firing in the order `claimTask()` rejects, and only on the claim path, so a corrupted reservation on an in-review task does not surface as a claim conflict;
+- an unassigned task waiting on the human for every model agent, ahead of role membership, and the envelope declining to enumerate other agents' tasks as noise;
+- delivery idempotency across equivalent polls, distinct attribution across a session replacement, and re-dispatch across a contract-version change;
+- a busy session reported as live but not deliverable, and refused issuance, while derivation itself stays available;
+- an issuing request over HTTP reading the work-in-flight value sampled before it registered its own activity, and still refused when the session is genuinely busy with other work;
+- causal attachment accepted only for a matching agent, resolved task, terminal operation, and workflow generation, including `review.submit` reaching its task through the review row;
+- a dispatch from an earlier revision cycle refused attachment to a later re-claim, proven against the pre-fix code to have otherwise recorded a false causal edge;
+- a derivation that fails to reduce returned intact and recorded as a rejected attempt rather than resolved by heuristic;
+- the derivation boundary itself: control may inspect any agent, a session only itself.
 
 The following commands passed while this document was prepared:
 
 ```bash
-npm test        # 45 tests, 45 pass, 0 fail
+npm test        # 61 tests, 61 pass, 0 fail
 npm run lint    # exit 0
 npm run build   # exit 0
 ```
@@ -308,7 +371,7 @@ This is implementation self-validation. It is not independent verification of ev
 
 Pilot 001 was run in the separate `/home/scott/Development/SCRAPGRID-pilot` repository, on the CLI-first system as it existed at that time. Its original collaboration database was inspected read-only for this document.
 
-This section is a historical record. The harness has changed substantially since the run, and none of the capabilities added in charter steps 1 through 7 were present. Pilot 001 is not evidence for them.
+This section is a historical record. The harness has changed substantially since the run, and none of the capabilities added in charter steps 1 through 8 were present. Pilot 001 is not evidence for them.
 
 ### 5.1 Task and artifact
 
@@ -423,18 +486,21 @@ Document 02's phase model has been superseded by the ten-step charter for Pilot 
 | Phase 0 — contract | Complete as the original task/status/authority baseline. |
 | Phase 1 — first usable slice | Implemented in the CLI-first service and SQLite schema. |
 | Phase 2 — Git truth | Implemented, and extended past the original slice with base-pinned required checks and daemon-executed verification. Live worktree truth and stale-candidate detection remain incomplete. |
-| Phase 3 — daemon and human controls | Daemon portion complete: `collabd` owns canonical mutation, the CLI is a pure client, and restart and concurrency behavior are covered by tests. Authenticated sessions, heartbeat, and deterministic session recovery were added in step 7. The rest of the human control plane — pause/resume, lease revocation, reassignment, waivers — was deliberately not bundled into either step and remains outstanding. |
+| Phase 3 — daemon and human controls | Daemon portion complete: `collabd` owns canonical mutation, the CLI is a pure client, and restart and concurrency behavior are covered by tests. Authenticated sessions, heartbeat, and deterministic session recovery were added in step 7, and deterministic dispatch of the next permitted action in step 8. The rest of the human control plane — pause/resume, lease revocation, reassignment, waivers — was deliberately not bundled into any of those steps and remains outstanding. |
 | Phase 4 — three-terminal pilot | Pilot 001 was completed and is reconstructable, but the formal gate remains partial because no blocking revision cycle or recovery path was exercised in a real run. Pilot 002 is charter step 10. |
 | Phase 5 — MCP adapters | Not started, and explicitly deferred by the charter. |
 | Phase 6 — game application | Still blocked on a more complete and trustworthy harness. |
 
-Charter status at this baseline: steps 1 through 7 are **COMPLETE**, step 8 is **NEXT**, and steps 9 and 10 are **PENDING**. See document 04 for the authoritative sequence and the recorded commit for each step.
+Charter status at this baseline: steps 1 through 8 are **COMPLETE**, step 9 is **NEXT**, and step 10 is **PENDING**. See document 04 for the authoritative sequence and the recorded commit for each step.
 
 ## 8. Current Boundaries
 
 The following are not implemented:
 
 - supervision of model runtimes: session liveness is collaboration presence, not proof that an agent process is alive or thinking;
+- any ranking, priority, scheduling, or automatic task selection: the dispatcher reports an agent's obligations in a stated non-semantic order and refuses to choose among them;
+- dispatch of an action to the human, or of the two obligations canonical state cannot uniquely address — resolving a blocking finding and clearing a blocker both remain human-mediated;
+- READY/WORKING or any other status machine over sessions;
 - session state in the field terminal, which still presents enabled-or-paused agent status only;
 - pause/resume for the project or agents;
 - human lease revocation or reassignment;
@@ -442,7 +508,6 @@ The following are not implemented:
 - lease renewal and abandoned-worktree recovery;
 - coupling between task leases and managed worktree state;
 - stale-candidate detection after review or verification;
-- deterministic dispatch of the next permitted action, and any READY/WORKING semantics over sessions;
 - deterministic context bundles and bundle identity;
 - accepted-candidate Git integration;
 - MCP adapters;
@@ -455,16 +520,18 @@ These are deliberate boundaries of the current implementation, not functions hid
 
 ## 9. Next Gate
 
-The next gate is **charter step 8 — deterministic dispatcher**. Document 04 governs its scope; this document does not propose a competing roadmap.
+The next gate is **charter step 9 — deterministic context bundles and bundle identity**. Document 04 governs its scope; this document does not propose a competing roadmap.
 
-Step 7 deliberately stopped short of dispatcher semantics. It answers whether an authenticated session is present and whether it is currently working; it does not decide what that session should do next. A dispatcher should read `liveness` and `work_in_flight` as the two separate facts they are rather than inferring one from the other.
+Step 8 deliberately stopped at the boundary step 9 begins from. A dispatched action carries identifiers, versions, and commits, and nothing else — no prose, no instruction, no assembled context. What an agent should *know* to carry out an action it has been told to perform is a separate question with its own identity requirements, and the dispatch record is explicitly not the place to park it. The recorded boundary is that `basis_json` holds discriminating coordination facts only; the moment bundles land, that field is the obvious place someone will try to store them, and it must refuse.
 
-Two items are recorded as deferred rather than forgotten:
+Four items are recorded as deferred rather than forgotten:
 
+- **Blocker and finding resolution remain human-mediated.** Neither `resolveBlocker()` nor `resolveReviewFinding()` has a unique authorized actor, so canonical state cannot address either obligation and the dispatcher reports the gap instead of inventing a rule. Blocker frequency and human-intervention count are both listed Pilot 002 evidence signals, so this is a measurement the pilot exists to take rather than a defect it should hide.
+- **Row 7a can strand a verifier.** After a check-policy override, the independent-verification requirement survives while the pinned policy no longer supplies a command for it, so the verifier is blocked with a determined action kind and an underdetermined argument vector. That is an honest representation of a real hole, and another signal worth counting.
 - **Replacement requires staleness.** Recovering a terminal that was lost seconds ago means waiting out the fifteen-minute threshold or configuring it. A forced replacement would weaken the invariant that prevents competing authority, so it was not added. Revisit only if Pilot 002 shows the latency actually costs something.
 - **Monotonic operation outcomes**, the item parked in the charter, remains deferred pending real evidence that the extra defense is needed.
 
-Frontend refinement can remain narrow and opportunistic: collapse long artifacts, present the session projection now that presence has a real meaning, and keep actions synchronized literally with canonical task state.
+Frontend refinement can remain narrow and opportunistic: collapse long artifacts, present the session projection now that presence has a real meaning, and keep actions synchronized literally with canonical task state. The field terminal does not yet surface dispatch records or derived obligations, which is a presentation gap rather than a missing capability.
 
 ## 10. Operational Reference
 
@@ -498,6 +565,23 @@ npm run collab -- session replace codex --reason "terminal was lost"
 
 Replacement is refused while that session still has accepted daemon work in flight, and is available once the session is stale. `COLLAB_SESSION_STALE_MS` changes the fifteen-minute threshold, and `COLLAB_SESSION` names a session descriptor for a model that is not standing in its worktree.
 
+A model reads its own obligations from its own worktree and then names the one it is taking up. The listed order is not a priority:
+
+```bash
+npm run collab -- dispatch derive --agent codex
+npm run collab -- dispatch issue --agent codex --task TASK-ID
+```
+
+`dispatch derive` accepts either credential — the human may inspect any agent from the main worktree, while a session may inspect only itself. `dispatch issue` requires a model session and refuses the control credential with `session_required`, because a delivery has to be attributable to the session that received it.
+
+Issuing returns the durable dispatch record. Echoing its id on the terminal operation records the causal edge from the delivery to the work:
+
+```bash
+npm run collab -- task claim TASK-ID --agent codex --expected-version 1 --dispatch DISPATCH-ID
+```
+
+The echo is advisory: a mismatched or absent id costs provenance, never work. Re-issuing against unchanged state returns the record already written rather than a second delivery.
+
 For the built local terminal:
 
 ```bash
@@ -518,12 +602,14 @@ npm run dev:api
 
 - Current public overview: [README.md](../../README.md)
 - Pilot 002 sequence: [04 — Pilot 002 Implementation Charter](./04%20-%20Pilot%20002%20Implementation%20Charter.md)
+- Dispatch design authority: [05 — Step 8 Dispatch Contract](./05%20-%20Step%208%20Dispatch%20Contract.md)
 - Schema: [`collab/schema.ts`](../../collab/schema.ts)
 - Workflow authority: [`collab/service.ts`](../../collab/service.ts)
 - Git and verification boundary: [`collab/git.ts`](../../collab/git.ts)
 - Daemon entry point and ownership lifecycle: [`collab/collabd.ts`](../../collab/collabd.ts)
 - Singleton lock, daemon discovery, and session descriptors: [`collab/runtime.ts`](../../collab/runtime.ts)
 - Operation registry and the session identity boundary: [`collab/operations.ts`](../../collab/operations.ts)
+- Dispatch state table, result contract, and basis digest: [`collab/dispatch.ts`](../../collab/dispatch.ts)
 - CLI: [`collab/cli.ts`](../../collab/cli.ts)
 - Daemon client: [`collab/client.ts`](../../collab/client.ts)
 - HTTP surface, credentials, and per-session activity: [`collab/http.ts`](../../collab/http.ts)

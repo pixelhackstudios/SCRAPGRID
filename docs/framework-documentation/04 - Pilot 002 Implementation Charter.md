@@ -29,9 +29,10 @@ while the collaboration service remains the authoritative truth and coordination
    - **COMPLETE** — `c067efbe2d341907afa865735bdbcedc2f81ffe2` (implementation),
      `08964d3bdf9e49d408eabdde438eac3b2871208b` (replacement-boundary review fix)
 8. **Deterministic dispatcher**
-   - **NEXT**
+   - **COMPLETE** — `e0dd0d9b7afc81c35eda1e89b5cf2fbd5810bbd1` (implementation candidate),
+     `9794626c0b449daa6d5b98ed79cb153aa53ac752` (accepted review fixes)
 9. **Deterministic context bundles + bundle identity**
-   - **PENDING**
+   - **NEXT**
 10. **Pilot 002**
     - **PENDING**
 
