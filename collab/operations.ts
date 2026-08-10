@@ -90,10 +90,6 @@ export function authorizeOperation(
   }
 }
 
-function sessionBusy(context: OperationContext): (sessionId: string) => boolean {
-  return (sessionId) => context.sessionActivity?.busy(sessionId) ?? false;
-}
-
 /**
  * Publishes a freshly issued credential into the model's own worktree.
  *
@@ -117,11 +113,7 @@ function deliverSession(
         issued_at: String(issued.session['created_at']),
       });
     } catch (error) {
-      service.closeSession({
-        agentId,
-        reason: 'session credential could not be delivered',
-        hasWorkInFlight: () => false,
-      });
+      service.closeSession({ agentId, reason: 'session credential could not be delivered' });
       throw new CollaborationError(
         `session credential could not be written to ${descriptorPath}: ${error instanceof Error ? error.message : String(error)}`,
         'session_delivery_failed',
@@ -221,24 +213,19 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   'session.replace': {
     mutating: true,
     control: true,
-    invoke: (context, input) => {
+    invoke: ({ service }, input) => {
       const agentId = requiredString(input, 'agent');
-      const replaced = context.service.replaceSession({
-        agentId,
-        reason: requiredString(input, 'reason'),
-        hasWorkInFlight: sessionBusy(context),
-      });
-      return { ...deliverSession(context.service, agentId, replaced), replaced_session_id: replaced.replaced };
+      const replaced = service.replaceSession({ agentId, reason: requiredString(input, 'reason') });
+      return { ...deliverSession(service, agentId, replaced), replaced_session_id: replaced.replaced };
     },
   },
   'session.close': {
     mutating: true,
     control: true,
-    invoke: (context, input) =>
-      context.service.closeSession({
+    invoke: ({ service }, input) =>
+      service.closeSession({
         agentId: requiredString(input, 'agent'),
         reason: optionalString(input, 'reason') ?? 'closed',
-        hasWorkInFlight: sessionBusy(context),
       }),
   },
   'session.heartbeat': {

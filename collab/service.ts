@@ -51,6 +51,14 @@ export interface SessionPrincipal {
 
 export interface ServiceOptions {
   sessionStaleAfterMs?: number;
+  /**
+   * Whether a session still has daemon work the daemon accepted and has not finished.
+   *
+   * Liveness and replacement are two questions about one fact, so they consult one probe. Without
+   * it the harness could refuse a replacement because a session is working while simultaneously
+   * projecting that same session as stale.
+   */
+  hasWorkInFlight?: (sessionId: string) => boolean;
 }
 
 export function hashSessionCredential(token: string): string {
@@ -126,6 +134,7 @@ function parseCheckPolicy(contents: unknown): CheckPolicy {
 
 export class CollaborationService {
   private readonly sessionStaleAfterMs: number;
+  private readonly hasWorkInFlight: (sessionId: string) => boolean;
 
   constructor(
     private readonly db: DatabaseSync,
@@ -133,6 +142,7 @@ export class CollaborationService {
     options: ServiceOptions = {},
   ) {
     this.sessionStaleAfterMs = options.sessionStaleAfterMs ?? SESSION_STALE_AFTER_MS;
+    this.hasWorkInFlight = options.hasWorkInFlight ?? (() => false);
   }
 
   private domainTransaction<T>(operation: () => T): T {
@@ -430,13 +440,25 @@ export class CollaborationService {
     return session;
   }
 
-  /** Session rows as projected outward. The credential hash never leaves the database. */
+  /**
+   * Session rows as projected outward. The credential hash never leaves the database.
+   *
+   * A live session is one that has communicated recently *or* currently has accepted work in
+   * flight. A model routinely spends minutes inside one operation without saying anything else, and
+   * a session the daemon is still writing on behalf of is the opposite of absent.
+   */
   private publicSession(session: Row, at = Date.now()): Row {
     const { credential_hash: _hash, ...visible } = session;
+    const working = session['status'] === 'open' && this.hasWorkInFlight(String(session['id']));
     return {
       ...visible,
       liveness:
-        session['status'] !== 'open' ? 'ended' : this.sessionIsStale(session, at) ? 'stale' : 'live',
+        session['status'] !== 'open'
+          ? 'ended'
+          : working || !this.sessionIsStale(session, at)
+            ? 'live'
+            : 'stale',
+      work_in_flight: session['status'] === 'open' ? working : false,
     };
   }
 
@@ -507,11 +529,7 @@ export class CollaborationService {
    * still a writer, and handing the same identity to a second process would create exactly the
    * competing authority Pilot 002 counts as a hard failure.
    */
-  replaceSession(input: {
-    agentId: string;
-    reason: string;
-    hasWorkInFlight: (sessionId: string) => boolean;
-  }): { session: Row; token: string; replaced: string } {
+  replaceSession(input: { agentId: string; reason: string }): { session: Row; token: string; replaced: string } {
     return this.transaction(
       { name: 'session.replace', actor: 'human', subjectType: 'agent', subjectId: input.agentId },
       (operationId) => {
@@ -525,7 +543,7 @@ export class CollaborationService {
           throw new CollaborationError(`${input.agentId} has no current session`, 'unknown_session');
         }
         const outgoing = String(current['id']);
-        if (input.hasWorkInFlight(outgoing)) {
+        if (this.hasWorkInFlight(outgoing)) {
           throw new CollaborationError(
             `${input.agentId} still has accepted daemon work in flight`,
             'session_busy',
@@ -551,7 +569,7 @@ export class CollaborationService {
     );
   }
 
-  closeSession(input: { agentId: string; reason: string; hasWorkInFlight: (sessionId: string) => boolean }): Row {
+  closeSession(input: { agentId: string; reason: string }): Row {
     return this.transaction(
       { name: 'session.close', actor: 'human', subjectType: 'agent', subjectId: input.agentId },
       (operationId) => {
@@ -561,7 +579,7 @@ export class CollaborationService {
           throw new CollaborationError(`${input.agentId} has no current session`, 'unknown_session');
         }
         const outgoing = String(current['id']);
-        if (input.hasWorkInFlight(outgoing)) {
+        if (this.hasWorkInFlight(outgoing)) {
           throw new CollaborationError(
             `${input.agentId} still has accepted daemon work in flight`,
             'session_busy',

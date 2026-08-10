@@ -249,13 +249,27 @@ async function serveStatic(response: ServerResponse, staticRoot: string, pathnam
 async function streamOperation(
   request: IncomingMessage,
   response: ServerResponse,
-  context: Omit<OperationContext, 'onOutput'>,
+  context: Omit<OperationContext, 'onOutput' | 'principal'>,
+  authenticate: () => OperationPrincipal,
 ): Promise<void> {
   const body = await readJson(request);
   const name = body['operation'];
   if (typeof name !== 'string' || name.length === 0) {
     throw new HttpError('operation must be a non-empty string', 400, 'invalid_operation');
   }
+
+  /**
+   * The authoritative identity decision, taken after the last await and never before it.
+   *
+   * Reading the body yields to the event loop, and a session can be replaced during that yield. A
+   * principal resolved before the yield describes who the caller *was*; only a principal resolved
+   * here decides who the caller is allowed to be now. Everything from this point to
+   * `sessionActivity.begin()` is synchronous, so a session cannot be replaced between being
+   * accepted and being counted as a writer.
+   */
+  const principal = authenticate();
+  const { sessionActivity } = context;
+
   let definition;
   let input;
   try {
@@ -263,7 +277,7 @@ async function streamOperation(
     input = operationInput(body['input']);
     // The session boundary answers before the stream opens, so a refused identity is an HTTP
     // status rather than an error frame inside a 200 the caller has to parse.
-    authorizeOperation(definition, context.principal, input);
+    authorizeOperation(definition, principal, input);
   } catch (error) {
     if (error instanceof CollaborationError) {
       throw new HttpError(error.message, error.code === 'unknown_operation' ? 404 : errorStatus(error), error.code);
@@ -271,7 +285,6 @@ async function streamOperation(
     throw error;
   }
 
-  const { principal, sessionActivity } = context;
   // Any authenticated request from a session is evidence of life; no separate heartbeat is required.
   if (principal.kind === 'session') context.service.touchSession(principal);
   // Only accepted mutations make a session unreplaceable. Reads cannot leave canonical state
@@ -290,7 +303,7 @@ async function streamOperation(
   keepalive.unref();
   try {
     const onOutput = (stream: OutputStream, data: string): void => write({ type: 'output', stream, data });
-    write({ type: 'result', value: await definition.invoke({ ...context, onOutput }, input) });
+    write({ type: 'result', value: await definition.invoke({ ...context, principal, onOutput }, input) });
   } catch (error) {
     if (error instanceof CollaborationError || error instanceof GitError) {
       write({ type: 'error', code: error.code, message: error.message });
@@ -319,15 +332,18 @@ export function createCollaborationHttpServer(options: CollaborationHttpOptions)
 
       if (request.method === 'POST') {
         if (url.pathname === '/api/operations') {
-          const principal = requirePrincipal(request, service, credentials);
+          const authenticate = (): OperationPrincipal => requirePrincipal(request, service, credentials);
+          // Fail fast on a credential that is already worthless, so an unauthenticated caller is
+          // never invited to upload a body. This is a cheap pre-check, not the authoritative one:
+          // `streamOperation` re-resolves the principal after the body has been read.
+          authenticate();
           rejectForeignOrigin(request);
-          return await streamOperation(request, response, {
-            service,
-            repository,
-            daemon,
-            principal,
-            sessionActivity,
-          });
+          return await streamOperation(
+            request,
+            response,
+            { service, repository, daemon, sessionActivity },
+            authenticate,
+          );
         }
 
         const revealMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/reveal-proposals$/);

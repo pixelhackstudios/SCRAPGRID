@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import type { Server } from 'node:http';
+import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
@@ -1934,9 +1935,22 @@ test('a session with accepted daemon work in flight cannot be replaced, however 
     assert.notEqual(refused.status, 0, 'replacement must not overlap two authorities for one model');
     assert.equal(cliError(refused)['error'], 'session_busy');
 
+    // The projection has to agree with that refusal. A session the daemon is still writing on
+    // behalf of is the opposite of absent, however long ago it last said anything.
+    const working = (cliJson(fixture.path, ['status'])['sessions'] as Array<Record<string, unknown>>)
+      .find((session) => session['agent_id'] === 'grok' && session['status'] === 'open');
+    assert.equal(working?.['work_in_flight'], true);
+    assert.equal(working?.['liveness'], 'live', 'accepted work in flight is never projected as stale');
+
     const verified = await verifying;
     assert.equal(verified.status, 0);
     assert.equal(parseCliJson(verified.stdout)['exit_code'], 0);
+
+    // With the work finished, the same session falls back to what its timestamp says.
+    const quiet = (cliJson(fixture.path, ['status'])['sessions'] as Array<Record<string, unknown>>)
+      .find((session) => session['agent_id'] === 'grok' && session['status'] === 'open');
+    assert.equal(quiet?.['work_in_flight'], false);
+    assert.equal(quiet?.['liveness'], 'stale');
 
     // Once the daemon is no longer writing on its behalf, the same recovery succeeds.
     const recovered = cliJson(fixture.path, ['session', 'replace', 'grok', '--reason', 'genuinely gone']);
@@ -2025,6 +2039,81 @@ test('authenticated activity refreshes liveness without spamming the ledger or t
     await delay(5);
     cliJson(fixture.path, ['agent', 'list'], sessions['codex']);
     assert.ok((await record()).beat > beaten.beat, 'any authenticated session request refreshes liveness');
+  } finally {
+    await daemon.stop();
+    fixture.close();
+  }
+});
+
+/**
+ * Sends one raw request whose body is delivered in two halves, so a test can act in the window
+ * between the daemon reading the headers and the daemon reading the body.
+ */
+function splitBodyRequest(url: string, token: string, body: string): {
+  finish: () => void;
+  response: Promise<string>;
+} {
+  const { hostname, port } = new URL(url);
+  const payload = Buffer.from(body, 'utf8');
+  const socket = connect({ host: hostname, port: Number(port) });
+  let received = '';
+  socket.setEncoding('utf8');
+  socket.on('data', (chunk: string) => { received += chunk; });
+  const response = new Promise<string>((done, failed) => {
+    socket.on('close', () => done(received));
+    socket.on('error', failed);
+  });
+  socket.on('connect', () => {
+    socket.write(
+      [
+        'POST /api/operations HTTP/1.1',
+        `host: ${hostname}:${port}`,
+        `authorization: Bearer ${token}`,
+        'content-type: application/json',
+        `content-length: ${payload.length}`,
+        'connection: close',
+        '',
+        '',
+      ].join('\r\n'),
+    );
+    socket.write(payload.subarray(0, 10));
+  });
+  return { finish: () => socket.end(payload.subarray(10)), response };
+}
+
+test('a session replaced mid-request cannot finish the request it had already authenticated', async () => {
+  const fixture = createRepository();
+  const daemon = await startDaemon(fixture.path, { COLLAB_SESSION_STALE_MS: '0' });
+  try {
+    const issued = cliJson(fixture.path, ['session', 'open', 'codex']);
+    cliJson(fixture.path, ['task', 'create', 'TASK-CROSS', '--goal', 'Refuse a crossed replacement boundary']);
+    cliJson(fixture.path, ['task', 'assign-roles', 'TASK-CROSS', '--actor', 'human', '--implementer', 'codex', '--reviewer', 'claude', '--verifier', 'grok']);
+    const before = cliJson(fixture.path, ['status']);
+
+    // The old session authenticates, then stalls part-way through its body.
+    const crossing = splitBodyRequest(
+      daemon.descriptor.url,
+      String(issued['token']),
+      JSON.stringify({
+        operation: 'task.claim',
+        input: { taskId: 'TASK-CROSS', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 },
+      }),
+    );
+    await delay(250);
+
+    // Nothing is registered as in flight yet, so recovery is permitted and the credential dies.
+    const replacement = cliJson(fixture.path, ['session', 'replace', 'codex', '--reason', 'terminal was lost']);
+    assert.notEqual(replacement['token'], String(issued['token']));
+
+    crossing.finish();
+    const answered = await crossing.response;
+    assert.match(answered, /^HTTP\/1\.1 401 /, 'the replaced session is refused at the operation boundary');
+    assert.match(answered, /"code":"unauthorized"/);
+
+    // The decisive assertion: the crossed request left no trace in canonical state.
+    const after = cliJson(fixture.path, ['status']);
+    assert.deepEqual(after['tasks'], before['tasks'], 'a replaced session committed no task mutation');
+    assert.deepEqual(after['active_leases'], [], 'and acquired no lease');
   } finally {
     await daemon.stop();
     fixture.close();

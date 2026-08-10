@@ -64,9 +64,12 @@ async function start(): Promise<void> {
   }
 
   const abandoned = recoverAbandonedOperations(db);
-  const service = new CollaborationService(db, repository, { sessionStaleAfterMs: sessionStaleAfterMs() });
   const activity = createActivityGate();
   const sessionActivity = createSessionActivity();
+  const service = new CollaborationService(db, repository, {
+    sessionStaleAfterMs: sessionStaleAfterMs(),
+    hasWorkInFlight: (sessionId) => sessionActivity.busy(sessionId),
+  });
   const credentials = { agent: mintToken(), browser: mintToken() };
   const startedAt = new Date().toISOString();
   const daemon: DaemonSummary = {
