@@ -51,6 +51,12 @@ export function initializeDatabase(db: DatabaseSync, repository: RepositoryBindi
     if (!taskColumns.some((column) => column.name === 'base_commit')) {
       db.exec('ALTER TABLE tasks ADD COLUMN base_commit TEXT');
     }
+    if (!taskColumns.some((column) => column.name === 'check_policy_identity')) {
+      db.exec('ALTER TABLE tasks ADD COLUMN check_policy_identity TEXT');
+    }
+    if (!taskColumns.some((column) => column.name === 'check_policy_json')) {
+      db.exec('ALTER TABLE tasks ADD COLUMN check_policy_json TEXT');
+    }
     const reviewColumns = db.prepare('PRAGMA table_info(reviews)').all() as Array<{ name: string }>;
     if (!reviewColumns.some((column) => column.name === 'repository_identity')) {
       db.exec('ALTER TABLE reviews ADD COLUMN repository_identity TEXT');
@@ -61,6 +67,12 @@ export function initializeDatabase(db: DatabaseSync, repository: RepositoryBindi
     }
     if (!verificationColumns.some((column) => column.name === 'command_argv_json')) {
       db.exec('ALTER TABLE verifications ADD COLUMN command_argv_json TEXT');
+    }
+    if (!verificationColumns.some((column) => column.name === 'check_id')) {
+      db.exec('ALTER TABLE verifications ADD COLUMN check_id TEXT');
+    }
+    if (!verificationColumns.some((column) => column.name === 'check_policy_identity')) {
+      db.exec('ALTER TABLE verifications ADD COLUMN check_policy_identity TEXT');
     }
     const findingColumns = db.prepare('PRAGMA table_info(review_findings)').all() as Array<{ name: string }>;
     if (!findingColumns.some((column) => column.name === 'raised_by')) {

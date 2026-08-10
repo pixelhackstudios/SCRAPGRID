@@ -25,6 +25,12 @@ export interface VerificationExecution {
   exitCode: number;
 }
 
+export interface RepositoryBlob {
+  commit: string;
+  identity: string;
+  contents: string;
+}
+
 export class GitError extends Error {
   constructor(
     message: string,
@@ -129,6 +135,24 @@ export class GitRepository {
       throw new GitError('git merge-base --is-ancestor failed', 'git_command_failed');
     }
     return { baseCommit, candidateCommit };
+  }
+
+  readBlobAtCommit(commitClaim: string, path: string): RepositoryBlob {
+    const commit = this.resolveCommit(commitClaim);
+    let objectId: string;
+    try {
+      objectId = git(this.binding.rootPath, ['rev-parse', '--verify', `${commit}:${path}`]).toLowerCase();
+    } catch {
+      throw new GitError(`required repository file is missing at ${commit}: ${path}`, 'missing_repository_file');
+    }
+    if (git(this.binding.rootPath, ['cat-file', '-t', objectId]) !== 'blob') {
+      throw new GitError(`required repository path is not a file at ${commit}: ${path}`, 'invalid_repository_file');
+    }
+    return {
+      commit,
+      identity: `${this.binding.objectFormat}:${objectId}`,
+      contents: git(this.binding.rootPath, ['cat-file', '-p', objectId]),
+    };
   }
 
   bootstrapWorktrees(rootPath: string, baseClaim: string, agentIds: string[]): ManagedWorktree[] {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
@@ -14,13 +14,22 @@ function git(path: string, args: string[]): string {
   return execFileSync('git', ['-C', path, ...args], { encoding: 'utf8' }).trim();
 }
 
-function createRepository(): { path: string; repository: GitRepository; close: () => void } {
+const FIXTURE_CHECK_ARGV = ['node', '-e', 'process.exit(0)'];
+
+function createRepository(checkPolicy: string | null = JSON.stringify({
+  version: 1,
+  checks: [{ id: 'fixture', argv: FIXTURE_CHECK_ARGV }],
+})): { path: string; repository: GitRepository; close: () => void } {
   const path = mkdtempSync(join(tmpdir(), 'scrapgrid-repository-test-'));
   git(path, ['init', '-b', 'main']);
   git(path, ['config', 'user.name', 'SCRAPGRID Test']);
   git(path, ['config', 'user.email', 'test@scrapgrid.invalid']);
   writeFileSync(join(path, 'artifact.txt'), 'base\n');
-  git(path, ['add', 'artifact.txt']);
+  if (checkPolicy !== null) {
+    mkdirSync(join(path, '.scrapgrid'));
+    writeFileSync(join(path, '.scrapgrid', 'checks.json'), `${checkPolicy}\n`);
+  }
+  git(path, ['add', '--all']);
   git(path, ['commit', '-m', 'Base artifact']);
   return { path, repository: GitRepository.discover(path), close: () => rmSync(path, { recursive: true, force: true }) };
 }
@@ -29,6 +38,13 @@ function commitArtifact(path: string, content: string): string {
   writeFileSync(join(path, 'artifact.txt'), content);
   git(path, ['add', 'artifact.txt']);
   git(path, ['commit', '-m', `Artifact ${content.trim()}`]);
+  return git(path, ['rev-parse', 'HEAD']);
+}
+
+function commitCheckPolicy(path: string, policy: unknown): string {
+  writeFileSync(join(path, '.scrapgrid', 'checks.json'), `${JSON.stringify(policy)}\n`);
+  git(path, ['add', '.scrapgrid/checks.json']);
+  git(path, ['commit', '-m', 'Change required checks']);
   return git(path, ['rev-parse', 'HEAD']);
 }
 
@@ -92,6 +108,7 @@ test('schema version 1 upgrades reservations, operation linkage, finding authors
     initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
     const version = db.prepare('PRAGMA user_version').get() as { user_version: number };
     const columns = db.prepare('PRAGMA table_info(review_findings)').all() as Array<{ name: string }>;
+    const taskColumns = db.prepare('PRAGMA table_info(tasks)').all() as Array<{ name: string }>;
     const verificationColumns = db.prepare('PRAGMA table_info(verifications)').all() as Array<{ name: string }>;
     const eventColumns = db.prepare('PRAGMA table_info(events)').all() as Array<{ name: string }>;
     const operationsTable = db
@@ -100,15 +117,23 @@ test('schema version 1 upgrades reservations, operation linkage, finding authors
     const reservationsTable = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'claim_reservations'")
       .get() as { name: string } | undefined;
+    const overridesTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'check_policy_overrides'")
+      .get() as { name: string } | undefined;
     const uniqueIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'proposals_task_agent_unique'")
       .get() as { name: string } | undefined;
-    assert.equal(version.user_version, 5);
+    assert.equal(version.user_version, 6);
     assert.ok(columns.some((column) => column.name === 'raised_by'));
+    assert.ok(taskColumns.some((column) => column.name === 'check_policy_identity'));
+    assert.ok(taskColumns.some((column) => column.name === 'check_policy_json'));
     assert.ok(verificationColumns.some((column) => column.name === 'command_argv_json'));
+    assert.ok(verificationColumns.some((column) => column.name === 'check_id'));
+    assert.ok(verificationColumns.some((column) => column.name === 'check_policy_identity'));
     assert.ok(eventColumns.some((column) => column.name === 'operation_id'));
     assert.equal(operationsTable?.name, 'operation_attempts');
     assert.equal(reservationsTable?.name, 'claim_reservations');
+    assert.equal(overridesTable?.name, 'check_policy_overrides');
     assert.equal(uniqueIndex?.name, 'proposals_task_agent_unique');
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
   } finally {
@@ -520,6 +545,189 @@ test('expired revision reservations restore ordinary claim rules and are consume
   }
 });
 
+test('task creation fails closed when the base check policy is missing, malformed, or empty', () => {
+  const cases: Array<{ name: string; policy: string | null; code: string }> = [
+    { name: 'missing', policy: null, code: 'missing_check_policy' },
+    { name: 'malformed', policy: '{', code: 'invalid_check_policy' },
+    { name: 'empty', policy: JSON.stringify({ version: 1, checks: [] }), code: 'invalid_check_policy' },
+  ];
+
+  for (const item of cases) {
+    const fixture = createRepository(item.policy);
+    const db = openDatabase(':memory:');
+    try {
+      initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
+      const service = new CollaborationService(db, fixture.repository);
+      assert.throws(
+        () => service.createTask({ id: `TASK-${item.name}`, goal: 'Fail closed', acceptance: [], actor: 'human' }),
+        (error: unknown) => error instanceof CollaborationError && error.code === item.code,
+      );
+      const snapshot = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+      assert.equal(snapshot['tasks']?.length, 0);
+      assert.ok(
+        snapshot['operations']?.some(
+          (operation) => operation['operation'] === 'task.create' && operation['reason_code'] === item.code,
+        ),
+      );
+    } finally {
+      db.close();
+      fixture.close();
+    }
+  }
+});
+
+test('required checks are pinned to the task base policy rather than the candidate policy', async () => {
+  const { service, repository, repositoryPath, close } = harness();
+  try {
+    const task = service.createTask({ id: 'TASK-PINNED-POLICY', goal: 'Pin policy at base', acceptance: [], actor: 'human' });
+    const basePolicyIdentity = task['check_policy_identity'];
+    assert.equal(
+      basePolicyIdentity,
+      repository.readBlobAtCommit(String(task['base_commit']), '.scrapgrid/checks.json').identity,
+    );
+    const candidate = commitCheckPolicy(repositoryPath, {
+      version: 1,
+      checks: [{ id: 'weakened', argv: ['node', '--version'] }],
+    });
+
+    await assert.rejects(
+      service.runVerification({
+        taskId: 'TASK-PINNED-POLICY',
+        agent: 'claude',
+        commit: candidate,
+        checkId: 'weakened',
+      }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'unknown_required_check',
+    );
+    const verification = await service.runVerification({
+      taskId: 'TASK-PINNED-POLICY',
+      agent: 'claude',
+      commit: candidate,
+      checkId: 'fixture',
+    });
+
+    assert.deepEqual(JSON.parse(String(verification['command_argv_json'])), FIXTURE_CHECK_ARGV);
+    assert.equal(verification['check_policy_identity'], basePolicyIdentity);
+    assert.equal(verification['check_id'], 'fixture');
+  } finally {
+    close();
+  }
+});
+
+test('arbitrary passing verification cannot replace every named check required by the base policy', async () => {
+  const fixture = createRepository(
+    JSON.stringify({
+      version: 1,
+      checks: [
+        { id: 'first', argv: ['node', '-e', 'process.exit(0)'] },
+        { id: 'second', argv: ['node', '-e', 'process.exit(0)'] },
+      ],
+    }),
+  );
+  const db = openDatabase(':memory:');
+  try {
+    initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
+    const service = new CollaborationService(db, fixture.repository);
+    service.createTask({ id: 'TASK-REQUIRED-CHECKS', goal: 'Require every named check', acceptance: [], actor: 'human' });
+    service.claimTask({ taskId: 'TASK-REQUIRED-CHECKS', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+    const candidate = fixture.repository.headCommit();
+    await service.runVerification({
+      taskId: 'TASK-REQUIRED-CHECKS',
+      agent: 'grok',
+      commit: candidate,
+      command: ['node', '--version'],
+    });
+    await service.runVerification({
+      taskId: 'TASK-REQUIRED-CHECKS',
+      agent: 'grok',
+      commit: candidate,
+      checkId: 'first',
+    });
+    const review = service.requestReview({ taskId: 'TASK-REQUIRED-CHECKS', agent: 'codex', commit: candidate });
+    service.submitReview({ reviewId: String(review['id']), agent: 'claude', verdict: 'approved' });
+
+    assert.throws(
+      () => service.acceptTask({ taskId: 'TASK-REQUIRED-CHECKS', actor: 'human', expectedVersion: 3 }),
+      (error: unknown) =>
+        error instanceof CollaborationError &&
+        error.code === 'acceptance_gate' &&
+        error.message.includes('second'),
+    );
+    await service.runVerification({
+      taskId: 'TASK-REQUIRED-CHECKS',
+      agent: 'claude',
+      commit: candidate,
+      checkId: 'second',
+    });
+    assert.equal(
+      service.acceptTask({ taskId: 'TASK-REQUIRED-CHECKS', actor: 'human', expectedVersion: 3 })['status'],
+      'accepted',
+    );
+  } finally {
+    db.close();
+    fixture.close();
+  }
+});
+
+test('human check-policy override is candidate-scoped, reason-bearing, and auditable', async () => {
+  const fixture = createRepository(
+    JSON.stringify({
+      version: 1,
+      checks: [{ id: 'broken', argv: ['node', '-e', 'process.exit(7)'] }],
+    }),
+  );
+  const db = openDatabase(':memory:');
+  try {
+    initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
+    const service = new CollaborationService(db, fixture.repository);
+    service.createTask({ id: 'TASK-OVERRIDE', goal: 'Repair broken policy', acceptance: [], actor: 'human' });
+    service.claimTask({ taskId: 'TASK-OVERRIDE', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+    const candidate = fixture.repository.headCommit();
+    const review = service.requestReview({ taskId: 'TASK-OVERRIDE', agent: 'codex', commit: candidate });
+    service.submitReview({ reviewId: String(review['id']), agent: 'claude', verdict: 'approved' });
+    const failedCheck = await service.runVerification({
+      taskId: 'TASK-OVERRIDE',
+      agent: 'grok',
+      commit: candidate,
+      checkId: 'broken',
+    });
+    assert.equal(failedCheck['exit_code'], 7);
+    assert.throws(
+      () => service.acceptTask({ taskId: 'TASK-OVERRIDE', actor: 'human', expectedVersion: 3 }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'acceptance_gate',
+    );
+    assert.throws(
+      () => service.overrideCheckPolicy({ taskId: 'TASK-OVERRIDE', actor: 'grok', reason: 'I want to bypass it' }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'human_required',
+    );
+    assert.throws(
+      () => service.overrideCheckPolicy({ taskId: 'TASK-OVERRIDE', actor: 'human', reason: '  ' }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'override_reason_required',
+    );
+
+    const override = service.overrideCheckPolicy({
+      taskId: 'TASK-OVERRIDE',
+      actor: 'human',
+      reason: 'Base policy invokes a deliberately broken check.',
+    });
+    assert.equal(
+      service.acceptTask({ taskId: 'TASK-OVERRIDE', actor: 'human', expectedVersion: 3 })['status'],
+      'accepted',
+    );
+    const snapshot = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    assert.equal(override['candidate_commit'], candidate);
+    assert.equal(override['reason'], 'Base policy invokes a deliberately broken check.');
+    assert.ok(
+      snapshot['events']?.some(
+        (event) => event['entity_id'] === override['id'] && event['action'] === 'check_policy_overridden',
+      ),
+    );
+  } finally {
+    db.close();
+    fixture.close();
+  }
+});
+
 test('three agents can propose, implement, communicate, verify, review, and reach human acceptance', async () => {
   const { service, repository, close } = harness();
   try {
@@ -548,16 +756,13 @@ test('three agents can propose, implement, communicate, verify, review, and reac
       taskId: 'TASK-ROOM',
       agent: 'grok',
       commit: candidate,
-      command: ['node', '-e', "process.exit(require('fs').readFileSync('artifact.txt', 'utf8') === 'base\\n' ? 0 : 1)"],
+      checkId: 'fixture',
     });
     assert.equal(verification['commit_sha'], candidate);
     assert.equal(verification['repository_identity'], repository.binding.identity);
     assert.equal(verification['exit_code'], 0);
-    assert.deepEqual(JSON.parse(String(verification['command'])), [
-      'node',
-      '-e',
-      "process.exit(require('fs').readFileSync('artifact.txt', 'utf8') === 'base\\n' ? 0 : 1)",
-    ]);
+    assert.deepEqual(JSON.parse(String(verification['command'])), FIXTURE_CHECK_ARGV);
+    assert.equal(verification['check_id'], 'fixture');
     assert.equal(verification['command_argv_json'], verification['command']);
     const review = service.requestReview({ taskId: 'TASK-ROOM', agent: 'codex', commit: candidate });
 
@@ -574,11 +779,7 @@ test('three agents can propose, implement, communicate, verify, review, and reac
       verifications: Array<Record<string, unknown>>;
     };
     assert.ok(sync.events.some((event) => event['action'] === 'task_accepted'));
-    assert.deepEqual(sync.verifications[0]?.['command_argv'], [
-      'node',
-      '-e',
-      "process.exit(require('fs').readFileSync('artifact.txt', 'utf8') === 'base\\n' ? 0 : 1)",
-    ]);
+    assert.deepEqual(sync.verifications[0]?.['command_argv'], FIXTURE_CHECK_ARGV);
   } finally {
     close();
   }
@@ -593,7 +794,7 @@ test('implementer verification is rejected and cannot satisfy acceptance even wh
       taskId: 'TASK-INDEPENDENT',
       agent: 'codex',
       commit: candidate,
-      command: ['node', '-e', 'process.exit(0)'],
+      checkId: 'fixture',
     });
     service.claimTask({ taskId: 'TASK-INDEPENDENT', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
 
@@ -602,7 +803,7 @@ test('implementer verification is rejected and cannot satisfy acceptance even wh
         taskId: 'TASK-INDEPENDENT',
         agent: 'codex',
         commit: candidate,
-        command: ['node', '-e', 'process.exit(0)'],
+        checkId: 'fixture',
       }),
       (error: unknown) => error instanceof CollaborationError && error.code === 'self_verify',
     );
@@ -614,14 +815,14 @@ test('implementer verification is rejected and cannot satisfy acceptance even wh
       (error: unknown) =>
         error instanceof CollaborationError &&
         error.code === 'acceptance_gate' &&
-        error.message.includes('passing verification'),
+        error.message.includes('passing required check'),
     );
 
     await service.runVerification({
       taskId: 'TASK-INDEPENDENT',
       agent: 'grok',
       commit: candidate,
-      command: ['node', '-e', 'process.exit(0)'],
+      checkId: 'fixture',
     });
     assert.equal(
       service.acceptTask({ taskId: 'TASK-INDEPENDENT', actor: 'human', expectedVersion: 3 })['status'],
@@ -653,7 +854,7 @@ test('verification for a different commit cannot satisfy acceptance', async () =
       taskId: 'TASK-SHA',
       agent: 'claude',
       commit: oldCommit,
-      command: ['node', '-e', 'process.exit(0)'],
+      checkId: 'fixture',
     });
     const newCommit = commitArtifact(repositoryPath, 'candidate\n');
     const review = service.requestReview({ taskId: 'TASK-SHA', agent: 'grok', commit: newCommit });
@@ -663,7 +864,7 @@ test('verification for a different commit cannot satisfy acceptance', async () =
       (error: unknown) =>
         error instanceof CollaborationError &&
         error.code === 'acceptance_gate' &&
-        error.message.includes('passing verification'),
+        error.message.includes('passing required check'),
     );
   } finally {
     close();
@@ -692,7 +893,7 @@ test('finding author or human can resolve a finding, while the implementer canno
       taskId: 'TASK-FINDING',
       agent: 'codex',
       commit: candidate,
-      command: ['node', '-e', 'process.exit(0)'],
+      checkId: 'fixture',
     });
     const review = service.requestReview({ taskId: 'TASK-FINDING', agent: 'grok', commit: candidate });
     const finding = service.addReviewFinding({

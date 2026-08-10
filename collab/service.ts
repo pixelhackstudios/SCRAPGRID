@@ -20,8 +20,18 @@ type OperationDescriptor = {
   subjectType?: string;
   subjectId?: string;
 };
+type RequiredCheck = { id: string; argv: string[] };
+type CheckPolicy = { version: 1; checks: RequiredCheck[] };
+type VerificationInput = {
+  taskId: string;
+  agent: string;
+  commit: string;
+  command?: string[];
+  checkId?: string;
+};
 
 const REVISION_RESERVATION_TTL_MS = 60 * 60 * 1000;
+const CHECK_POLICY_PATH = '.scrapgrid/checks.json';
 
 function now(): string {
   return new Date().toISOString();
@@ -41,6 +51,49 @@ function parseJsonOrNull(value: unknown): unknown {
   } catch {
     return null;
   }
+}
+
+function parseCheckPolicy(contents: unknown): CheckPolicy {
+  let value: unknown;
+  try {
+    value = parseJson(contents);
+  } catch {
+    throw new CollaborationError(`${CHECK_POLICY_PATH} must contain valid JSON`, 'invalid_check_policy');
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new CollaborationError(`${CHECK_POLICY_PATH} must contain an object`, 'invalid_check_policy');
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate['version'] !== 1 || !Array.isArray(candidate['checks']) || candidate['checks'].length === 0) {
+    throw new CollaborationError(
+      `${CHECK_POLICY_PATH} requires version 1 and at least one check`,
+      'invalid_check_policy',
+    );
+  }
+  const ids = new Set<string>();
+  const checks = candidate['checks'].map((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new CollaborationError('each required check must be an object', 'invalid_check_policy');
+    }
+    const check = item as Record<string, unknown>;
+    const id = check['id'];
+    const argv = check['argv'];
+    if (typeof id !== 'string' || !/^[A-Za-z0-9._-]+$/.test(id) || ids.has(id)) {
+      throw new CollaborationError('required check ids must be unique names', 'invalid_check_policy');
+    }
+    if (
+      !Array.isArray(argv) ||
+      argv.length === 0 ||
+      typeof argv[0] !== 'string' ||
+      argv[0].length === 0 ||
+      !argv.every((argument) => typeof argument === 'string')
+    ) {
+      throw new CollaborationError(`required check ${id} must define a non-empty argv`, 'invalid_check_policy');
+    }
+    ids.add(id);
+    return { id, argv: [...argv] };
+  });
+  return { version: 1, checks };
 }
 
 export class CollaborationService {
@@ -169,6 +222,54 @@ export class CollaborationService {
     return task;
   }
 
+  private loadBaseCheckPolicy(): { baseCommit: string; identity: string; policy: CheckPolicy } {
+    const baseCommit = this.repository.headCommit();
+    let source;
+    try {
+      source = this.repository.readBlobAtCommit(baseCommit, CHECK_POLICY_PATH);
+    } catch (error) {
+      if (error instanceof GitError && error.code === 'missing_repository_file') {
+        throw new CollaborationError(
+          `${CHECK_POLICY_PATH} is required at task base ${baseCommit}`,
+          'missing_check_policy',
+        );
+      }
+      throw error;
+    }
+    return { baseCommit, identity: source.identity, policy: parseCheckPolicy(source.contents) };
+  }
+
+  private requireTaskCheckPolicy(task: Row): CheckPolicy {
+    if (!task['check_policy_identity'] || !task['check_policy_json']) {
+      throw new CollaborationError('task has no pinned required-check policy', 'missing_check_policy');
+    }
+    return parseCheckPolicy(task['check_policy_json']);
+  }
+
+  private verificationSpec(task: Row, input: VerificationInput): {
+    command: string[];
+    checkId?: string;
+    checkPolicyIdentity?: string;
+  } {
+    if (input.checkId && input.command) {
+      throw new CollaborationError('verification must use either a named check or explicit argv', 'invalid_verification');
+    }
+    if (input.checkId) {
+      const policy = this.requireTaskCheckPolicy(task);
+      const check = policy.checks.find((candidate) => candidate.id === input.checkId);
+      if (!check) throw new CollaborationError(`unknown required check: ${input.checkId}`, 'unknown_required_check');
+      return {
+        command: check.argv,
+        checkId: check.id,
+        checkPolicyIdentity: String(task['check_policy_identity']),
+      };
+    }
+    if (!input.command || input.command.length === 0) {
+      throw new CollaborationError('verification requires a named check or explicit argv', 'missing_verification_command');
+    }
+    return { command: input.command };
+  }
+
   private requireIndependentVerifier(taskId: string, agentId: string): Row {
     const task = this.requireTask(taskId);
     if (task['owner_agent_id'] === agentId) {
@@ -208,7 +309,8 @@ export class CollaborationService {
     const repository = this.db.prepare('SELECT * FROM project_repository WHERE singleton = 1').get() as Row;
     const tasks = this.db
       .prepare(
-        `SELECT id, goal, status, owner_agent_id, version, repository_identity, base_commit, candidate_commit
+        `SELECT id, goal, status, owner_agent_id, version, repository_identity, base_commit,
+                check_policy_identity, candidate_commit
          FROM tasks ORDER BY created_at`,
       )
       .all() as Row[];
@@ -237,8 +339,16 @@ export class CollaborationService {
     const project = this.db.prepare('SELECT status, version, updated_at FROM project_state WHERE singleton = 1').get() as Row;
     const repository = this.db.prepare('SELECT * FROM project_repository WHERE singleton = 1').get() as Row;
     const tasks = (this.db.prepare('SELECT * FROM tasks ORDER BY created_at').all() as Row[]).map((task) => {
-      const { acceptance_json: storedAcceptance, ...plainTask } = task;
-      return { ...plainTask, acceptance: parseJsonOrNull(storedAcceptance) };
+      const {
+        acceptance_json: storedAcceptance,
+        check_policy_json: storedCheckPolicy,
+        ...plainTask
+      } = task;
+      return {
+        ...plainTask,
+        acceptance: parseJsonOrNull(storedAcceptance),
+        check_policy: parseJsonOrNull(storedCheckPolicy),
+      };
     });
     const proposals = (this.db.prepare('SELECT * FROM proposals ORDER BY created_at').all() as Row[]).map(
       (proposal) => {
@@ -273,6 +383,9 @@ export class CollaborationService {
       reviews: this.db.prepare('SELECT * FROM reviews ORDER BY created_at').all() as Row[],
       findings: this.db.prepare('SELECT * FROM review_findings ORDER BY created_at').all() as Row[],
       verifications,
+      check_policy_overrides: this.db
+        .prepare('SELECT * FROM check_policy_overrides ORDER BY created_at')
+        .all() as Row[],
       operations: this.db.prepare('SELECT * FROM operation_attempts ORDER BY started_at, id').all() as Row[],
       events,
     };
@@ -322,7 +435,7 @@ export class CollaborationService {
     const verificationRows = this.db
       .prepare(
         `SELECT id, task_id, repository_identity, commit_sha, command, command_argv_json,
-                exit_code, runner, created_at
+                check_id, check_policy_identity, exit_code, runner, created_at
          FROM verifications ORDER BY created_at DESC LIMIT 100`,
       )
       .all() as Row[];
@@ -339,6 +452,12 @@ export class CollaborationService {
          WHERE finding.status = 'open' ORDER BY finding.created_at`,
       )
       .all() as Row[];
+    const checkPolicyOverrides = this.db
+      .prepare(
+        `SELECT id, task_id, repository_identity, candidate_commit, check_policy_identity, actor, reason, created_at
+         FROM check_policy_overrides ORDER BY created_at`,
+      )
+      .all() as Row[];
     return {
       agent_id: agentId,
       synced_at: timestamp,
@@ -351,38 +470,48 @@ export class CollaborationService {
       pending_reviews: pendingReviews,
       open_findings: openFindings,
       verifications,
+      check_policy_overrides: checkPolicyOverrides,
       status: this.status(),
     };
   }
 
   createTask(input: { id: string; goal: string; acceptance: string[]; actor: string }): Row {
-    return this.transaction({ name: 'task.create', actor: input.actor, subjectType: 'task', subjectId: input.id }, (operationId) => {
-      this.requireProjectActive();
-      this.requireAgent(input.actor);
-      const timestamp = now();
-      this.db
-        .prepare(
-          `INSERT INTO tasks
-           (id, goal, acceptance_json, repository_identity, base_commit, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          input.id,
-          input.goal,
-          JSON.stringify(input.acceptance),
-          this.repository.binding.identity,
-          this.repository.headCommit(),
-          timestamp,
-          timestamp,
-        );
-      const task = this.requireTask(input.id);
-      this.event(operationId, input.actor, 'task', input.id, 'task_created', {
-        acceptance: input.acceptance,
-        repository: this.repository.binding.identity,
-        base_commit: task['base_commit'],
-      });
-      return task;
-    });
+    return this.preparedTransaction(
+      { name: 'task.create', actor: input.actor, subjectType: 'task', subjectId: input.id },
+      () => this.loadBaseCheckPolicy(),
+      (operationId, policySource) => {
+        this.requireProjectActive();
+        this.requireAgent(input.actor);
+        const timestamp = now();
+        this.db
+          .prepare(
+            `INSERT INTO tasks
+             (id, goal, acceptance_json, repository_identity, base_commit,
+              check_policy_identity, check_policy_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            input.id,
+            input.goal,
+            JSON.stringify(input.acceptance),
+            this.repository.binding.identity,
+            policySource.baseCommit,
+            policySource.identity,
+            JSON.stringify(policySource.policy),
+            timestamp,
+            timestamp,
+          );
+        const task = this.requireTask(input.id);
+        this.event(operationId, input.actor, 'task', input.id, 'task_created', {
+          acceptance: input.acceptance,
+          repository: this.repository.binding.identity,
+          base_commit: task['base_commit'],
+          check_policy_identity: policySource.identity,
+          required_checks: policySource.policy.checks.map((check) => check.id),
+        });
+        return task;
+      },
+    );
   }
 
   claimTask(input: { taskId: string; agent: string; expectedVersion: number; ttlSeconds: number }): Row {
@@ -711,24 +840,30 @@ export class CollaborationService {
     });
   }
 
-  async runVerification(input: { taskId: string; agent: string; commit: string; command: string[] }): Promise<Row> {
+  async runVerification(input: VerificationInput): Promise<Row> {
     return this.preparedAsyncTransaction(
       { name: 'verification.run', actor: input.agent, subjectType: 'task', subjectId: input.taskId },
       async () => {
         this.requireAgent(input.agent);
-        this.requireIndependentVerifier(input.taskId, input.agent);
-        return this.repository.runAtCommit(input.commit, input.command);
+        const task = this.requireIndependentVerifier(input.taskId, input.agent);
+        const spec = this.verificationSpec(task, input);
+        const execution = await this.repository.runAtCommit(input.commit, spec.command);
+        return { execution, spec };
       },
-      (operationId, execution) => {
+      (operationId, { execution, spec }) => {
         const commandArgvJson = JSON.stringify(execution.commandArgv);
         this.requireAgent(input.agent);
-        this.requireIndependentVerifier(input.taskId, input.agent);
+        const task = this.requireIndependentVerifier(input.taskId, input.agent);
+        if (spec.checkPolicyIdentity && task['check_policy_identity'] !== spec.checkPolicyIdentity) {
+          throw new CollaborationError('task check policy changed during verification', 'stale_check_policy');
+        }
         const id = makeId('verify');
         this.db
           .prepare(
             `INSERT INTO verifications
-             (id, task_id, repository_identity, commit_sha, command, command_argv_json, exit_code, runner, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (id, task_id, repository_identity, commit_sha, command, command_argv_json,
+              check_id, check_policy_identity, exit_code, runner, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             id,
@@ -737,6 +872,8 @@ export class CollaborationService {
             execution.commit,
             commandArgvJson,
             commandArgvJson,
+            spec.checkId ?? null,
+            spec.checkPolicyIdentity ?? null,
             execution.exitCode,
             input.agent,
             now(),
@@ -752,6 +889,8 @@ export class CollaborationService {
             repository: this.repository.binding.identity,
             commit: execution.commit,
             command_argv: execution.commandArgv,
+            check_id: spec.checkId ?? null,
+            check_policy_identity: spec.checkPolicyIdentity ?? null,
             exit_code: execution.exitCode,
           },
         );
@@ -806,6 +945,50 @@ export class CollaborationService {
     );
   }
 
+  overrideCheckPolicy(input: { taskId: string; actor: string; reason: string }): Row {
+    return this.transaction(
+      { name: 'check_policy.override', actor: input.actor, subjectType: 'task', subjectId: input.taskId },
+      (operationId) => {
+        const actor = this.requireAgent(input.actor);
+        if (actor['kind'] !== 'human') {
+          throw new CollaborationError('only a human can override required checks', 'human_required');
+        }
+        const reason = input.reason.trim();
+        if (!reason) throw new CollaborationError('check policy override requires a reason', 'override_reason_required');
+        const task = this.requireTask(input.taskId);
+        if (task['status'] !== 'in_review' || !task['candidate_commit']) {
+          throw new CollaborationError('check policy override requires a candidate in review', 'invalid_transition');
+        }
+        const id = makeId('override');
+        const timestamp = now();
+        this.db
+          .prepare(
+            `INSERT INTO check_policy_overrides
+             (id, task_id, repository_identity, candidate_commit, check_policy_identity, actor, reason, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            id,
+            input.taskId,
+            this.repository.binding.identity,
+            String(task['candidate_commit']),
+            task['check_policy_identity'] ? String(task['check_policy_identity']) : null,
+            input.actor,
+            reason,
+            timestamp,
+          );
+        this.event(operationId, input.actor, 'check_policy_override', id, 'check_policy_overridden', {
+          task_id: input.taskId,
+          repository: this.repository.binding.identity,
+          candidate_commit: task['candidate_commit'],
+          check_policy_identity: task['check_policy_identity'] ?? null,
+          reason,
+        });
+        return this.db.prepare('SELECT * FROM check_policy_overrides WHERE id = ?').get(id) as Row;
+      },
+    );
+  }
+
   acceptTask(input: { taskId: string; actor: string; expectedVersion: number }): Row {
     return this.transaction({ name: 'task.accept', actor: input.actor, subjectType: 'task', subjectId: input.taskId }, (operationId) => {
       this.requireProjectActive();
@@ -845,26 +1028,52 @@ export class CollaborationService {
         )
         .get(input.taskId, this.repository.binding.identity, String(task['candidate_commit']));
       if (!review) throw new CollaborationError('candidate commit lacks an approved review', 'acceptance_gate');
-      const verification = this.db
+      const override = this.db
         .prepare(
-          `SELECT id FROM verifications
-           WHERE task_id = ? AND repository_identity = ? AND commit_sha = ? AND exit_code = 0
-             AND runner <> ?
+          `SELECT id FROM check_policy_overrides
+           WHERE task_id = ? AND repository_identity = ? AND candidate_commit = ?
            ORDER BY created_at DESC LIMIT 1`,
         )
-        .get(
-          input.taskId,
-          this.repository.binding.identity,
-          String(task['candidate_commit']),
-          String(task['owner_agent_id']),
-        );
-      if (!verification) throw new CollaborationError('candidate commit lacks a passing verification', 'acceptance_gate');
+        .get(input.taskId, this.repository.binding.identity, String(task['candidate_commit'])) as Row | undefined;
+      if (!override) {
+        let policy: CheckPolicy;
+        try {
+          policy = this.requireTaskCheckPolicy(task);
+        } catch {
+          throw new CollaborationError('task lacks a valid pinned required-check policy', 'acceptance_gate');
+        }
+        for (const check of policy.checks) {
+          const verification = this.db
+            .prepare(
+              `SELECT id FROM verifications
+               WHERE task_id = ? AND repository_identity = ? AND commit_sha = ? AND exit_code = 0
+                 AND runner <> ? AND check_id = ? AND check_policy_identity = ?
+               ORDER BY created_at DESC LIMIT 1`,
+            )
+            .get(
+              input.taskId,
+              this.repository.binding.identity,
+              String(task['candidate_commit']),
+              String(task['owner_agent_id']),
+              check.id,
+              String(task['check_policy_identity']),
+            );
+          if (!verification) {
+            throw new CollaborationError(
+              `candidate commit lacks passing required check: ${check.id}`,
+              'acceptance_gate',
+            );
+          }
+        }
+      }
       const timestamp = now();
       this.db
         .prepare('UPDATE tasks SET status = \'accepted\', version = version + 1, updated_at = ? WHERE id = ?')
         .run(timestamp, input.taskId);
       this.event(operationId, input.actor, 'task', input.taskId, 'task_accepted', {
         commit: task['candidate_commit'],
+        check_policy_identity: task['check_policy_identity'] ?? null,
+        check_policy_override_id: override?.['id'] ?? null,
       });
       return this.requireTask(input.taskId);
     });

@@ -88,7 +88,8 @@ Commands:
   review submit REVIEW --agent ID --verdict approved|needs_revision
   finding add REVIEW --agent ID --severity blocking|non_blocking --description TEXT [--location TEXT]
   finding resolve FINDING --agent ID
-  verify TASK --agent ID --commit SHA -- COMMAND [ARG ...]
+  policy override TASK --actor human --reason TEXT
+  verify TASK --agent ID --commit SHA [--check ID | -- COMMAND [ARG ...]]
 `);
 }
 
@@ -234,14 +235,26 @@ async function run(): Promise<void> {
     if (area === 'finding' && action === 'resolve' && id) {
       return print(service.resolveReviewFinding(id, required(parsed.options, 'agent')));
     }
-    if (area === 'verify' && action && parsed.command.length > 0) {
-      const command = parsed.command[0];
-      if (!command) throw new Error('missing verification command after --');
+    if (area === 'policy' && action === 'override' && id) {
+      return print(
+        service.overrideCheckPolicy({
+          taskId: id,
+          actor: required(parsed.options, 'actor'),
+          reason: required(parsed.options, 'reason'),
+        }),
+      );
+    }
+    if (area === 'verify' && action) {
+      const checkId = optional(parsed.options, 'check');
+      if (Boolean(checkId) === (parsed.command.length > 0)) {
+        throw new Error('verify requires exactly one of --check ID or an explicit command after --');
+      }
       const record = await service.runVerification({
         taskId: action,
         agent: required(parsed.options, 'agent'),
         commit: required(parsed.options, 'commit'),
-        command: parsed.command,
+        checkId,
+        command: parsed.command.length > 0 ? parsed.command : undefined,
       });
       print(record);
       const exitCode = Number(record['exit_code']);

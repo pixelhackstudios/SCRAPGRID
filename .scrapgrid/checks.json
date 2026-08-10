@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "id": "quality",
+      "argv": [
+        "bash",
+        "-lc",
+        "npm ci && npm test && npm run build && npm run lint && git diff --check"
+      ]
+    }
+  ]
+}

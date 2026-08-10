@@ -17,7 +17,7 @@ tests provide executable evidence. No model has supervisory authority over anoth
 The repository contains the CLI-first collaboration core plus its first Git-truth slice:
 
 - a SQLite schema for agents, tasks, leases, revision claim reservations, proposals, decisions, messages,
-  blockers, reviews, findings, verifications, operation attempts, and append-only events;
+  blockers, reviews, findings, verifications, check-policy overrides, operation attempts, and append-only events;
 - a transport-neutral operation boundary that records accepted, rejected, and failed coordination operations
   outside rolled-back domain transactions, while unfinished rows preserve crash or abandonment evidence;
 - causal `operation_id` linkage from successful operations to the domain events they produced;
@@ -35,10 +35,13 @@ The repository contains the CLI-first collaboration core plus its first Git-trut
   normalized commit, exact command argv as JSON, and exit code recorded;
 - independent verification enforcement that rejects the task owner as runner and prevents owner-authored evidence
   from satisfying acceptance;
+- named required checks loaded from `.scrapgrid/checks.json` at each task's base commit, with the Git blob identity
+  pinned to the task and carried by satisfying verification evidence;
 - review requests that require the implementation owner to still hold the live task lease;
 - review findings that only their author or the human may resolve;
-- acceptance gates requiring a human actor, an approved review, passing verification for the same candidate,
-  and no unresolved blockers or blocking findings;
+- acceptance gates requiring a human actor, an approved review, every base-pinned named check passing for the same
+  candidate, and no unresolved blockers or blocking findings;
+- a candidate-scoped, reason-bearing human check-policy override recorded in canonical state and domain events;
 - a side-effect-free, visibility-safe snapshot of collaboration state exposed through a loopback-only HTTP API;
 - a React, Tailwind 4, and shadcn/ui collaboration field terminal that renders messages and typed domain events
   as one chronological activity stream;
@@ -46,9 +49,8 @@ The repository contains the CLI-first collaboration core plus its first Git-trut
   to the existing collaboration service;
 - a JSON-output CLI and implementation-proximate tests.
 
-This slice does **not** yet enforce required-check policy, couple leases to mutable worktree ownership, recover
-stale post-review edits, run a daemon, expose MCP, schedule agents, provide general-purpose human chat input, or
-implement MMORPG systems. See
+This slice does **not** yet couple leases to mutable worktree ownership, recover stale post-review edits, run a
+daemon, expose MCP, schedule agents, provide general-purpose human chat input, or implement MMORPG systems. See
 [`docs/framework-documentation/04 - Pilot 002 Implementation Charter.md`](docs/framework-documentation/04%20-%20Pilot%20002%20Implementation%20Charter.md)
 for the authoritative Pilot 002 prerequisite sequence.
 
@@ -88,12 +90,20 @@ npm run collab -- proposal reveal TASK-001 --actor human
 npm run collab -- task claim TASK-001 --agent codex --expected-version 1
 npm run collab -- message send --from codex --to claude --task TASK-001 --body "Candidate is ready."
 npm run collab -- review request TASK-001 --agent codex --commit "$(git rev-parse HEAD)"
-npm run collab -- verify TASK-001 --agent claude --commit "$(git rev-parse HEAD)" -- npm test
+npm run collab -- verify TASK-001 --agent claude --commit "$(git rev-parse HEAD)" --check quality
 ```
 
-`verify` creates a detached temporary worktree at the normalized commit, runs the exact argv there, records that
-argv as JSON with the result, and removes the worktree. Commands must prepare any untracked dependencies they
-require; the verifier never borrows `node_modules` or other mutable state from an agent worktree.
+`verify --check ID` resolves the named argv from the task's base-pinned `.scrapgrid/checks.json`. An explicit
+command after `--` remains useful as evidence but cannot satisfy acceptance. Every named check must pass for the
+exact candidate under the pinned policy identity. `verify` runs the resolved argv in a detached temporary
+worktree and never borrows mutable dependencies from an agent worktree.
+
+If a valid base policy is operationally broken, the human may record the deliberately narrow escape hatch after
+the candidate enters review:
+
+```bash
+npm run collab -- policy override TASK-001 --actor human --reason "Base check cannot resolve its pinned tool."
+```
 
 Run `npm run collab -- help` for the complete command list.
 

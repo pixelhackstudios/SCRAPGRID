@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   acceptance_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(acceptance_json)),
   repository_identity TEXT NOT NULL,
   base_commit TEXT NOT NULL,
+  check_policy_identity TEXT NOT NULL,
+  check_policy_json TEXT NOT NULL CHECK (json_valid(check_policy_json)),
   candidate_commit TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -129,8 +131,21 @@ CREATE TABLE IF NOT EXISTS verifications (
   commit_sha TEXT NOT NULL,
   command TEXT NOT NULL,
   command_argv_json TEXT NOT NULL CHECK (json_valid(command_argv_json)),
+  check_id TEXT,
+  check_policy_identity TEXT,
   exit_code INTEGER NOT NULL,
   runner TEXT NOT NULL REFERENCES agents(id),
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS check_policy_overrides (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  repository_identity TEXT NOT NULL,
+  candidate_commit TEXT NOT NULL,
+  check_policy_identity TEXT,
+  actor TEXT NOT NULL REFERENCES agents(id),
+  reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
   created_at TEXT NOT NULL
 );
 
@@ -178,4 +193,6 @@ CREATE INDEX IF NOT EXISTS proposals_task ON proposals(task_id);
 CREATE UNIQUE INDEX IF NOT EXISTS proposals_task_agent_unique ON proposals(task_id, agent_id);
 CREATE INDEX IF NOT EXISTS reviews_task_commit ON reviews(task_id, commit_sha);
 CREATE INDEX IF NOT EXISTS verifications_task_commit ON verifications(task_id, commit_sha);
+CREATE INDEX IF NOT EXISTS check_policy_overrides_task_commit
+  ON check_policy_overrides(task_id, repository_identity, candidate_commit);
 `;
