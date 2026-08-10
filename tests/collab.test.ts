@@ -747,6 +747,21 @@ test('human check-policy override is candidate-scoped, reason-bearing, and audit
       actor: 'human',
       reason: 'Base policy invokes a deliberately broken check.',
     });
+    assert.throws(
+      () => service.acceptTask({ taskId: 'TASK-OVERRIDE', actor: 'human', expectedVersion: 3 }),
+      (error: unknown) =>
+        error instanceof CollaborationError &&
+        error.code === 'acceptance_gate' &&
+        error.message.includes('designated verifier'),
+    );
+    const alternativeVerification = await service.runVerification({
+      taskId: 'TASK-OVERRIDE',
+      agent: 'grok',
+      commit: candidate,
+      command: ['node', '-e', 'process.exit(0)'],
+    });
+    assert.equal(alternativeVerification['check_id'], null);
+    assert.equal(alternativeVerification['exit_code'], 0);
     assert.equal(
       service.acceptTask({ taskId: 'TASK-OVERRIDE', actor: 'human', expectedVersion: 3 })['status'],
       'accepted',
@@ -910,7 +925,7 @@ test('task roles are distinct, human-assigned, task-scoped, and enforced at ever
       (error: unknown) =>
         error instanceof CollaborationError &&
         error.code === 'acceptance_gate' &&
-        error.message.includes('passing required check'),
+        error.message.includes('designated verifier'),
     );
 
     await service.runVerification({
@@ -1003,7 +1018,7 @@ test('verification for a different commit cannot satisfy acceptance', async () =
       (error: unknown) =>
         error instanceof CollaborationError &&
         error.code === 'acceptance_gate' &&
-        error.message.includes('passing required check'),
+        error.message.includes('designated verifier'),
     );
   } finally {
     close();

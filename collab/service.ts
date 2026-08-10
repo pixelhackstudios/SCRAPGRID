@@ -1136,6 +1136,26 @@ export class CollaborationService {
            ORDER BY created_at DESC LIMIT 1`,
         )
         .get(input.taskId, this.repository.binding.identity, String(task['candidate_commit'])) as Row | undefined;
+      const independentVerification = this.db
+        .prepare(
+          `SELECT id FROM verifications
+           WHERE task_id = ? AND repository_identity = ? AND commit_sha = ? AND exit_code = 0
+             AND runner = ? AND runner <> ?
+           ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get(
+          input.taskId,
+          this.repository.binding.identity,
+          String(task['candidate_commit']),
+          roles.verifier,
+          String(task['owner_agent_id']),
+        );
+      if (!independentVerification) {
+        throw new CollaborationError(
+          'candidate commit lacks passing verification from the designated verifier',
+          'acceptance_gate',
+        );
+      }
       if (!override) {
         let policy: CheckPolicy;
         try {
