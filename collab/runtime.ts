@@ -27,6 +27,63 @@ export interface DaemonDescriptor {
   started_at: string;
 }
 
+/**
+ * A model's answer to "who am I?", written into its own managed worktree.
+ *
+ * The daemon descriptor answers "where is collabd?" and is reminted on every start. Keeping the two
+ * apart is what lets the daemon's port, pid, and control credential rotate without destroying a
+ * model's collaboration identity.
+ */
+export interface SessionDescriptor {
+  session_id: string;
+  agent_id: string;
+  token: string;
+  issued_at: string;
+}
+
+/** A session credential lives beside the worktree's other local collaboration state. */
+export function sessionDescriptorPath(worktreePath: string): string {
+  return resolve(worktreePath, '.collab/session.json');
+}
+
+export function writeSessionDescriptor(path: string, descriptor: SessionDescriptor): void {
+  mkdirSync(dirname(path), { recursive: true });
+  // Remove first so the owner-only mode applies even when a previous session file is present.
+  rmSync(path, { force: true });
+  const handle = openSync(path, 'wx', 0o600);
+  try {
+    writeSync(handle, `${JSON.stringify(descriptor, null, 2)}\n`);
+  } finally {
+    closeSync(handle);
+  }
+}
+
+export function readSessionDescriptor(path: string): SessionDescriptor {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    throw new DaemonRuntimeError(`${path} is not a readable session descriptor`, 'invalid_session_descriptor');
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new DaemonRuntimeError(`${path} must contain an object`, 'invalid_session_descriptor');
+  }
+  const candidate = parsed as Record<string, unknown>;
+  const sessionId = candidate['session_id'];
+  const agentId = candidate['agent_id'];
+  const token = candidate['token'];
+  const issuedAt = candidate['issued_at'];
+  if (
+    typeof sessionId !== 'string' ||
+    typeof agentId !== 'string' ||
+    typeof token !== 'string' ||
+    typeof issuedAt !== 'string'
+  ) {
+    throw new DaemonRuntimeError(`${path} is missing required session fields`, 'invalid_session_descriptor');
+  }
+  return { session_id: sessionId, agent_id: agentId, token, issued_at: issuedAt };
+}
+
 export interface DaemonLock {
   readonly path: string;
   release(): void;

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -63,10 +63,10 @@ async function waitFor(description: string, condition: () => boolean, timeoutMs 
 }
 
 /** Spawns a real `collabd` on an ephemeral port and waits until it has published its descriptor. */
-async function startDaemon(repositoryPath: string): Promise<RunningDaemon> {
+async function startDaemon(repositoryPath: string, env: NodeJS.ProcessEnv = {}): Promise<RunningDaemon> {
   const child = spawn(process.execPath, [COLLABD_ENTRY], {
     cwd: repositoryPath,
-    env: { ...process.env, PORT: '0' },
+    env: { ...process.env, PORT: '0', ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -104,14 +104,27 @@ interface CliResult {
   stderr: string;
 }
 
-function runCli(repositoryPath: string, args: string[]): CliResult {
-  const result = spawnSync(process.execPath, [CLI_ENTRY, ...args], { cwd: repositoryPath, encoding: 'utf8' });
+/** `session` names the session descriptor this invocation authenticates with, if any. */
+function cliEnvironment(session?: string): NodeJS.ProcessEnv {
+  return session === undefined ? process.env : { ...process.env, COLLAB_SESSION: session };
+}
+
+function runCli(repositoryPath: string, args: string[], session?: string): CliResult {
+  const result = spawnSync(process.execPath, [CLI_ENTRY, ...args], {
+    cwd: repositoryPath,
+    encoding: 'utf8',
+    env: cliEnvironment(session),
+  });
   return { status: result.status ?? 1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
 }
 
-function runCliAsync(repositoryPath: string, args: string[]): Promise<CliResult> {
+function runCliAsync(repositoryPath: string, args: string[], session?: string): Promise<CliResult> {
   return new Promise((done) => {
-    const child = spawn(process.execPath, [CLI_ENTRY, ...args], { cwd: repositoryPath, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [CLI_ENTRY, ...args], {
+      cwd: repositoryPath,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: cliEnvironment(session),
+    });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');
@@ -128,10 +141,37 @@ function parseCliJson(stdout: string): Record<string, unknown> {
   return JSON.parse(start >= 0 ? stdout.slice(start + 1) : stdout) as Record<string, unknown>;
 }
 
-function cliJson(repositoryPath: string, args: string[]): Record<string, unknown> {
-  const result = runCli(repositoryPath, args);
+function cliJson(repositoryPath: string, args: string[], session?: string): Record<string, unknown> {
+  const result = runCli(repositoryPath, args, session);
   assert.equal(result.status, 0, `collab ${args.join(' ')} failed: ${result.stderr}`);
   return parseCliJson(result.stdout);
+}
+
+/**
+ * Opens a real session per model and stores each credential where `COLLAB_SESSION` can name it.
+ *
+ * Tests that do not bootstrap worktrees have nowhere for the daemon to deliver a descriptor, so the
+ * issued credential is written here instead. The credential itself is the daemon's.
+ */
+function openSessions(repositoryPath: string, agentIds: string[]): Record<string, string> {
+  const directory = mkdtempSync(join(tmpdir(), 'scrapgrid-session-test-'));
+  const sessions: Record<string, string> = {};
+  for (const agentId of agentIds) {
+    const issued = cliJson(repositoryPath, ['session', 'open', agentId]);
+    const session = issued['session'] as Record<string, unknown>;
+    const path = join(directory, `${agentId}.json`);
+    writeFileSync(
+      path,
+      JSON.stringify({
+        session_id: session['id'],
+        agent_id: agentId,
+        token: issued['token'],
+        issued_at: session['created_at'],
+      }),
+    );
+    sessions[agentId] = path;
+  }
+  return sessions;
 }
 
 function cliError(result: CliResult): Record<string, unknown> {
@@ -262,7 +302,15 @@ test('schema version 1 upgrades roles, reservations, operation linkage, findings
     const uniqueIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'proposals_task_agent_unique'")
       .get() as { name: string } | undefined;
-    assert.equal(version.user_version, 7);
+    const sessionsTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_sessions'")
+      .get() as { name: string } | undefined;
+    const currentSessionIndex = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'agent_sessions_current'")
+      .get() as { name: string } | undefined;
+    assert.equal(version.user_version, 8);
+    assert.equal(sessionsTable?.name, 'agent_sessions');
+    assert.equal(currentSessionIndex?.name, 'agent_sessions_current');
     assert.ok(columns.some((column) => column.name === 'raised_by'));
     assert.ok(taskColumns.some((column) => column.name === 'check_policy_identity'));
     assert.ok(taskColumns.some((column) => column.name === 'check_policy_json'));
@@ -1385,15 +1433,16 @@ test('the collab CLI drives a complete task through collabd', async () => {
   const fixture = createRepository();
   const daemon = await startDaemon(fixture.path);
   try {
+    const sessions = openSessions(fixture.path, ['codex', 'claude', 'grok']);
     cliJson(fixture.path, ['task', 'create', 'TASK-DAEMON', '--goal', 'Prove the daemon boundary', '--acceptance', 'collabd owns every mutation']);
     cliJson(fixture.path, ['task', 'assign-roles', 'TASK-DAEMON', '--actor', 'human', '--implementer', 'codex', '--reviewer', 'claude', '--verifier', 'grok']);
     const candidate = commitArtifact(fixture.path, 'candidate\n');
-    cliJson(fixture.path, ['task', 'claim', 'TASK-DAEMON', '--agent', 'codex', '--expected-version', '1']);
-    const review = cliJson(fixture.path, ['review', 'request', 'TASK-DAEMON', '--agent', 'codex', '--commit', candidate]);
-    const verification = cliJson(fixture.path, ['verify', 'TASK-DAEMON', '--agent', 'grok', '--commit', candidate, '--check', 'fixture']);
+    cliJson(fixture.path, ['task', 'claim', 'TASK-DAEMON', '--agent', 'codex', '--expected-version', '1'], sessions['codex']);
+    const review = cliJson(fixture.path, ['review', 'request', 'TASK-DAEMON', '--agent', 'codex', '--commit', candidate], sessions['codex']);
+    const verification = cliJson(fixture.path, ['verify', 'TASK-DAEMON', '--agent', 'grok', '--commit', candidate, '--check', 'fixture'], sessions['grok']);
     assert.equal(verification['exit_code'], 0);
     assert.equal(verification['runner'], 'grok');
-    cliJson(fixture.path, ['review', 'submit', String(review['id']), '--agent', 'claude', '--verdict', 'approved']);
+    cliJson(fixture.path, ['review', 'submit', String(review['id']), '--agent', 'claude', '--verdict', 'approved'], sessions['claude']);
 
     const pending = cliJson(fixture.path, ['status'])['tasks'] as Array<Record<string, unknown>>;
     cliJson(fixture.path, ['task', 'accept', 'TASK-DAEMON', '--actor', 'human', '--expected-version', String(pending[0]?.['version'])]);
@@ -1471,13 +1520,14 @@ test('verification runs inside collabd while its output streams back to the clie
   const fixture = createRepository();
   const daemon = await startDaemon(fixture.path);
   try {
+    const sessions = openSessions(fixture.path, ['grok']);
     cliJson(fixture.path, ['task', 'create', 'TASK-STREAM', '--goal', 'Stream verification output']);
     cliJson(fixture.path, ['task', 'assign-roles', 'TASK-STREAM', '--actor', 'human', '--implementer', 'codex', '--reviewer', 'claude', '--verifier', 'grok']);
     const head = git(fixture.path, ['rev-parse', 'HEAD']);
     const result = runCli(fixture.path, [
       'verify', 'TASK-STREAM', '--agent', 'grok', '--commit', head,
       '--', 'node', '-e', 'console.log("check speaking"); console.error("check warning"); process.exit(3)',
-    ]);
+    ], sessions['grok']);
     assert.equal(result.status, 3, 'the client exits with the exit code the daemon observed');
     assert.match(result.stdout, /check speaking/);
     assert.match(result.stderr, /check warning/);
@@ -1527,11 +1577,12 @@ test('concurrent claims through the daemon produce exactly one owner', async () 
   const fixture = createRepository();
   const daemon = await startDaemon(fixture.path);
   try {
+    const sessions = openSessions(fixture.path, ['codex']);
     cliJson(fixture.path, ['task', 'create', 'TASK-RACE', '--goal', 'Only one owner may win']);
     cliJson(fixture.path, ['task', 'assign-roles', 'TASK-RACE', '--actor', 'human', '--implementer', 'codex', '--reviewer', 'claude', '--verifier', 'grok']);
     const attempts = await Promise.all([
-      runCliAsync(fixture.path, ['task', 'claim', 'TASK-RACE', '--agent', 'codex', '--expected-version', '1']),
-      runCliAsync(fixture.path, ['task', 'claim', 'TASK-RACE', '--agent', 'codex', '--expected-version', '1']),
+      runCliAsync(fixture.path, ['task', 'claim', 'TASK-RACE', '--agent', 'codex', '--expected-version', '1'], sessions['codex']),
+      runCliAsync(fixture.path, ['task', 'claim', 'TASK-RACE', '--agent', 'codex', '--expected-version', '1'], sessions['codex']),
     ]);
     const winners = attempts.filter((attempt) => attempt.status === 0);
     const losers = attempts.filter((attempt) => attempt.status !== 0);
@@ -1648,6 +1699,7 @@ test('a replacement daemon cannot start while the outgoing one is still draining
   const { lockPath } = daemonRuntimePaths(fixture.path);
   const daemon = await startDaemon(fixture.path);
   try {
+    const sessions = openSessions(fixture.path, ['grok']);
     cliJson(fixture.path, ['task', 'create', 'TASK-DRAIN', '--goal', 'Hold ownership until the work is done']);
     cliJson(fixture.path, ['task', 'assign-roles', 'TASK-DRAIN', '--actor', 'human', '--implementer', 'codex', '--reviewer', 'claude', '--verifier', 'grok']);
     const head = git(fixture.path, ['rev-parse', 'HEAD']);
@@ -1656,7 +1708,7 @@ test('a replacement daemon cannot start while the outgoing one is still draining
     const verifying = runCliAsync(fixture.path, [
       'verify', 'TASK-DRAIN', '--agent', 'grok', '--commit', head,
       '--', 'node', '-e', `require('fs').writeFileSync(${JSON.stringify(sentinel)}, 'x'); setTimeout(() => process.exit(0), 5000)`,
-    ]);
+    ], sessions['grok']);
     await waitFor('the verification to actually start', () => existsSync(sentinel));
 
     daemon.signal('SIGTERM');
@@ -1719,6 +1771,262 @@ test('a startup failure after listening surrenders the server, database, and own
     assert.ok(!existsSync(lockPath), 'a failed start does not strand the singleton lock');
   } finally {
     rmSync(descriptorPath, { recursive: true, force: true });
+    fixture.close();
+  }
+});
+
+test('a model session is bound to its own identity and the control credential is bound to the human', async () => {
+  const fixture = createRepository();
+  const daemon = await startDaemon(fixture.path);
+  try {
+    const sessions = openSessions(fixture.path, ['codex', 'claude']);
+    cliJson(fixture.path, ['task', 'create', 'TASK-BOUND', '--goal', 'Bind every claim to a principal']);
+    cliJson(fixture.path, ['task', 'assign-roles', 'TASK-BOUND', '--actor', 'human', '--implementer', 'codex', '--reviewer', 'claude', '--verifier', 'grok']);
+
+    // Codex may act as Codex.
+    cliJson(fixture.path, ['message', 'send', '--from', 'codex', '--to', 'claude', '--body', 'Session bound.'], sessions['codex']);
+
+    // It may not act as another model, as the human, or as the control plane.
+    for (const [args, code] of [
+      [['task', 'claim', 'TASK-BOUND', '--agent', 'claude', '--expected-version', '1'], 'identity_mismatch'],
+      [['message', 'send', '--from', 'grok', '--to', 'human', '--body', 'Not grok.'], 'identity_mismatch'],
+      [['task', 'accept', 'TASK-BOUND', '--actor', 'human', '--expected-version', '1'], 'identity_mismatch'],
+      [['session', 'open', 'grok'], 'control_credential_required'],
+      [['worktree', 'bootstrap'], 'control_credential_required'],
+    ] as Array<[string[], string]>) {
+      const rejected = runCli(fixture.path, args, sessions['codex']);
+      assert.notEqual(rejected.status, 0, `collab ${args.join(' ')} must be refused`);
+      assert.equal(cliError(rejected)['error'], code, `collab ${args.join(' ')}`);
+    }
+
+    // The control credential carries human authority and no model identity at all, so reading the
+    // daemon descriptor is not a way to mutate state as Codex.
+    const borrowed = runCli(fixture.path, ['task', 'claim', 'TASK-BOUND', '--agent', 'codex', '--expected-version', '1']);
+    assert.notEqual(borrowed.status, 0);
+    assert.equal(cliError(borrowed)['error'], 'identity_mismatch');
+
+    // A live session is not a recovery candidate: replacement exists for a session that is gone.
+    const live = runCli(fixture.path, ['session', 'replace', 'codex', '--reason', 'no reason to']);
+    assert.notEqual(live.status, 0);
+    assert.equal(cliError(live)['error'], 'session_live');
+
+    // Domain authority is unchanged by any of this: Claude still cannot claim an implementer task.
+    const forbidden = runCli(
+      fixture.path,
+      ['task', 'claim', 'TASK-BOUND', '--agent', 'claude', '--expected-version', '1'],
+      sessions['claude'],
+    );
+    assert.notEqual(forbidden.status, 0);
+    assert.equal(cliError(forbidden)['error'], 'role_forbidden');
+  } finally {
+    await daemon.stop();
+    fixture.close();
+  }
+});
+
+test('a model has one current session, and closing or replacing it invalidates the old credential', async () => {
+  const fixture = createRepository();
+  // Every session is immediately eligible for recovery, so staleness never has to be waited out.
+  const daemon = await startDaemon(fixture.path, { COLLAB_SESSION_STALE_MS: '0' });
+  try {
+    const sessions = openSessions(fixture.path, ['codex']);
+
+    const duplicate = runCli(fixture.path, ['session', 'open', 'codex']);
+    assert.notEqual(duplicate.status, 0, 'a second current session cannot coexist with the first');
+    assert.equal(cliError(duplicate)['error'], 'session_exists');
+
+    const replacement = cliJson(fixture.path, ['session', 'replace', 'codex', '--reason', 'terminal was lost']);
+    const replaced = String(replacement['replaced_session_id']);
+    assert.notEqual(replacement['token'], undefined);
+
+    // The process holding the old credential fails closed rather than reattaching.
+    const stale = runCli(fixture.path, ['sync', '--agent', 'codex'], sessions['codex']);
+    assert.notEqual(stale.status, 0);
+    assert.equal(cliError(stale)['error'], 'unauthorized');
+
+    const successor = join(mkdtempSync(join(tmpdir(), 'scrapgrid-session-test-')), 'codex.json');
+    const issued = replacement['session'] as Record<string, unknown>;
+    writeFileSync(
+      successor,
+      JSON.stringify({
+        session_id: issued['id'],
+        agent_id: 'codex',
+        token: replacement['token'],
+        issued_at: issued['created_at'],
+      }),
+    );
+    assert.equal(cliJson(fixture.path, ['sync', '--agent', 'codex'], successor)['agent_id'], 'codex');
+
+    const projected = cliJson(fixture.path, ['status'])['sessions'] as Array<Record<string, unknown>>;
+    const open = projected.filter((session) => session['status'] === 'open');
+    assert.equal(open.length, 1, 'exactly one session is current');
+    assert.equal(open[0]?.['id'], issued['id']);
+    const retired = projected.find((session) => session['id'] === replaced);
+    assert.equal(retired?.['status'], 'replaced');
+    assert.equal(retired?.['replaced_by_session_id'], issued['id']);
+    assert.ok(projected.every((session) => !Object.hasOwn(session, 'credential_hash')));
+
+    // A closed session is just as dead as a replaced one.
+    cliJson(fixture.path, ['session', 'close', 'codex', '--reason', 'done for the day']);
+    const closed = runCli(fixture.path, ['sync', '--agent', 'codex'], successor);
+    assert.notEqual(closed.status, 0);
+    assert.equal(cliError(closed)['error'], 'unauthorized');
+  } finally {
+    await daemon.stop();
+    fixture.close();
+  }
+});
+
+test('a session survives a daemon restart, and neither restart nor replacement moves task authority', async () => {
+  const fixture = createRepository();
+  const first = await startDaemon(fixture.path, { COLLAB_SESSION_STALE_MS: '0' });
+  const sessions = openSessions(fixture.path, ['codex']);
+  cliJson(fixture.path, ['task', 'create', 'TASK-SESSION', '--goal', 'Keep authority across recovery']);
+  cliJson(fixture.path, ['task', 'assign-roles', 'TASK-SESSION', '--actor', 'human', '--implementer', 'codex', '--reviewer', 'claude', '--verifier', 'grok']);
+  cliJson(fixture.path, ['task', 'claim', 'TASK-SESSION', '--agent', 'codex', '--expected-version', '1'], sessions['codex']);
+  const authority = cliJson(fixture.path, ['status']);
+  const canonical = (state: Record<string, unknown>): Record<string, unknown> => ({
+    tasks: state['tasks'],
+    active_leases: state['active_leases'],
+    active_claim_reservations: state['active_claim_reservations'],
+    task_roles: state['task_roles'],
+  });
+  await first.stop();
+
+  const second = await startDaemon(fixture.path, { COLLAB_SESSION_STALE_MS: '0' });
+  try {
+    assert.notEqual(second.descriptor.agent_token, first.descriptor.agent_token, 'the control credential rotated');
+
+    // The same session credential reconnects to the replacement daemon.
+    const beat = cliJson(fixture.path, ['session', 'heartbeat'], sessions['codex']);
+    assert.equal(beat['agent_id'], 'codex');
+    assert.equal(beat['status'], 'open');
+    assert.equal(cliJson(fixture.path, ['sync', '--agent', 'codex'], sessions['codex'])['agent_id'], 'codex');
+    assert.deepEqual(canonical(cliJson(fixture.path, ['status'])), canonical(authority), 'restart moved no task authority');
+
+    // Nor does deliberate recovery of the session identity.
+    cliJson(fixture.path, ['session', 'replace', 'codex', '--reason', 'the terminal was closed']);
+    assert.deepEqual(canonical(cliJson(fixture.path, ['status'])), canonical(authority), 'replacement moved no task authority');
+  } finally {
+    await second.stop();
+    fixture.close();
+  }
+});
+
+test('a session with accepted daemon work in flight cannot be replaced, however stale it looks', async () => {
+  const fixture = createRepository();
+  const sentinel = join(mkdtempSync(join(tmpdir(), 'scrapgrid-inflight-')), 'verification-started');
+  const daemon = await startDaemon(fixture.path, { COLLAB_SESSION_STALE_MS: '0' });
+  try {
+    const sessions = openSessions(fixture.path, ['grok']);
+    cliJson(fixture.path, ['task', 'create', 'TASK-INFLIGHT', '--goal', 'Never overlap two authorities']);
+    cliJson(fixture.path, ['task', 'assign-roles', 'TASK-INFLIGHT', '--actor', 'human', '--implementer', 'codex', '--reviewer', 'claude', '--verifier', 'grok']);
+    const head = git(fixture.path, ['rev-parse', 'HEAD']);
+
+    const verifying = runCliAsync(fixture.path, [
+      'verify', 'TASK-INFLIGHT', '--agent', 'grok', '--commit', head,
+      '--', 'node', '-e', `require('fs').writeFileSync(${JSON.stringify(sentinel)}, 'x'); setTimeout(() => process.exit(0), 3000)`,
+    ], sessions['grok']);
+    await waitFor('the verification to actually start', () => existsSync(sentinel));
+
+    // The heartbeat timestamp already qualifies as stale, and the session is still a live writer.
+    const refused = runCli(fixture.path, ['session', 'replace', 'grok', '--reason', 'looks gone']);
+    assert.notEqual(refused.status, 0, 'replacement must not overlap two authorities for one model');
+    assert.equal(cliError(refused)['error'], 'session_busy');
+
+    const verified = await verifying;
+    assert.equal(verified.status, 0);
+    assert.equal(parseCliJson(verified.stdout)['exit_code'], 0);
+
+    // Once the daemon is no longer writing on its behalf, the same recovery succeeds.
+    const recovered = cliJson(fixture.path, ['session', 'replace', 'grok', '--reason', 'genuinely gone']);
+    assert.equal((recovered['session'] as Record<string, unknown>)['agent_id'], 'grok');
+  } finally {
+    await daemon.stop();
+    rmSync(dirname(sentinel), { recursive: true, force: true });
+    fixture.close();
+  }
+});
+
+test('a session credential is delivered to the model worktree at 0600 and never stored raw', async () => {
+  const fixture = createRepository();
+  const daemon = await startDaemon(fixture.path);
+  const worktreeRoot = join(fixture.path, 'worktrees');
+  let token = '';
+  try {
+    cliJson(fixture.path, ['worktree', 'bootstrap', '--root', worktreeRoot]);
+    const issued = cliJson(fixture.path, ['session', 'open', 'codex']);
+    token = String(issued['token']);
+    const descriptorPath = String(issued['descriptor_path']);
+    assert.equal(descriptorPath, join(worktreeRoot, 'codex', '.collab', 'session.json'));
+    assert.equal(statSync(descriptorPath).mode & 0o777, 0o600);
+
+    const descriptor = JSON.parse(readFileSync(descriptorPath, 'utf8')) as Record<string, unknown>;
+    assert.equal(descriptor['agent_id'], 'codex');
+    assert.equal(descriptor['token'], token);
+    assert.ok(!Object.hasOwn(descriptor, 'url'), 'the session file answers who am I, not where is collabd');
+
+    // A model running in its own worktree is authenticated as itself without any extra configuration.
+    assert.equal(cliJson(join(worktreeRoot, 'codex'), ['sync', '--agent', 'codex'])['agent_id'], 'codex');
+
+    const snapshot = await (
+      await fetch(`${daemon.descriptor.url}/api/snapshot`, { headers: { authorization: `Bearer ${daemon.browserToken}` } })
+    ).json();
+    assert.ok(!JSON.stringify(snapshot).includes(token), 'the snapshot never carries a session credential');
+  } finally {
+    await daemon.stop();
+    fixture.close();
+  }
+  // Read after the daemon closed, so the write-ahead log has been checkpointed into the database.
+  for (const suffix of ['', '-wal', '-shm']) {
+    const path = join(fixture.path, '.collab', `collab.db${suffix}`);
+    if (!existsSync(path)) continue;
+    assert.ok(!readFileSync(path).includes(token), `the raw credential is absent from collab.db${suffix}`);
+  }
+});
+
+test('authenticated activity refreshes liveness without spamming the ledger or the event stream', async () => {
+  const fixture = createRepository();
+  const daemon = await startDaemon(fixture.path);
+  try {
+    const sessions = openSessions(fixture.path, ['codex']);
+    // One beat first, so the comparison is between two timestamps rather than against never-seen.
+    cliJson(fixture.path, ['session', 'heartbeat'], sessions['codex']);
+    const record = async (): Promise<{ beat: string; seen: unknown; operations: number; events: number }> => {
+      const status = cliJson(fixture.path, ['status']);
+      const session = (status['sessions'] as Array<Record<string, unknown>>).find((row) => row['status'] === 'open');
+      const agent = (status['agents'] as Array<Record<string, unknown>>).find((row) => row['id'] === 'codex');
+      const snapshot = (await (
+        await fetch(`${daemon.descriptor.url}/api/snapshot`, { headers: { authorization: `Bearer ${daemon.browserToken}` } })
+      ).json()) as Record<string, unknown[]>;
+      return {
+        beat: String(session?.['last_heartbeat_at']),
+        seen: agent?.['last_seen_at'],
+        operations: (snapshot['operations'] ?? []).length,
+        events: (snapshot['events'] ?? []).length,
+      };
+    };
+
+    const opened = await record();
+    assert.equal(
+      (cliJson(fixture.path, ['status'])['sessions'] as Array<Record<string, unknown>>)[0]?.['liveness'],
+      'live',
+    );
+
+    await delay(5);
+    for (let beat = 0; beat < 3; beat += 1) cliJson(fixture.path, ['session', 'heartbeat'], sessions['codex']);
+    const beaten = await record();
+    assert.ok(beaten.beat > opened.beat, 'an explicit heartbeat refreshes session liveness');
+    assert.ok(String(beaten.seen) > String(opened.seen), 'and the agent identity it belongs to');
+    assert.equal(beaten.operations, opened.operations, 'heartbeats add no operation attempts');
+    assert.equal(beaten.events, opened.events, 'heartbeats add no domain events');
+
+    // Ordinary authenticated work is itself evidence of life; no separate heartbeat is required.
+    await delay(5);
+    cliJson(fixture.path, ['agent', 'list'], sessions['codex']);
+    assert.ok((await record()).beat > beaten.beat, 'any authenticated session request refreshes liveness');
+  } finally {
+    await daemon.stop();
     fixture.close();
   }
 });

@@ -4,11 +4,14 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, resolve, sep } from 'node:path';
 import { GitError } from './git.js';
 import {
+  authorizeOperation,
   operationInput,
   requireOperation,
   type DaemonSummary,
   type OperationContext,
+  type OperationPrincipal,
   type OutputStream,
+  type SessionActivity,
 } from './operations.js';
 import type { GitRepository } from './git.js';
 import type { CollaborationService } from './service.js';
@@ -28,9 +31,14 @@ const KEEPALIVE_INTERVAL_MS = 10_000;
 /**
  * Two separately scoped credentials, minted fresh by each `collabd` start.
  *
- * `agent` reaches the whole operation registry and is published in the owner-only daemon
- * descriptor. `browser` reaches only the snapshot and the human-control routes, and is delivered
- * through the URL fragment the daemon prints on its own stdout.
+ * `agent` is the local control and bootstrap credential: it establishes and recovers model
+ * sessions and carries human authority, and is published in the owner-only daemon descriptor. It
+ * no longer represents any model identity. `browser` reaches only the snapshot and the
+ * human-control routes, and is delivered through the URL fragment the daemon prints on its own
+ * stdout.
+ *
+ * Model session credentials are deliberately absent here. They are durable, they outlive a daemon
+ * start, and they live in the database rather than in this process.
  */
 export interface DaemonCredentials {
   agent: string;
@@ -68,12 +76,30 @@ export function createActivityGate(): ActivityGate {
   };
 }
 
+/**
+ * Per-session view of the same fact `ActivityGate` tracks for the daemon as a whole: work accepted
+ * and not yet finished. Recovery consults it so a session that is still writing cannot be replaced.
+ */
+export function createSessionActivity(): SessionActivity {
+  const counts = new Map<string, number>();
+  return {
+    begin: (sessionId) => { counts.set(sessionId, (counts.get(sessionId) ?? 0) + 1); },
+    end: (sessionId) => {
+      const remaining = (counts.get(sessionId) ?? 0) - 1;
+      if (remaining > 0) counts.set(sessionId, remaining);
+      else counts.delete(sessionId);
+    },
+    busy: (sessionId) => (counts.get(sessionId) ?? 0) > 0,
+  };
+}
+
 export interface CollaborationHttpOptions {
   service: CollaborationService;
   repository: GitRepository;
   credentials: DaemonCredentials;
   daemon: DaemonSummary;
   activity?: ActivityGate;
+  sessionActivity?: SessionActivity;
   staticRoot?: string;
 }
 
@@ -144,6 +170,27 @@ function requireCredential(request: IncomingMessage, expected: string, scope: st
   }
 }
 
+/**
+ * Resolves the operation route's bearer credential to an authenticated principal.
+ *
+ * A durable model session is tried first, so a session credential keeps working across daemon
+ * restarts that reminted the control credential. Everything else — missing, unknown, closed, or
+ * replaced — falls through to the control comparison and then fails closed.
+ */
+function requirePrincipal(
+  request: IncomingMessage,
+  service: CollaborationService,
+  credentials: DaemonCredentials,
+): OperationPrincipal {
+  const presented = presentedCredential(request);
+  if (presented) {
+    const session = service.authenticateSession(presented);
+    if (session) return { kind: 'session', agentId: session.agentId, sessionId: session.sessionId };
+    if (credentialMatches(presented, credentials.agent)) return { kind: 'control', agentId: 'human' };
+  }
+  throw new HttpError('a collabd session or control credential is required', 401, 'unauthorized');
+}
+
 async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let length = 0;
@@ -165,6 +212,7 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
 
 function errorStatus(error: CollaborationError | GitError): number {
   if (error.code.startsWith('unknown_')) return 404;
+  if (error.code === 'identity_mismatch') return 403;
   if (error.code.includes('required') || error.code.includes('forbidden')) return 403;
   return 409;
 }
@@ -213,12 +261,23 @@ async function streamOperation(
   try {
     definition = requireOperation(name);
     input = operationInput(body['input']);
+    // The session boundary answers before the stream opens, so a refused identity is an HTTP
+    // status rather than an error frame inside a 200 the caller has to parse.
+    authorizeOperation(definition, context.principal, input);
   } catch (error) {
     if (error instanceof CollaborationError) {
-      throw new HttpError(error.message, error.code === 'unknown_operation' ? 404 : 400, error.code);
+      throw new HttpError(error.message, error.code === 'unknown_operation' ? 404 : errorStatus(error), error.code);
     }
     throw error;
   }
+
+  const { principal, sessionActivity } = context;
+  // Any authenticated request from a session is evidence of life; no separate heartbeat is required.
+  if (principal.kind === 'session') context.service.touchSession(principal);
+  // Only accepted mutations make a session unreplaceable. Reads cannot leave canonical state
+  // half-written, and treating them as work in flight would make recovery hostage to polling.
+  const tracked = principal.kind === 'session' && definition.mutating;
+  if (tracked) sessionActivity?.begin(principal.sessionId);
 
   response.writeHead(200, {
     'cache-control': 'no-store',
@@ -240,13 +299,14 @@ async function streamOperation(
       write({ type: 'error', code: 'internal_error', message: 'internal server error' });
     }
   } finally {
+    if (tracked && principal.kind === 'session') sessionActivity?.end(principal.sessionId);
     clearInterval(keepalive);
     response.end();
   }
 }
 
 export function createCollaborationHttpServer(options: CollaborationHttpOptions) {
-  const { service, repository, credentials, daemon, activity, staticRoot } = options;
+  const { service, repository, credentials, daemon, activity, sessionActivity, staticRoot } = options;
   return createServer(async (request, response) => {
     activity?.begin();
     try {
@@ -259,9 +319,15 @@ export function createCollaborationHttpServer(options: CollaborationHttpOptions)
 
       if (request.method === 'POST') {
         if (url.pathname === '/api/operations') {
-          requireCredential(request, credentials.agent, 'collabd agent');
+          const principal = requirePrincipal(request, service, credentials);
           rejectForeignOrigin(request);
-          return await streamOperation(request, response, { service, repository, daemon });
+          return await streamOperation(request, response, {
+            service,
+            repository,
+            daemon,
+            principal,
+            sessionActivity,
+          });
         }
 
         const revealMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/reveal-proposals$/);

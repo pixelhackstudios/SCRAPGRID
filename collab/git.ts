@@ -56,6 +56,19 @@ function git(cwd: string, args: string[]): string {
   }
 }
 
+/**
+ * The working tree the caller is standing in, which is a managed agent worktree rather than the
+ * main one whenever a model runs the CLI from its own checkout.
+ */
+export function worktreeRoot(startPath: string): string {
+  const cwd = resolve(startPath);
+  try {
+    return realpathSync(git(cwd, ['rev-parse', '--show-toplevel']));
+  } catch {
+    throw new GitError(`${cwd} is not inside a Git working tree`, 'repository_not_found');
+  }
+}
+
 function mainWorktreePath(cwd: string): string {
   const list = git(cwd, ['worktree', 'list', '--porcelain']);
   const firstLine = list.split('\n').find((line) => line.startsWith('worktree '));

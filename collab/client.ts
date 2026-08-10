@@ -1,9 +1,13 @@
-import type { GitRepository } from './git.js';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { worktreeRoot, type GitRepository } from './git.js';
 import {
   daemonRuntimePaths,
   DaemonRuntimeError,
   readDaemonDescriptor,
+  readSessionDescriptor,
   requireLiveDaemon,
+  sessionDescriptorPath,
   type DaemonDescriptor,
 } from './runtime.js';
 
@@ -25,6 +29,36 @@ export function connectToDaemon(repository: GitRepository): DaemonDescriptor {
   return requireLiveDaemon(readDaemonDescriptor(descriptorPath), repository.binding.identity);
 }
 
+export interface ClientCredential {
+  token: string;
+  /** Which identity this invocation will be authenticated as. */
+  principal: 'control' | string;
+  source: string;
+}
+
+/**
+ * Chooses which credential this invocation presents.
+ *
+ * A model runs the CLI from its own managed worktree, where the daemon delivered its session
+ * descriptor, so it is authenticated as itself without passing a flag. The human runs it from the
+ * main worktree, where no session descriptor exists, and falls back to the daemon's local control
+ * credential. `COLLAB_SESSION` names a descriptor explicitly when a model is not in its worktree.
+ */
+export function resolveCredential(descriptor: DaemonDescriptor, startPath: string): ClientCredential {
+  const explicit = process.env['COLLAB_SESSION'];
+  if (explicit) {
+    const path = resolve(explicit);
+    const session = readSessionDescriptor(path);
+    return { token: session.token, principal: session.agent_id, source: path };
+  }
+  const local = sessionDescriptorPath(worktreeRoot(startPath));
+  if (existsSync(local)) {
+    const session = readSessionDescriptor(local);
+    return { token: session.token, principal: session.agent_id, source: local };
+  }
+  return { token: descriptor.agent_token, principal: 'control', source: 'daemon control credential' };
+}
+
 function frameError(payload: Record<string, unknown>): DaemonRuntimeError {
   const message = typeof payload['message'] === 'string' ? payload['message'] : 'collabd rejected the operation';
   const code = typeof payload['code'] === 'string' ? payload['code'] : 'operation_failed';
@@ -33,6 +67,7 @@ function frameError(payload: Record<string, unknown>): DaemonRuntimeError {
 
 async function requestOperation(
   descriptor: DaemonDescriptor,
+  credential: string,
   operation: string,
   input: Record<string, unknown>,
 ): Promise<Response> {
@@ -41,7 +76,7 @@ async function requestOperation(
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        authorization: `Bearer ${descriptor.agent_token}`,
+        authorization: `Bearer ${credential}`,
       },
       body: JSON.stringify({ operation, input }),
     });
@@ -61,11 +96,12 @@ async function requestOperation(
  */
 export async function invokeOperation(
   descriptor: DaemonDescriptor,
+  credential: string,
   operation: string,
   input: Record<string, unknown> = {},
   onOutput: OutputSink = defaultSink,
 ): Promise<unknown> {
-  const response = await requestOperation(descriptor, operation, input);
+  const response = await requestOperation(descriptor, credential, operation, input);
   if (!response.ok) {
     const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
     throw new DaemonRuntimeError(

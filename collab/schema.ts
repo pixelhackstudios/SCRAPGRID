@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
@@ -9,6 +9,20 @@ CREATE TABLE IF NOT EXISTS agents (
   kind TEXT NOT NULL CHECK (kind IN ('human', 'model')),
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused')),
   last_seen_at TEXT
+);
+
+-- One authenticated collaboration session per model agent. The bearer credential itself is never
+-- stored: only its hash is, so a database copy cannot be replayed as an identity.
+CREATE TABLE IF NOT EXISTS agent_sessions (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  credential_hash TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed', 'replaced')),
+  created_at TEXT NOT NULL,
+  last_heartbeat_at TEXT NOT NULL,
+  ended_at TEXT,
+  ended_reason TEXT,
+  replaced_by_session_id TEXT REFERENCES agent_sessions(id)
 );
 
 CREATE TABLE IF NOT EXISTS project_state (
@@ -193,6 +207,10 @@ CREATE TABLE IF NOT EXISTS events (
   payload TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),
   timestamp TEXT NOT NULL
 );
+
+-- The exclusivity invariant itself: at most one current session per model agent, enforced by the
+-- database rather than by whichever code path happens to open one.
+CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_current ON agent_sessions(agent_id) WHERE status = 'open';
 
 CREATE INDEX IF NOT EXISTS events_actor_cursor ON events(actor, id);
 CREATE INDEX IF NOT EXISTS operation_attempts_started ON operation_attempts(started_at);

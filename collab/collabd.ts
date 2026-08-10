@@ -10,7 +10,7 @@ import {
   recoverAbandonedOperations,
 } from './database.js';
 import { GitError, GitRepository } from './git.js';
-import { createActivityGate, createCollaborationHttpServer } from './http.js';
+import { createActivityGate, createCollaborationHttpServer, createSessionActivity } from './http.js';
 import type { DaemonSummary } from './operations.js';
 import {
   acquireDaemonLock,
@@ -21,9 +21,23 @@ import {
   writeDaemonDescriptor,
 } from './runtime.js';
 import { SCHEMA_VERSION } from './schema.js';
-import { CollaborationService } from './service.js';
+import { CollaborationService, SESSION_STALE_AFTER_MS } from './service.js';
 
 const HOST = '127.0.0.1';
+
+/**
+ * How long a session may go quiet before recovery may replace it. Configurable because the right
+ * answer depends on how long a model's turns actually run; the default suits frontier coding agents.
+ */
+function sessionStaleAfterMs(): number {
+  const raw = process.env['COLLAB_SESSION_STALE_MS'];
+  if (raw === undefined) return SESSION_STALE_AFTER_MS;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new DaemonRuntimeError('COLLAB_SESSION_STALE_MS must be a non-negative integer', 'invalid_session_stale_ms');
+  }
+  return value;
+}
 
 function requestedPort(): number {
   const port = Number(process.env['PORT'] ?? 4173);
@@ -50,8 +64,9 @@ async function start(): Promise<void> {
   }
 
   const abandoned = recoverAbandonedOperations(db);
-  const service = new CollaborationService(db, repository);
+  const service = new CollaborationService(db, repository, { sessionStaleAfterMs: sessionStaleAfterMs() });
   const activity = createActivityGate();
+  const sessionActivity = createSessionActivity();
   const credentials = { agent: mintToken(), browser: mintToken() };
   const startedAt = new Date().toISOString();
   const daemon: DaemonSummary = {
@@ -68,6 +83,7 @@ async function start(): Promise<void> {
     credentials,
     daemon,
     activity,
+    sessionActivity,
     staticRoot: resolve(repository.binding.rootPath, 'dist'),
   });
 
@@ -139,7 +155,7 @@ async function start(): Promise<void> {
       [
         `SCRAPGRID collabd listening on ${daemon.url}`,
         `repository      ${repository.binding.identity}`,
-        `agent clients   ${paths.descriptorPath}`,
+        `control clients ${paths.descriptorPath}`,
         `field terminal  ${daemon.url}/#t=${credentials.browser}`,
         ...(abandoned > 0 ? [`recovered       ${abandoned} abandoned operation attempt(s)`] : []),
         '',

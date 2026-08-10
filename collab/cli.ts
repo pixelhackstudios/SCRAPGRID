@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { connectToDaemon, invokeOperation } from './client.js';
+import { connectToDaemon, invokeOperation, resolveCredential } from './client.js';
 import { GitError, GitRepository } from './git.js';
 import { DaemonRuntimeError } from './runtime.js';
 
@@ -67,6 +67,10 @@ function help(): void {
 Every command is a request to this repository's collabd. Start the daemon first with "npm start";
 the CLI never opens the collaboration database itself.
 
+A model is authenticated by the session descriptor in its own managed worktree; the human is
+authenticated by the daemon's local control credential. COLLAB_SESSION names a session descriptor
+explicitly when a model is not running inside its worktree.
+
 Global option:
   --repo PATH                            Path inside the bound repository (default current directory)
 
@@ -74,6 +78,10 @@ Commands:
   init
   daemon status
   status
+  session open AGENT
+  session replace AGENT --reason TEXT
+  session close AGENT [--reason TEXT]
+  session heartbeat
   sync --agent ID [--after EVENT_ID]
   agent list
   worktree bootstrap [--root PATH] [--base SHA]
@@ -107,6 +115,14 @@ function resolveInvocation(parsed: ReturnType<typeof parseArguments>): Invocatio
     return { operation: 'sync', input: { agent: required(options, 'agent'), after: integer(options, 'after', 0) } };
   }
   if (area === 'agent' && action === 'list') return { operation: 'agents.list', input: {} };
+  if (area === 'session' && action === 'heartbeat') return { operation: 'session.heartbeat', input: {} };
+  if (area === 'session' && action === 'open' && id) return { operation: 'session.open', input: { agent: id } };
+  if (area === 'session' && action === 'replace' && id) {
+    return { operation: 'session.replace', input: { agent: id, reason: required(options, 'reason') } };
+  }
+  if (area === 'session' && action === 'close' && id) {
+    return { operation: 'session.close', input: { agent: id, reason: optional(options, 'reason') } };
+  }
   if (area === 'worktree' && action === 'bootstrap') {
     return {
       operation: 'worktree.bootstrap',
@@ -258,10 +274,12 @@ async function run(): Promise<void> {
     throw new Error('--db is no longer accepted: collabd owns the collaboration database. Set COLLAB_DB before starting the daemon.');
   }
 
-  const repository = GitRepository.discover(optional(parsed.options, 'repo'));
+  const startPath = optional(parsed.options, 'repo') ?? process.cwd();
+  const repository = GitRepository.discover(startPath);
   const invocation = resolveInvocation(parsed);
   const descriptor = connectToDaemon(repository);
-  const result = await invokeOperation(descriptor, invocation.operation, invocation.input);
+  const credential = resolveCredential(descriptor, startPath);
+  const result = await invokeOperation(descriptor, credential.token, invocation.operation, invocation.input);
   print(result);
 
   if (invocation.operation === 'verification.run') {

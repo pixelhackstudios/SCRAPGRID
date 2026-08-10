@@ -1,4 +1,5 @@
 import type { GitRepository } from './git.js';
+import { sessionDescriptorPath, writeSessionDescriptor } from './runtime.js';
 import { CollaborationError, type CollaborationService } from './service.js';
 
 export type OutputStream = 'stdout' | 'stderr';
@@ -11,17 +12,123 @@ export interface DaemonSummary {
   started_at: string;
 }
 
+/**
+ * Who the daemon has authenticated, as distinct from whom the request body claims to be.
+ *
+ * `control` is the local bootstrap credential the daemon publishes in its own descriptor. It
+ * establishes and recovers sessions and carries human authority; it deliberately cannot act as any
+ * model, or session identity would be decorative.
+ */
+export type OperationPrincipal =
+  | { kind: 'control'; agentId: 'human' }
+  | { kind: 'session'; agentId: string; sessionId: string };
+
+/**
+ * Which sessions currently have daemon work the daemon has accepted but not finished.
+ *
+ * `ActivityGate` already answers this for the daemon as a whole so shutdown can outlast a socket.
+ * Recovery needs the same question asked of one session, and nothing more: this is presence
+ * bookkeeping, not a scheduler.
+ */
+export interface SessionActivity {
+  begin(sessionId: string): void;
+  end(sessionId: string): void;
+  busy(sessionId: string): boolean;
+}
+
 export interface OperationContext {
   service: CollaborationService;
   repository: GitRepository;
   daemon: DaemonSummary;
+  principal: OperationPrincipal;
+  sessionActivity?: SessionActivity;
   onOutput?: (stream: OutputStream, data: string) => void;
 }
 
 export interface OperationDefinition {
   /** Read operations bypass the ledger, matching the service methods they call. */
   mutating: boolean;
+  /** Input key carrying a claimed collaboration identity, which must match the principal. */
+  identity?: string;
+  /** Requires the local control credential rather than a model session. */
+  control?: boolean;
+  /** Requires a model session rather than the control credential. */
+  session?: boolean;
   invoke(context: OperationContext, input: Record<string, unknown>): unknown | Promise<unknown>;
+}
+
+/**
+ * The session boundary, applied before any operation runs.
+ *
+ * This is an additional gate, not a replacement for `CollaborationService` authority: passing here
+ * only proves the caller is who it says it is. Whether that identity may perform the operation is
+ * still decided by the service.
+ */
+export function authorizeOperation(
+  definition: OperationDefinition,
+  principal: OperationPrincipal,
+  input: Record<string, unknown>,
+): void {
+  if (definition.control && principal.kind !== 'control') {
+    throw new CollaborationError(
+      'this operation requires the local control credential',
+      'control_credential_required',
+    );
+  }
+  if (definition.session && principal.kind !== 'session') {
+    throw new CollaborationError('this operation requires a model session', 'session_required');
+  }
+  if (!definition.identity) return;
+  const claimed = input[definition.identity];
+  // A malformed claim is left to the operation's own input validation, which reports it precisely.
+  if (typeof claimed !== 'string' || claimed.length === 0) return;
+  if (claimed !== principal.agentId) {
+    throw new CollaborationError(
+      `authenticated as ${principal.agentId}, but this operation claims ${claimed}`,
+      'identity_mismatch',
+    );
+  }
+}
+
+function sessionBusy(context: OperationContext): (sessionId: string) => boolean {
+  return (sessionId) => context.sessionActivity?.busy(sessionId) ?? false;
+}
+
+/**
+ * Publishes a freshly issued credential into the model's own worktree.
+ *
+ * The write happens after the session row commits, so a delivery failure retires the session it
+ * could not deliver rather than leaving a credential nobody holds.
+ */
+function deliverSession(
+  service: CollaborationService,
+  agentId: string,
+  issued: { session: Record<string, unknown>; token: string },
+): Record<string, unknown> {
+  const worktree = service.managedWorktreePath(agentId);
+  let descriptorPath: string | null = null;
+  if (worktree) {
+    descriptorPath = sessionDescriptorPath(worktree);
+    try {
+      writeSessionDescriptor(descriptorPath, {
+        session_id: String(issued.session['id']),
+        agent_id: agentId,
+        token: issued.token,
+        issued_at: String(issued.session['created_at']),
+      });
+    } catch (error) {
+      service.closeSession({
+        agentId,
+        reason: 'session credential could not be delivered',
+        hasWorkInFlight: () => false,
+      });
+      throw new CollaborationError(
+        `session credential could not be written to ${descriptorPath}: ${error instanceof Error ? error.message : String(error)}`,
+        'session_delivery_failed',
+      );
+    }
+  }
+  return { session: issued.session, token: issued.token, descriptor_path: descriptorPath };
 }
 
 function invalid(message: string): CollaborationError {
@@ -103,12 +210,53 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
     mutating: false,
     invoke: ({ service }) => service.listAgents(),
   },
+  'session.open': {
+    mutating: true,
+    control: true,
+    invoke: ({ service }, input) => {
+      const agentId = requiredString(input, 'agent');
+      return deliverSession(service, agentId, service.openSession(agentId));
+    },
+  },
+  'session.replace': {
+    mutating: true,
+    control: true,
+    invoke: (context, input) => {
+      const agentId = requiredString(input, 'agent');
+      const replaced = context.service.replaceSession({
+        agentId,
+        reason: requiredString(input, 'reason'),
+        hasWorkInFlight: sessionBusy(context),
+      });
+      return { ...deliverSession(context.service, agentId, replaced), replaced_session_id: replaced.replaced };
+    },
+  },
+  'session.close': {
+    mutating: true,
+    control: true,
+    invoke: (context, input) =>
+      context.service.closeSession({
+        agentId: requiredString(input, 'agent'),
+        reason: optionalString(input, 'reason') ?? 'closed',
+        hasWorkInFlight: sessionBusy(context),
+      }),
+  },
+  'session.heartbeat': {
+    mutating: false,
+    session: true,
+    invoke: ({ service, principal }) => {
+      if (principal.kind !== 'session') throw new CollaborationError('no session principal', 'session_required');
+      return service.heartbeat(principal);
+    },
+  },
   sync: {
     mutating: true,
+    identity: 'agent',
     invoke: ({ service }, input) => service.sync(requiredString(input, 'agent'), nonNegativeInteger(input, 'after', 0)),
   },
   'worktree.bootstrap': {
     mutating: true,
+    control: true,
     invoke: ({ service, repository }, input) =>
       service.bootstrapWorktrees({
         rootPath: optionalString(input, 'rootPath') ?? `${repository.binding.rootPath}/worktrees`,
@@ -117,6 +265,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   },
   'task.create': {
     mutating: true,
+    identity: 'actor',
     invoke: ({ service }, input) =>
       service.createTask({
         id: requiredString(input, 'id'),
@@ -127,6 +276,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   },
   'task.assign_roles': {
     mutating: true,
+    identity: 'actor',
     invoke: ({ service }, input) =>
       service.assignTaskRoles({
         taskId: requiredString(input, 'taskId'),
@@ -138,6 +288,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   },
   'task.claim': {
     mutating: true,
+    identity: 'agent',
     invoke: ({ service }, input) =>
       service.claimTask({
         taskId: requiredString(input, 'taskId'),
@@ -148,6 +299,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   },
   'task.accept': {
     mutating: true,
+    identity: 'actor',
     invoke: ({ service }, input) =>
       service.acceptTask({
         taskId: requiredString(input, 'taskId'),
@@ -157,6 +309,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   },
   'proposal.submit': {
     mutating: true,
+    identity: 'agent',
     invoke: ({ service }, input) =>
       service.submitProposal({
         taskId: requiredString(input, 'taskId'),
@@ -166,11 +319,13 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   },
   'proposal.reveal': {
     mutating: true,
+    identity: 'actor',
     invoke: ({ service }, input) =>
       service.revealProposals(requiredString(input, 'taskId'), requiredString(input, 'actor')),
   },
   'decision.propose': {
     mutating: true,
+    identity: 'actor',
     invoke: ({ service }, input) =>
       service.proposeDecision({
         taskId: optionalString(input, 'taskId'),
@@ -181,11 +336,13 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   },
   'decision.accept': {
     mutating: true,
+    identity: 'actor',
     invoke: ({ service }, input) =>
       service.acceptDecision(requiredString(input, 'decisionId'), requiredString(input, 'actor')),
   },
   'message.send': {
     mutating: true,
+    identity: 'from',
     invoke: ({ service }, input) =>
       service.sendMessage({
         from: requiredString(input, 'from'),
@@ -196,6 +353,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   },
   'blocker.add': {
     mutating: true,
+    identity: 'agent',
     invoke: ({ service }, input) =>
       service.addBlocker({
         taskId: requiredString(input, 'taskId'),
@@ -205,11 +363,13 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   },
   'blocker.resolve': {
     mutating: true,
+    identity: 'agent',
     invoke: ({ service }, input) =>
       service.resolveBlocker(requiredString(input, 'blockerId'), requiredString(input, 'agent')),
   },
   'review.request': {
     mutating: true,
+    identity: 'agent',
     invoke: ({ service }, input) =>
       service.requestReview({
         taskId: requiredString(input, 'taskId'),
@@ -219,6 +379,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   },
   'review.submit': {
     mutating: true,
+    identity: 'agent',
     invoke: ({ service }, input) =>
       service.submitReview({
         reviewId: requiredString(input, 'reviewId'),
@@ -228,6 +389,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   },
   'finding.add': {
     mutating: true,
+    identity: 'agent',
     invoke: ({ service }, input) =>
       service.addReviewFinding({
         reviewId: requiredString(input, 'reviewId'),
@@ -239,11 +401,13 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   },
   'finding.resolve': {
     mutating: true,
+    identity: 'agent',
     invoke: ({ service }, input) =>
       service.resolveReviewFinding(requiredString(input, 'findingId'), requiredString(input, 'agent')),
   },
   'check_policy.override': {
     mutating: true,
+    identity: 'actor',
     invoke: ({ service }, input) =>
       service.overrideCheckPolicy({
         taskId: requiredString(input, 'taskId'),
@@ -253,6 +417,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
   },
   'verification.run': {
     mutating: true,
+    identity: 'agent',
     invoke: ({ service, onOutput }, input) => {
       const checkId = optionalString(input, 'checkId');
       const command = optionalStringArray(input, 'command');

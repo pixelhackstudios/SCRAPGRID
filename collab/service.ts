@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { GitError, GitRepository } from './git.js';
 
@@ -34,6 +34,32 @@ type TaskRoleAssignment = Record<TaskRole, string>;
 
 const REVISION_RESERVATION_TTL_MS = 60 * 60 * 1000;
 const CHECK_POLICY_PATH = '.scrapgrid/checks.json';
+
+/**
+ * How long an authenticated session may go quiet before recovery may replace it.
+ *
+ * Fifteen minutes is chosen for frontier coding agents, which routinely spend minutes inside a
+ * single turn without touching the daemon. A short presence timeout would classify ordinary
+ * thinking as absence and invite exactly the replacement races step 7 exists to prevent.
+ */
+export const SESSION_STALE_AFTER_MS = 15 * 60 * 1000;
+
+export interface SessionPrincipal {
+  sessionId: string;
+  agentId: string;
+}
+
+export interface ServiceOptions {
+  sessionStaleAfterMs?: number;
+}
+
+export function hashSessionCredential(token: string): string {
+  return createHash('sha256').update(`scrapgrid-session\0${token}`).digest('hex');
+}
+
+export function mintSessionCredential(): string {
+  return randomBytes(32).toString('base64url');
+}
 
 function now(): string {
   return new Date().toISOString();
@@ -99,10 +125,15 @@ function parseCheckPolicy(contents: unknown): CheckPolicy {
 }
 
 export class CollaborationService {
+  private readonly sessionStaleAfterMs: number;
+
   constructor(
     private readonly db: DatabaseSync,
     private readonly repository: GitRepository,
-  ) {}
+    options: ServiceOptions = {},
+  ) {
+    this.sessionStaleAfterMs = options.sessionStaleAfterMs ?? SESSION_STALE_AFTER_MS;
+  }
 
   private domainTransaction<T>(operation: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
@@ -326,8 +357,221 @@ export class CollaborationService {
       .run(operationId, actor, entityType, entityId, action, JSON.stringify(payload), now());
   }
 
+  /** Where a model's session credential can be delivered, when its worktree has been registered. */
+  managedWorktreePath(agentId: string): string | undefined {
+    const worktree = this.db
+      .prepare('SELECT worktree_path FROM managed_worktrees WHERE agent_id = ?')
+      .get(agentId) as Row | undefined;
+    return worktree ? String(worktree['worktree_path']) : undefined;
+  }
+
   listAgents(): Row[] {
     return this.db.prepare('SELECT id, name, kind, status, last_seen_at FROM agents ORDER BY kind, id').all() as Row[];
+  }
+
+  private requireModelAgent(agentId: string): Row {
+    const agent = this.requireAgent(agentId);
+    if (agent['kind'] !== 'model') {
+      throw new CollaborationError(
+        `collaboration sessions belong to model agents: ${agentId}`,
+        'invalid_session_agent',
+      );
+    }
+    return agent;
+  }
+
+  private currentSession(agentId: string): Row | undefined {
+    return this.db
+      .prepare("SELECT * FROM agent_sessions WHERE agent_id = ? AND status = 'open'")
+      .get(agentId) as Row | undefined;
+  }
+
+  private sessionIsStale(session: Row, at = Date.now()): boolean {
+    return Date.parse(String(session['last_heartbeat_at'])) <= at - this.sessionStaleAfterMs;
+  }
+
+  /**
+   * Ends a session and mints the credential that replaces it, if any.
+   *
+   * Every path that retires a session goes through here, so "the previous credential is permanently
+   * invalid" is one rule rather than one rule per caller.
+   */
+  private retireSession(
+    session: Row,
+    status: 'closed' | 'replaced',
+    reason: string,
+    replacedBy?: string,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE agent_sessions
+         SET status = ?, ended_at = ?, ended_reason = ?, replaced_by_session_id = ?
+         WHERE id = ?`,
+      )
+      .run(status, now(), reason, replacedBy ?? null, String(session['id']));
+  }
+
+  private insertSession(agentId: string): { id: string; token: string } {
+    const id = makeId('session');
+    const token = mintSessionCredential();
+    const timestamp = now();
+    this.db
+      .prepare(
+        `INSERT INTO agent_sessions (id, agent_id, credential_hash, status, created_at, last_heartbeat_at)
+         VALUES (?, ?, ?, 'open', ?, ?)`,
+      )
+      .run(id, agentId, hashSessionCredential(token), timestamp, timestamp);
+    return { id, token };
+  }
+
+  private requireSessionRow(sessionId: string): Row {
+    const session = this.db.prepare('SELECT * FROM agent_sessions WHERE id = ?').get(sessionId) as Row | undefined;
+    if (!session) throw new CollaborationError(`unknown session: ${sessionId}`, 'unknown_session');
+    return session;
+  }
+
+  /** Session rows as projected outward. The credential hash never leaves the database. */
+  private publicSession(session: Row, at = Date.now()): Row {
+    const { credential_hash: _hash, ...visible } = session;
+    return {
+      ...visible,
+      liveness:
+        session['status'] !== 'open' ? 'ended' : this.sessionIsStale(session, at) ? 'stale' : 'live',
+    };
+  }
+
+  sessions(): Row[] {
+    const at = Date.now();
+    const rows = this.db
+      .prepare('SELECT * FROM agent_sessions ORDER BY created_at, id')
+      .all() as Row[];
+    return rows.map((session) => this.publicSession(session, at));
+  }
+
+  /**
+   * Resolves a presented bearer credential to its session principal.
+   *
+   * Only an open session authenticates. A closed or replaced credential resolves to nothing, which
+   * is what makes an agent process that wakes up after recovery fail closed rather than reattach.
+   */
+  authenticateSession(token: string): SessionPrincipal | undefined {
+    const session = this.db
+      .prepare("SELECT id, agent_id FROM agent_sessions WHERE credential_hash = ? AND status = 'open'")
+      .get(hashSessionCredential(token)) as Row | undefined;
+    if (!session) return undefined;
+    return { sessionId: String(session['id']), agentId: String(session['agent_id']) };
+  }
+
+  /**
+   * Refreshes liveness without touching the ledger or the event stream.
+   *
+   * Presence is a timestamp, not history. Recording every heartbeat as an attempt and an event
+   * would bury the causal record it exists to keep readable.
+   */
+  touchSession(principal: SessionPrincipal): void {
+    const timestamp = now();
+    this.db
+      .prepare("UPDATE agent_sessions SET last_heartbeat_at = ? WHERE id = ? AND status = 'open'")
+      .run(timestamp, principal.sessionId);
+    this.db.prepare('UPDATE agents SET last_seen_at = ? WHERE id = ?').run(timestamp, principal.agentId);
+  }
+
+  heartbeat(principal: SessionPrincipal): Row {
+    this.touchSession(principal);
+    return this.publicSession(this.requireSessionRow(principal.sessionId));
+  }
+
+  openSession(agentId: string): { session: Row; token: string } {
+    return this.transaction(
+      { name: 'session.open', actor: 'human', subjectType: 'agent', subjectId: agentId },
+      (operationId) => {
+        this.requireModelAgent(agentId);
+        if (this.currentSession(agentId)) {
+          throw new CollaborationError(
+            `${agentId} already has a current session; replace it instead of opening a second one`,
+            'session_exists',
+          );
+        }
+        const { id, token } = this.insertSession(agentId);
+        this.event(operationId, 'human', 'session', id, 'session_opened', { agent_id: agentId });
+        return { session: this.publicSession(this.requireSessionRow(id)), token };
+      },
+    );
+  }
+
+  /**
+   * Deterministic recovery for a session whose agent is gone.
+   *
+   * Replacement is refused while the outgoing session still has accepted daemon work in flight.
+   * A stale heartbeat only means nobody has called recently; a check running inside `collabd` is
+   * still a writer, and handing the same identity to a second process would create exactly the
+   * competing authority Pilot 002 counts as a hard failure.
+   */
+  replaceSession(input: {
+    agentId: string;
+    reason: string;
+    hasWorkInFlight: (sessionId: string) => boolean;
+  }): { session: Row; token: string; replaced: string } {
+    return this.transaction(
+      { name: 'session.replace', actor: 'human', subjectType: 'agent', subjectId: input.agentId },
+      (operationId) => {
+        this.requireModelAgent(input.agentId);
+        const reason = input.reason.trim();
+        if (!reason) {
+          throw new CollaborationError('session replacement requires a reason', 'session_reason_required');
+        }
+        const current = this.currentSession(input.agentId);
+        if (!current) {
+          throw new CollaborationError(`${input.agentId} has no current session`, 'unknown_session');
+        }
+        const outgoing = String(current['id']);
+        if (input.hasWorkInFlight(outgoing)) {
+          throw new CollaborationError(
+            `${input.agentId} still has accepted daemon work in flight`,
+            'session_busy',
+          );
+        }
+        if (!this.sessionIsStale(current)) {
+          throw new CollaborationError(
+            `${input.agentId} has a live session; replacement recovers a stale one`,
+            'session_live',
+          );
+        }
+        // The outgoing row is retired first so the one-open-session index admits the replacement.
+        this.retireSession(current, 'replaced', reason);
+        const { id, token } = this.insertSession(input.agentId);
+        this.db.prepare('UPDATE agent_sessions SET replaced_by_session_id = ? WHERE id = ?').run(id, outgoing);
+        this.event(operationId, 'human', 'session', id, 'session_replaced', {
+          agent_id: input.agentId,
+          replaced_session_id: outgoing,
+          reason,
+        });
+        return { session: this.publicSession(this.requireSessionRow(id)), token, replaced: outgoing };
+      },
+    );
+  }
+
+  closeSession(input: { agentId: string; reason: string; hasWorkInFlight: (sessionId: string) => boolean }): Row {
+    return this.transaction(
+      { name: 'session.close', actor: 'human', subjectType: 'agent', subjectId: input.agentId },
+      (operationId) => {
+        this.requireModelAgent(input.agentId);
+        const current = this.currentSession(input.agentId);
+        if (!current) {
+          throw new CollaborationError(`${input.agentId} has no current session`, 'unknown_session');
+        }
+        const outgoing = String(current['id']);
+        if (input.hasWorkInFlight(outgoing)) {
+          throw new CollaborationError(
+            `${input.agentId} still has accepted daemon work in flight`,
+            'session_busy',
+          );
+        }
+        this.retireSession(current, 'closed', input.reason.trim() || 'closed');
+        this.event(operationId, 'human', 'session', outgoing, 'session_closed', { agent_id: input.agentId });
+        return this.publicSession(this.requireSessionRow(outgoing));
+      },
+    );
   }
 
   status(): JsonObject {
@@ -354,6 +598,8 @@ export class CollaborationService {
       project,
       repository,
       agents: this.listAgents(),
+      // Enabled/paused identity, live/stale session, and last heartbeat stay three separate facts.
+      sessions: this.sessions(),
       tasks,
       active_leases: activeLeases,
       active_claim_reservations: activeClaimReservations,
@@ -399,6 +645,7 @@ export class CollaborationService {
       project,
       repository,
       agents: this.listAgents(),
+      sessions: this.sessions(),
       tasks,
       leases: this.db.prepare('SELECT * FROM leases ORDER BY acquired_at').all() as Row[],
       claim_reservations: this.db.prepare('SELECT * FROM claim_reservations ORDER BY created_at').all() as Row[],
