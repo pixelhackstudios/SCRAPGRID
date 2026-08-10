@@ -308,7 +308,7 @@ This is implementation self-validation. It is not independent verification of ev
 
 Pilot 001 was run in the separate `/home/scott/Development/SCRAPGRID-pilot` repository, on the CLI-first system as it existed at that time. Its original collaboration database was inspected read-only for this document.
 
-This section is a historical record. The harness has changed substantially since the run, and none of the capabilities added in charter steps 1 through 6 were present. Pilot 001 is not evidence for them.
+This section is a historical record. The harness has changed substantially since the run, and none of the capabilities added in charter steps 1 through 7 were present. Pilot 001 is not evidence for them.
 
 ### 5.1 Task and artifact
 
