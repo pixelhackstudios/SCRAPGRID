@@ -47,7 +47,19 @@ interface RunningDaemon {
   descriptor: DaemonDescriptor;
   browserToken: string;
   output: () => string;
+  running: () => boolean;
+  signal: (signal: NodeJS.Signals) => void;
+  exited: Promise<void>;
   stop: () => Promise<void>;
+}
+
+/** Waits for a condition, failing loudly rather than hanging the suite. */
+async function waitFor(description: string, condition: () => boolean, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${description}`);
+    await delay(25);
+  }
 }
 
 /** Spawns a real `collabd` on an ephemeral port and waits until it has published its descriptor. */
@@ -76,6 +88,9 @@ async function startDaemon(repositoryPath: string): Promise<RunningDaemon> {
     descriptor: readDaemonDescriptor(descriptorPath),
     browserToken: /#t=(\S+)/.exec(stdout)?.[1] ?? '',
     output: () => stdout,
+    running: () => child.exitCode === null,
+    signal: (signal) => { if (child.exitCode === null) child.kill(signal); },
+    exited,
     stop: async () => {
       if (child.exitCode === null) child.kill('SIGTERM');
       await exited;
@@ -1624,5 +1639,86 @@ test('the agent and field-terminal credentials are scoped to their own surfaces'
   } finally {
     await new Promise<void>((closed) => server.close(() => closed()));
     close();
+  }
+});
+
+test('a replacement daemon cannot start while the outgoing one is still draining an operation', async () => {
+  const fixture = createRepository();
+  const sentinel = join(mkdtempSync(join(tmpdir(), 'scrapgrid-drain-')), 'verification-started');
+  const { lockPath } = daemonRuntimePaths(fixture.path);
+  const daemon = await startDaemon(fixture.path);
+  try {
+    cliJson(fixture.path, ['task', 'create', 'TASK-DRAIN', '--goal', 'Hold ownership until the work is done']);
+    cliJson(fixture.path, ['task', 'assign-roles', 'TASK-DRAIN', '--actor', 'human', '--implementer', 'codex', '--reviewer', 'claude', '--verifier', 'grok']);
+    const head = git(fixture.path, ['rev-parse', 'HEAD']);
+
+    // A check that announces itself and then keeps the daemon busy long enough to overlap a restart.
+    const verifying = runCliAsync(fixture.path, [
+      'verify', 'TASK-DRAIN', '--agent', 'grok', '--commit', head,
+      '--', 'node', '-e', `require('fs').writeFileSync(${JSON.stringify(sentinel)}, 'x'); setTimeout(() => process.exit(0), 5000)`,
+    ]);
+    await waitFor('the verification to actually start', () => existsSync(sentinel));
+
+    daemon.signal('SIGTERM');
+    await waitFor('the daemon to begin draining', () => /draining 1 in-flight operation/.test(daemon.output()));
+
+    // The dangerous window: shutting down, still holding the database, work still running.
+    assert.ok(daemon.running(), 'the outgoing daemon is still alive');
+    assert.ok(existsSync(lockPath), 'ownership is retained while work is in flight');
+    const replacement = spawnSync(process.execPath, [COLLABD_ENTRY], {
+      cwd: fixture.path,
+      env: { ...process.env, PORT: '0' },
+      encoding: 'utf8',
+    });
+    assert.notEqual(replacement.status, 0, 'a second writer must not start during the drain');
+    assert.equal((JSON.parse(replacement.stderr.trim()) as Record<string, unknown>)['error'], 'daemon_already_running');
+
+    // The outgoing daemon still finishes the work it accepted.
+    const verified = await verifying;
+    assert.equal(verified.status, 0);
+    assert.equal(parseCliJson(verified.stdout)['exit_code'], 0);
+    await daemon.exited;
+    assert.ok(!existsSync(lockPath), 'ownership is surrendered only after the daemon is done');
+
+    // Ownership is now genuinely free, and the completed evidence survived the handover.
+    const successor = await startDaemon(fixture.path);
+    try {
+      const snapshot = (await (
+        await fetch(`${successor.descriptor.url}/api/snapshot`, {
+          headers: { authorization: `Bearer ${successor.browserToken}` },
+        })
+      ).json()) as Record<string, Array<Record<string, unknown>>>;
+      const attempts = (snapshot['operations'] ?? []).filter((entry) => entry['operation'] === 'verification.run');
+      assert.equal(attempts.length, 1);
+      assert.equal(attempts[0]?.['outcome'], 'accepted', 'the drained operation was never reclassified as abandoned');
+      assert.equal(snapshot['verifications']?.[0]?.['exit_code'], 0);
+    } finally {
+      await successor.stop();
+    }
+  } finally {
+    await daemon.stop();
+    rmSync(dirname(sentinel), { recursive: true, force: true });
+    fixture.close();
+  }
+});
+
+test('a startup failure after listening surrenders the server, database, and ownership', () => {
+  const fixture = createRepository();
+  const { lockPath, descriptorPath } = daemonRuntimePaths(fixture.path);
+  try {
+    // Make publishing the descriptor fail after the server is already listening.
+    mkdirSync(descriptorPath, { recursive: true });
+    const failed = spawnSync(process.execPath, [COLLABD_ENTRY], {
+      cwd: fixture.path,
+      env: { ...process.env, PORT: '0' },
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+    assert.notEqual(failed.status, 0, 'the daemon exits rather than lingering without a descriptor');
+    assert.equal(failed.signal, null, 'it exits on its own rather than being killed on timeout');
+    assert.ok(!existsSync(lockPath), 'a failed start does not strand the singleton lock');
+  } finally {
+    rmSync(descriptorPath, { recursive: true, force: true });
+    fixture.close();
   }
 });

@@ -37,11 +37,43 @@ export interface DaemonCredentials {
   browser: string;
 }
 
+/**
+ * Counts work the daemon has accepted but not finished.
+ *
+ * Shutdown has to outlast this, not merely outlast the socket: a client can disconnect mid-check
+ * while the operation keeps running, and the daemon is still a writer until it returns.
+ */
+export interface ActivityGate {
+  begin(): void;
+  end(): void;
+  active(): number;
+  whenIdle(): Promise<void>;
+}
+
+export function createActivityGate(): ActivityGate {
+  let active = 0;
+  let idleWaiters: Array<() => void> = [];
+  return {
+    begin: () => { active += 1; },
+    end: () => {
+      active -= 1;
+      if (active > 0) return;
+      const waiting = idleWaiters;
+      idleWaiters = [];
+      for (const notify of waiting) notify();
+    },
+    active: () => active,
+    whenIdle: () =>
+      active === 0 ? Promise.resolve() : new Promise<void>((notify) => { idleWaiters.push(notify); }),
+  };
+}
+
 export interface CollaborationHttpOptions {
   service: CollaborationService;
   repository: GitRepository;
   credentials: DaemonCredentials;
   daemon: DaemonSummary;
+  activity?: ActivityGate;
   staticRoot?: string;
 }
 
@@ -214,8 +246,9 @@ async function streamOperation(
 }
 
 export function createCollaborationHttpServer(options: CollaborationHttpOptions) {
-  const { service, repository, credentials, daemon, staticRoot } = options;
+  const { service, repository, credentials, daemon, activity, staticRoot } = options;
   return createServer(async (request, response) => {
+    activity?.begin();
     try {
       const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`);
 
@@ -280,6 +313,8 @@ export function createCollaborationHttpServer(options: CollaborationHttpOptions)
       }
       console.error(error);
       return json(response, 500, { error: 'internal server error', code: 'internal_error' });
+    } finally {
+      activity?.end();
     }
   });
 }
