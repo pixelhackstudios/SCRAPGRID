@@ -19,9 +19,9 @@ while the collaboration service remains the authoritative truth and coordination
 3. **Independent verification**
    - **COMPLETE** — `048ba7cbc3562fcea1c2f386f8a731a6b93e7505`
 4. **Base-pinned required-check policy + explicit human override**
-   - **NEXT**
+   - **COMPLETE** — `20ce79b0039009d715983528b1fdb2b236d7dc5f`
 5. **Temporary task roles**
-   - **PENDING**
+   - **NEXT**
 6. **`collabd`**
    - **PENDING**
 7. **Sessions / heartbeat / recovery**
