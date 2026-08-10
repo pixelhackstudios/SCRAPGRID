@@ -26,9 +26,10 @@ while the collaboration service remains the authoritative truth and coordination
    - **COMPLETE** — `2a9480cbe3adeea59cde6a7f533874e67d3217b6` (implementation),
      `4ec211777e0234acfcfa0fa397c1a0ca4dc37cd1` (ownership lifecycle)
 7. **Sessions / heartbeat / recovery**
-   - **NEXT**
+   - **COMPLETE** — `c067efbe2d341907afa865735bdbcedc2f81ffe2` (implementation),
+     `08964d3bdf9e49d408eabdde438eac3b2871208b` (replacement-boundary review fix)
 8. **Deterministic dispatcher**
-   - **PENDING**
+   - **NEXT**
 9. **Deterministic context bundles + bundle identity**
    - **PENDING**
 10. **Pilot 002**
