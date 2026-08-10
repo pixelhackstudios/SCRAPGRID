@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 
 export interface RepositoryBinding {
   identity: string;
@@ -61,6 +61,31 @@ function mainWorktreePath(cwd: string): string {
   const firstLine = list.split('\n').find((line) => line.startsWith('worktree '));
   if (!firstLine) throw new GitError('repository has no main worktree', 'repository_not_found');
   return realpathSync(firstLine.slice('worktree '.length));
+}
+
+/**
+ * Resolves to the command's exit status. A command that cannot be launched resolves to `1` with its
+ * failure reported as output, matching the previous synchronous behavior: an unlaunchable check is
+ * failing evidence, not a harness crash.
+ */
+function runCommand(
+  executable: string,
+  args: string[],
+  cwd: string,
+  onOutput?: (stream: 'stdout' | 'stderr', data: string) => void,
+): Promise<number> {
+  return new Promise((resolveExit) => {
+    const child = spawn(executable, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => onOutput?.('stdout', chunk));
+    child.stderr.on('data', (chunk: string) => onOutput?.('stderr', chunk));
+    child.on('error', (error) => {
+      onOutput?.('stderr', `${error.message}\n`);
+      resolveExit(1);
+    });
+    child.on('close', (code) => resolveExit(code ?? 1));
+  });
 }
 
 export class GitRepository {
@@ -206,7 +231,18 @@ export class GitRepository {
     });
   }
 
-  async runAtCommit(commitClaim: string, command: string[]): Promise<VerificationExecution> {
+  /**
+   * Runs a verification command at an immutable commit inside a disposable detached worktree.
+   *
+   * `onOutput` lets the daemon stream the run back to whichever terminal asked for it while the
+   * daemon itself remains the process that observes the exit code. Evidence is never reported by a
+   * client.
+   */
+  async runAtCommit(
+    commitClaim: string,
+    command: string[],
+    onOutput?: (stream: 'stdout' | 'stderr', data: string) => void,
+  ): Promise<VerificationExecution> {
     const commit = this.resolveCommit(commitClaim);
     const executable = command[0];
     if (!executable) throw new GitError('verification command cannot be empty', 'missing_verification_command');
@@ -223,15 +259,10 @@ export class GitRepository {
           'verification_checkout_mismatch',
         );
       }
-      const result = spawnSync(executable, command.slice(1), {
-        cwd: worktreePath,
-        stdio: 'inherit',
-        shell: false,
-      });
       return {
         commit,
         commandArgv: [...command],
-        exitCode: result.status ?? 1,
+        exitCode: await runCommand(executable, command.slice(1), worktreePath, onOutput),
       };
     } finally {
       if (added) {

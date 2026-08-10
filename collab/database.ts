@@ -35,6 +35,26 @@ export function openDatabase(path = defaultDatabasePath()): DatabaseSync {
   return db;
 }
 
+/**
+ * Closes out operation attempts left unfinished by a previous process.
+ *
+ * Only the daemon may call this, and only while it holds the singleton lock: holding the lock is
+ * what proves no other writer is mid-operation. An unfinished row is crash residue, and leaving it
+ * undecided is exactly the indeterminate state daemon recovery has to eliminate.
+ */
+export function recoverAbandonedOperations(db: DatabaseSync): number {
+  const unfinished = db
+    .prepare('SELECT count(*) AS count FROM operation_attempts WHERE outcome IS NULL')
+    .get() as { count: number };
+  if (unfinished.count === 0) return 0;
+  db.prepare(
+    `UPDATE operation_attempts
+     SET outcome = 'abandoned', reason_code = 'daemon_restart', completed_at = ?
+     WHERE outcome IS NULL`,
+  ).run(new Date().toISOString());
+  return unfinished.count;
+}
+
 export function initializeDatabase(db: DatabaseSync, repository: RepositoryBinding, baseCommit: string): void {
   const version = Number((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
   if (version > SCHEMA_VERSION) {

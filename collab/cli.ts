@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
-import { resolve } from 'node:path';
-import { DatabaseError, defaultDatabasePath, initializeDatabase, openDatabase } from './database.js';
+import { connectToDaemon, invokeOperation } from './client.js';
 import { GitError, GitRepository } from './git.js';
-import { CollaborationError, CollaborationService } from './service.js';
+import { DaemonRuntimeError } from './runtime.js';
 
 type Options = Record<string, string | string[]>;
+type Invocation = { operation: string; input: Record<string, unknown> };
 
 function parseArguments(args: string[]): { words: string[]; options: Options; command: string[] } {
   const words: string[] = [];
@@ -64,12 +64,15 @@ function print(value: unknown): void {
 function help(): void {
   process.stdout.write(`SCRAPGRID collaboration CLI
 
+Every command is a request to this repository's collabd. Start the daemon first with "npm start";
+the CLI never opens the collaboration database itself.
+
 Global option:
-  --db PATH                              SQLite path (default .collab/collab.db)
   --repo PATH                            Path inside the bound repository (default current directory)
 
 Commands:
   init
+  daemon status
   status
   sync --agent ID [--after EVENT_ID]
   agent list
@@ -94,199 +97,185 @@ Commands:
 `);
 }
 
+function resolveInvocation(parsed: ReturnType<typeof parseArguments>): Invocation {
+  const { words, options, command } = parsed;
+  const [area, action, id] = words;
+
+  if (area === 'init' || (area === 'daemon' && action === 'status')) return { operation: 'daemon.info', input: {} };
+  if (area === 'status') return { operation: 'status', input: {} };
+  if (area === 'sync') {
+    return { operation: 'sync', input: { agent: required(options, 'agent'), after: integer(options, 'after', 0) } };
+  }
+  if (area === 'agent' && action === 'list') return { operation: 'agents.list', input: {} };
+  if (area === 'worktree' && action === 'bootstrap') {
+    return {
+      operation: 'worktree.bootstrap',
+      input: { rootPath: optional(options, 'root'), baseCommit: optional(options, 'base') },
+    };
+  }
+
+  if (area === 'task' && action === 'create' && id) {
+    return {
+      operation: 'task.create',
+      input: {
+        id,
+        goal: required(options, 'goal'),
+        acceptance: repeated(options, 'acceptance'),
+        actor: optional(options, 'actor') ?? 'human',
+      },
+    };
+  }
+  if (area === 'task' && action === 'assign-roles' && id) {
+    return {
+      operation: 'task.assign_roles',
+      input: {
+        taskId: id,
+        actor: required(options, 'actor'),
+        implementer: required(options, 'implementer'),
+        reviewer: required(options, 'reviewer'),
+        verifier: required(options, 'verifier'),
+      },
+    };
+  }
+  if (area === 'task' && action === 'claim' && id) {
+    return {
+      operation: 'task.claim',
+      input: {
+        taskId: id,
+        agent: required(options, 'agent'),
+        expectedVersion: integer(options, 'expected-version'),
+        ttlSeconds: integer(options, 'ttl', 900),
+      },
+    };
+  }
+  if (area === 'task' && action === 'accept' && id) {
+    return {
+      operation: 'task.accept',
+      input: {
+        taskId: id,
+        actor: required(options, 'actor'),
+        expectedVersion: integer(options, 'expected-version'),
+      },
+    };
+  }
+  if (area === 'proposal' && action === 'submit' && id) {
+    return {
+      operation: 'proposal.submit',
+      input: { taskId: id, agent: required(options, 'agent'), content: required(options, 'content') },
+    };
+  }
+  if (area === 'proposal' && action === 'reveal' && id) {
+    return { operation: 'proposal.reveal', input: { taskId: id, actor: optional(options, 'actor') ?? 'human' } };
+  }
+  if (area === 'decision' && action === 'propose') {
+    return {
+      operation: 'decision.propose',
+      input: {
+        taskId: optional(options, 'task'),
+        actor: required(options, 'actor'),
+        statement: required(options, 'statement'),
+        rationale: required(options, 'rationale'),
+      },
+    };
+  }
+  if (area === 'decision' && action === 'accept' && id) {
+    return { operation: 'decision.accept', input: { decisionId: id, actor: required(options, 'actor') } };
+  }
+  if (area === 'message' && action === 'send') {
+    return {
+      operation: 'message.send',
+      input: {
+        from: required(options, 'from'),
+        to: required(options, 'to'),
+        taskId: optional(options, 'task'),
+        body: required(options, 'body'),
+      },
+    };
+  }
+  if (area === 'blocker' && action === 'add' && id) {
+    return {
+      operation: 'blocker.add',
+      input: { taskId: id, agent: required(options, 'agent'), description: required(options, 'description') },
+    };
+  }
+  if (area === 'blocker' && action === 'resolve' && id) {
+    return { operation: 'blocker.resolve', input: { blockerId: id, agent: required(options, 'agent') } };
+  }
+  if (area === 'review' && action === 'request' && id) {
+    return {
+      operation: 'review.request',
+      input: { taskId: id, agent: required(options, 'agent'), commit: required(options, 'commit') },
+    };
+  }
+  if (area === 'review' && action === 'submit' && id) {
+    return {
+      operation: 'review.submit',
+      input: { reviewId: id, agent: required(options, 'agent'), verdict: required(options, 'verdict') },
+    };
+  }
+  if (area === 'finding' && action === 'add' && id) {
+    return {
+      operation: 'finding.add',
+      input: {
+        reviewId: id,
+        agent: required(options, 'agent'),
+        severity: required(options, 'severity'),
+        description: required(options, 'description'),
+        location: optional(options, 'location'),
+      },
+    };
+  }
+  if (area === 'finding' && action === 'resolve' && id) {
+    return { operation: 'finding.resolve', input: { findingId: id, agent: required(options, 'agent') } };
+  }
+  if (area === 'policy' && action === 'override' && id) {
+    return {
+      operation: 'check_policy.override',
+      input: { taskId: id, actor: required(options, 'actor'), reason: required(options, 'reason') },
+    };
+  }
+  if (area === 'verify' && action) {
+    return {
+      operation: 'verification.run',
+      input: {
+        taskId: action,
+        agent: required(options, 'agent'),
+        commit: required(options, 'commit'),
+        checkId: optional(options, 'check'),
+        command: command.length > 0 ? command : undefined,
+      },
+    };
+  }
+
+  throw new Error(`unknown command: ${words.join(' ')}`);
+}
+
 async function run(): Promise<void> {
   const parsed = parseArguments(process.argv.slice(2));
+  const [area] = parsed.words;
+  if (!area || area === 'help') return help();
+  if (optional(parsed.options, 'db') !== undefined) {
+    throw new Error('--db is no longer accepted: collabd owns the collaboration database. Set COLLAB_DB before starting the daemon.');
+  }
+
   const repository = GitRepository.discover(optional(parsed.options, 'repo'));
-  const dbPath = optional(parsed.options, 'db');
-  const db = openDatabase(dbPath ?? defaultDatabasePath(repository.binding.rootPath));
-  try {
-    initializeDatabase(db, repository.binding, repository.headCommit());
-    const service = new CollaborationService(db, repository);
-    const [area, action, id] = parsed.words;
+  const invocation = resolveInvocation(parsed);
+  const descriptor = connectToDaemon(repository);
+  const result = await invokeOperation(descriptor, invocation.operation, invocation.input);
+  print(result);
 
-    if (!area || area === 'help') return help();
-    if (area === 'init') {
-      return print({
-        database: dbPath ?? defaultDatabasePath(repository.binding.rootPath),
-        repository: repository.binding,
-        agents: service.listAgents(),
-      });
-    }
-    if (area === 'status') return print(service.status());
-    if (area === 'sync') {
-      return print(service.sync(required(parsed.options, 'agent'), integer(parsed.options, 'after', 0)));
-    }
-    if (area === 'agent' && action === 'list') return print(service.listAgents());
-    if (area === 'worktree' && action === 'bootstrap') {
-      return print(
-        service.bootstrapWorktrees({
-          rootPath: optional(parsed.options, 'root') ?? resolve(repository.binding.rootPath, 'worktrees'),
-          baseCommit: optional(parsed.options, 'base') ?? repository.headCommit(),
-        }),
-      );
-    }
-
-    if (area === 'task' && action === 'create' && id) {
-      return print(
-        service.createTask({
-          id,
-          goal: required(parsed.options, 'goal'),
-          acceptance: repeated(parsed.options, 'acceptance'),
-          actor: optional(parsed.options, 'actor') ?? 'human',
-        }),
-      );
-    }
-    if (area === 'task' && action === 'claim' && id) {
-      return print(
-        service.claimTask({
-          taskId: id,
-          agent: required(parsed.options, 'agent'),
-          expectedVersion: integer(parsed.options, 'expected-version'),
-          ttlSeconds: integer(parsed.options, 'ttl', 900),
-        }),
-      );
-    }
-    if (area === 'task' && action === 'assign-roles' && id) {
-      return print(
-        service.assignTaskRoles({
-          taskId: id,
-          actor: required(parsed.options, 'actor'),
-          implementer: required(parsed.options, 'implementer'),
-          reviewer: required(parsed.options, 'reviewer'),
-          verifier: required(parsed.options, 'verifier'),
-        }),
-      );
-    }
-    if (area === 'task' && action === 'accept' && id) {
-      return print(
-        service.acceptTask({
-          taskId: id,
-          actor: required(parsed.options, 'actor'),
-          expectedVersion: integer(parsed.options, 'expected-version'),
-        }),
-      );
-    }
-    if (area === 'proposal' && action === 'submit' && id) {
-      return print(
-        service.submitProposal({
-          taskId: id,
-          agent: required(parsed.options, 'agent'),
-          content: required(parsed.options, 'content'),
-        }),
-      );
-    }
-    if (area === 'proposal' && action === 'reveal' && id) {
-      return print(service.revealProposals(id, optional(parsed.options, 'actor') ?? 'human'));
-    }
-    if (area === 'decision' && action === 'propose') {
-      return print(
-        service.proposeDecision({
-          taskId: optional(parsed.options, 'task'),
-          actor: required(parsed.options, 'actor'),
-          statement: required(parsed.options, 'statement'),
-          rationale: required(parsed.options, 'rationale'),
-        }),
-      );
-    }
-    if (area === 'decision' && action === 'accept' && id) {
-      return print(service.acceptDecision(id, required(parsed.options, 'actor')));
-    }
-    if (area === 'message' && action === 'send') {
-      return print(
-        service.sendMessage({
-          from: required(parsed.options, 'from'),
-          to: required(parsed.options, 'to'),
-          taskId: optional(parsed.options, 'task'),
-          body: required(parsed.options, 'body'),
-        }),
-      );
-    }
-    if (area === 'blocker' && action === 'add' && id) {
-      return print(
-        service.addBlocker({
-          taskId: id,
-          agent: required(parsed.options, 'agent'),
-          description: required(parsed.options, 'description'),
-        }),
-      );
-    }
-    if (area === 'blocker' && action === 'resolve' && id) {
-      return print(service.resolveBlocker(id, required(parsed.options, 'agent')));
-    }
-    if (area === 'review' && action === 'request' && id) {
-      return print(
-        service.requestReview({
-          taskId: id,
-          agent: required(parsed.options, 'agent'),
-          commit: required(parsed.options, 'commit'),
-        }),
-      );
-    }
-    if (area === 'review' && action === 'submit' && id) {
-      const verdict = required(parsed.options, 'verdict');
-      if (verdict !== 'approved' && verdict !== 'needs_revision') {
-        throw new Error('--verdict must be approved or needs_revision');
-      }
-      return print(service.submitReview({ reviewId: id, agent: required(parsed.options, 'agent'), verdict }));
-    }
-    if (area === 'finding' && action === 'add' && id) {
-      const severity = required(parsed.options, 'severity');
-      if (severity !== 'blocking' && severity !== 'non_blocking') {
-        throw new Error('--severity must be blocking or non_blocking');
-      }
-      return print(
-        service.addReviewFinding({
-          reviewId: id,
-          agent: required(parsed.options, 'agent'),
-          severity,
-          description: required(parsed.options, 'description'),
-          location: optional(parsed.options, 'location'),
-        }),
-      );
-    }
-    if (area === 'finding' && action === 'resolve' && id) {
-      return print(service.resolveReviewFinding(id, required(parsed.options, 'agent')));
-    }
-    if (area === 'policy' && action === 'override' && id) {
-      return print(
-        service.overrideCheckPolicy({
-          taskId: id,
-          actor: required(parsed.options, 'actor'),
-          reason: required(parsed.options, 'reason'),
-        }),
-      );
-    }
-    if (area === 'verify' && action) {
-      const checkId = optional(parsed.options, 'check');
-      if (Boolean(checkId) === (parsed.command.length > 0)) {
-        throw new Error('verify requires exactly one of --check ID or an explicit command after --');
-      }
-      const record = await service.runVerification({
-        taskId: action,
-        agent: required(parsed.options, 'agent'),
-        commit: required(parsed.options, 'commit'),
-        checkId,
-        command: parsed.command.length > 0 ? parsed.command : undefined,
-      });
-      print(record);
-      const exitCode = Number(record['exit_code']);
-      if (exitCode !== 0) process.exitCode = exitCode;
-      return;
-    }
-
-    throw new Error(`unknown command: ${parsed.words.join(' ')}`);
-  } finally {
-    db.close();
+  if (invocation.operation === 'verification.run') {
+    const exitCode = Number((result as Record<string, unknown>)['exit_code']);
+    if (exitCode !== 0) process.exitCode = exitCode;
   }
 }
 
 try {
   await run();
 } catch (error) {
+  // Domain rejections arrive as daemon frames; only discovery and local Git failures originate here.
   const code =
-    error instanceof CollaborationError || error instanceof GitError || error instanceof DatabaseError
-      ? error.code
-      : 'usage_error';
+    error instanceof DaemonRuntimeError || error instanceof GitError ? error.code : 'usage_error';
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`${JSON.stringify({ error: code, message })}\n`);
   process.exitCode = 1;

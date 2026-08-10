@@ -5,14 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:api": "npm run build:collab --silent && node --enable-source-maps dist-collab/collab/server.js",
+    "dev:api": "npm run collabd",
     "build": "npm run build:collab && tsc -b && vite build",
     "build:collab": "tsc -p tsconfig.collab.json",
     "collab": "npm run build:collab --silent && node dist-collab/collab/cli.js",
+    "collabd": "npm run build:collab --silent && node --enable-source-maps dist-collab/collab/collabd.js",
     "lint": "oxlint",
     "test": "npm run build:collab --silent && node --test dist-collab/tests/*.test.js",
     "preview": "vite preview",
-    "start": "node --enable-source-maps dist-collab/collab/server.js"
+    "start": "node --enable-source-maps dist-collab/collab/collabd.js"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.3.0",

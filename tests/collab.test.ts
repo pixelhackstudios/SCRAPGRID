@@ -1,17 +1,126 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import type { Server } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { initializeDatabase, openDatabase } from '../collab/database.js';
 import { GitError, GitRepository } from '../collab/git.js';
 import { CollaborationError, CollaborationService } from '../collab/service.js';
 import { createCollaborationHttpServer } from '../collab/http.js';
+import { daemonRuntimePaths, readDaemonDescriptor, type DaemonDescriptor } from '../collab/runtime.js';
+import { SCHEMA_VERSION } from '../collab/schema.js';
 
 function git(path: string, args: string[]): string {
   return execFileSync('git', ['-C', path, ...args], { encoding: 'utf8' }).trim();
+}
+
+const DIST_ROOT = resolve(import.meta.dirname, '..');
+const COLLABD_ENTRY = join(DIST_ROOT, 'collab', 'collabd.js');
+const CLI_ENTRY = join(DIST_ROOT, 'collab', 'cli.js');
+const AGENT_TOKEN = 'test-agent-credential';
+const BROWSER_TOKEN = 'test-browser-credential';
+
+function delay(ms: number): Promise<void> {
+  return new Promise((done) => setTimeout(done, ms));
+}
+
+/** Builds the in-process HTTP server with fixed credentials, standing in for a real daemon. */
+function httpServer(service: CollaborationService, repository: GitRepository): Server {
+  return createCollaborationHttpServer({
+    service,
+    repository,
+    credentials: { agent: AGENT_TOKEN, browser: BROWSER_TOKEN },
+    daemon: {
+      url: 'http://127.0.0.1:0',
+      pid: process.pid,
+      repository_identity: repository.binding.identity,
+      schema_version: SCHEMA_VERSION,
+      started_at: new Date().toISOString(),
+    },
+  });
+}
+
+interface RunningDaemon {
+  descriptor: DaemonDescriptor;
+  browserToken: string;
+  output: () => string;
+  stop: () => Promise<void>;
+}
+
+/** Spawns a real `collabd` on an ephemeral port and waits until it has published its descriptor. */
+async function startDaemon(repositoryPath: string): Promise<RunningDaemon> {
+  const child = spawn(process.execPath, [COLLABD_ENTRY], {
+    cwd: repositoryPath,
+    env: { ...process.env, PORT: '0' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk: string) => { stdout += chunk; });
+  child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+  const exited = new Promise<void>((done) => child.on('exit', () => done()));
+
+  const { descriptorPath } = daemonRuntimePaths(repositoryPath);
+  const deadline = Date.now() + 20_000;
+  while (!(existsSync(descriptorPath) && stdout.includes('#t='))) {
+    if (child.exitCode !== null) throw new Error(`collabd exited early: ${stderr || stdout}`);
+    if (Date.now() > deadline) throw new Error(`collabd did not start: ${stderr || stdout}`);
+    await delay(25);
+  }
+  return {
+    descriptor: readDaemonDescriptor(descriptorPath),
+    browserToken: /#t=(\S+)/.exec(stdout)?.[1] ?? '',
+    output: () => stdout,
+    stop: async () => {
+      if (child.exitCode === null) child.kill('SIGTERM');
+      await exited;
+    },
+  };
+}
+
+interface CliResult {
+  status: number;
+  stdout: string;
+  stderr: string;
+}
+
+function runCli(repositoryPath: string, args: string[]): CliResult {
+  const result = spawnSync(process.execPath, [CLI_ENTRY, ...args], { cwd: repositoryPath, encoding: 'utf8' });
+  return { status: result.status ?? 1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+}
+
+function runCliAsync(repositoryPath: string, args: string[]): Promise<CliResult> {
+  return new Promise((done) => {
+    const child = spawn(process.execPath, [CLI_ENTRY, ...args], { cwd: repositoryPath, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => { stdout += chunk; });
+    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+    child.on('close', (code) => done({ status: code ?? 1, stdout, stderr }));
+  });
+}
+
+/** CLI output may be preceded by streamed check output; the printed record always ends it. */
+function parseCliJson(stdout: string): Record<string, unknown> {
+  const start = Math.max(stdout.lastIndexOf('\n{\n'), stdout.lastIndexOf('\n[\n'));
+  return JSON.parse(start >= 0 ? stdout.slice(start + 1) : stdout) as Record<string, unknown>;
+}
+
+function cliJson(repositoryPath: string, args: string[]): Record<string, unknown> {
+  const result = runCli(repositoryPath, args);
+  assert.equal(result.status, 0, `collab ${args.join(' ')} failed: ${result.stderr}`);
+  return parseCliJson(result.stdout);
+}
+
+function cliError(result: CliResult): Record<string, unknown> {
+  return JSON.parse(result.stderr.trim()) as Record<string, unknown>;
 }
 
 const FIXTURE_CHECK_ARGV = ['node', '-e', 'process.exit(0)'];
@@ -1170,8 +1279,9 @@ test('snapshot is side-effect free, decodes JSON, and redacts sealed proposal co
 });
 
 test('HTTP bridge exposes snapshots and delegates human mutations to the service', async () => {
-  const { service, close } = harness();
-  const server = createCollaborationHttpServer(service);
+  const { service, repository, close } = harness();
+  const server = httpServer(service, repository);
+  const credentialed = { authorization: `Bearer ${BROWSER_TOKEN}` };
   try {
     service.createTask({ id: 'TASK-HTTP', goal: 'Expose the service', acceptance: [], actor: 'human' });
     service.submitProposal({ taskId: 'TASK-HTTP', agent: 'claude', content: 'Reveal through the service.' });
@@ -1186,20 +1296,20 @@ test('HTTP bridge exposes snapshots and delegates human mutations to the service
     assert.ok(address && typeof address !== 'string');
     const origin = `http://127.0.0.1:${address.port}`;
 
-    const initialResponse = await fetch(`${origin}/api/snapshot`);
+    const initialResponse = await fetch(`${origin}/api/snapshot`, { headers: credentialed });
     const initial = (await initialResponse.json()) as Record<string, Array<Record<string, unknown>>>;
     assert.equal(initialResponse.status, 200);
     assert.equal(initial['proposals']?.[0]?.['content'], undefined);
 
     const rejectedOrigin = await fetch(`${origin}/api/tasks/TASK-HTTP/reveal-proposals`, {
       method: 'POST',
-      headers: { origin: 'https://example.invalid' },
+      headers: { ...credentialed, origin: 'https://example.invalid' },
     });
     assert.equal(rejectedOrigin.status, 403);
 
     const revealResponse = await fetch(`${origin}/api/tasks/TASK-HTTP/reveal-proposals`, {
       method: 'POST',
-      headers: { origin },
+      headers: { ...credentialed, origin },
     });
     const revealed = (await revealResponse.json()) as Record<string, Array<Record<string, unknown>>>;
     assert.equal(revealResponse.status, 200);
@@ -1212,7 +1322,7 @@ test('HTTP bridge exposes snapshots and delegates human mutations to the service
 
     const acceptResponse = await fetch(`${origin}/api/decisions/${String(decision['id'])}/accept`, {
       method: 'POST',
-      headers: { origin },
+      headers: { ...credentialed, origin },
     });
     const accepted = (await acceptResponse.json()) as Record<string, Array<Record<string, unknown>>>;
     assert.equal(acceptResponse.status, 200);
@@ -1220,12 +1330,299 @@ test('HTTP bridge exposes snapshots and delegates human mutations to the service
 
     const invalidAccept = await fetch(`${origin}/api/tasks/TASK-HTTP/accept`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', origin },
+      headers: { ...credentialed, 'content-type': 'application/json', origin },
       body: JSON.stringify({}),
     });
     assert.equal(invalidAccept.status, 400);
   } finally {
     await new Promise<void>((resolveClosed) => server.close(() => resolveClosed()));
+    close();
+  }
+});
+
+test('collabd owns the repository as a singleton and takes over only a stale lock', async () => {
+  const fixture = createRepository();
+  const { lockPath, descriptorPath } = daemonRuntimePaths(fixture.path);
+  const daemon = await startDaemon(fixture.path);
+  try {
+    const competitor = spawnSync(process.execPath, [COLLABD_ENTRY], {
+      cwd: fixture.path,
+      env: { ...process.env, PORT: '0' },
+      encoding: 'utf8',
+    });
+    assert.notEqual(competitor.status, 0);
+    assert.equal((JSON.parse(competitor.stderr.trim()) as Record<string, unknown>)['error'], 'daemon_already_running');
+  } finally {
+    await daemon.stop();
+  }
+  assert.ok(!existsSync(lockPath), 'a clean shutdown releases the lock');
+  assert.ok(!existsSync(descriptorPath), 'a clean shutdown withdraws the descriptor');
+
+  // A lock naming a process that no longer exists is crash residue, not a live owner.
+  const departed = spawnSync(process.execPath, ['-e', '']);
+  writeFileSync(lockPath, `${String(departed.pid)}\n`);
+  const revived = await startDaemon(fixture.path);
+  await revived.stop();
+  fixture.close();
+});
+
+test('the collab CLI drives a complete task through collabd', async () => {
+  const fixture = createRepository();
+  const daemon = await startDaemon(fixture.path);
+  try {
+    cliJson(fixture.path, ['task', 'create', 'TASK-DAEMON', '--goal', 'Prove the daemon boundary', '--acceptance', 'collabd owns every mutation']);
+    cliJson(fixture.path, ['task', 'assign-roles', 'TASK-DAEMON', '--actor', 'human', '--implementer', 'codex', '--reviewer', 'claude', '--verifier', 'grok']);
+    const candidate = commitArtifact(fixture.path, 'candidate\n');
+    cliJson(fixture.path, ['task', 'claim', 'TASK-DAEMON', '--agent', 'codex', '--expected-version', '1']);
+    const review = cliJson(fixture.path, ['review', 'request', 'TASK-DAEMON', '--agent', 'codex', '--commit', candidate]);
+    const verification = cliJson(fixture.path, ['verify', 'TASK-DAEMON', '--agent', 'grok', '--commit', candidate, '--check', 'fixture']);
+    assert.equal(verification['exit_code'], 0);
+    assert.equal(verification['runner'], 'grok');
+    cliJson(fixture.path, ['review', 'submit', String(review['id']), '--agent', 'claude', '--verdict', 'approved']);
+
+    const pending = cliJson(fixture.path, ['status'])['tasks'] as Array<Record<string, unknown>>;
+    cliJson(fixture.path, ['task', 'accept', 'TASK-DAEMON', '--actor', 'human', '--expected-version', String(pending[0]?.['version'])]);
+    const accepted = cliJson(fixture.path, ['status'])['tasks'] as Array<Record<string, unknown>>;
+    assert.equal(accepted[0]?.['status'], 'accepted');
+    assert.equal(accepted[0]?.['candidate_commit'], candidate);
+
+    const snapshotResponse = await fetch(`${daemon.descriptor.url}/api/snapshot`, {
+      headers: { authorization: `Bearer ${daemon.browserToken}` },
+    });
+    assert.equal(snapshotResponse.status, 200);
+    const snapshot = (await snapshotResponse.json()) as Record<string, Array<Record<string, unknown>>>;
+    const ledger = snapshot['operations'] ?? [];
+    for (const operation of ['task.create', 'task.assign_roles', 'task.claim', 'review.request', 'verification.run', 'review.submit', 'task.accept']) {
+      assert.ok(
+        ledger.some((entry) => entry['operation'] === operation && entry['outcome'] === 'accepted'),
+        `ledger is missing an accepted ${operation}`,
+      );
+    }
+    assert.ok(ledger.every((entry) => entry['outcome'] !== null), 'every attempt was completed by the daemon');
+  } finally {
+    await daemon.stop();
+    fixture.close();
+  }
+});
+
+test('a client without a daemon fails closed and never creates the database', () => {
+  const fixture = createRepository();
+  try {
+    const mutation = runCli(fixture.path, ['task', 'create', 'TASK-ORPHAN', '--goal', 'No daemon is running']);
+    assert.notEqual(mutation.status, 0);
+    assert.equal(cliError(mutation)['error'], 'daemon_unavailable');
+
+    // Reads fail closed too: the CLI has no database path of its own to fall back to.
+    const read = runCli(fixture.path, ['status']);
+    assert.notEqual(read.status, 0);
+    assert.equal(cliError(read)['error'], 'daemon_unavailable');
+
+    assert.ok(!existsSync(join(fixture.path, '.collab', 'collab.db')), 'no client opened a collaboration database');
+  } finally {
+    fixture.close();
+  }
+});
+
+test('a client rejects a daemon bound elsewhere and a credential that does not match', async () => {
+  const home = createRepository();
+  const other = createRepository();
+  const daemon = await startDaemon(home.path);
+  const homeDescriptor = daemonRuntimePaths(home.path).descriptorPath;
+  const published = readFileSync(homeDescriptor, 'utf8');
+  try {
+    const foreignDescriptor = daemonRuntimePaths(other.path).descriptorPath;
+    mkdirSync(dirname(foreignDescriptor), { recursive: true });
+    writeFileSync(foreignDescriptor, published);
+    const mismatch = runCli(other.path, ['status']);
+    assert.notEqual(mismatch.status, 0);
+    assert.equal(cliError(mismatch)['error'], 'daemon_repository_mismatch');
+
+    writeFileSync(
+      homeDescriptor,
+      JSON.stringify({ ...(JSON.parse(published) as Record<string, unknown>), agent_token: 'not-the-published-credential' }),
+    );
+    const rejected = runCli(home.path, ['status']);
+    assert.notEqual(rejected.status, 0);
+    assert.equal(cliError(rejected)['error'], 'unauthorized');
+  } finally {
+    writeFileSync(homeDescriptor, published);
+    await daemon.stop();
+    home.close();
+    other.close();
+  }
+});
+
+test('verification runs inside collabd while its output streams back to the client', async () => {
+  const fixture = createRepository();
+  const daemon = await startDaemon(fixture.path);
+  try {
+    cliJson(fixture.path, ['task', 'create', 'TASK-STREAM', '--goal', 'Stream verification output']);
+    cliJson(fixture.path, ['task', 'assign-roles', 'TASK-STREAM', '--actor', 'human', '--implementer', 'codex', '--reviewer', 'claude', '--verifier', 'grok']);
+    const head = git(fixture.path, ['rev-parse', 'HEAD']);
+    const result = runCli(fixture.path, [
+      'verify', 'TASK-STREAM', '--agent', 'grok', '--commit', head,
+      '--', 'node', '-e', 'console.log("check speaking"); console.error("check warning"); process.exit(3)',
+    ]);
+    assert.equal(result.status, 3, 'the client exits with the exit code the daemon observed');
+    assert.match(result.stdout, /check speaking/);
+    assert.match(result.stderr, /check warning/);
+    assert.equal(parseCliJson(result.stdout)['exit_code'], 3);
+  } finally {
+    await daemon.stop();
+    fixture.close();
+  }
+});
+
+test('a daemon restart preserves canonical state and resolves abandoned attempts', async () => {
+  const fixture = createRepository();
+  const first = await startDaemon(fixture.path);
+  cliJson(fixture.path, ['task', 'create', 'TASK-RESTART', '--goal', 'Survive a restart']);
+  const before = (cliJson(fixture.path, ['status'])['tasks'] as Array<Record<string, unknown>>)[0];
+  await first.stop();
+
+  // Stand in for a process that died mid-operation, leaving its attempt undecided.
+  const databasePath = join(fixture.path, '.collab', 'collab.db');
+  const crashed = openDatabase(databasePath);
+  crashed
+    .prepare('INSERT INTO operation_attempts (id, operation, actor, subject_type, subject_id, started_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run('op-crashed', 'task.claim', 'codex', 'task', 'TASK-RESTART', new Date().toISOString());
+  crashed.close();
+
+  const second = await startDaemon(fixture.path);
+  try {
+    assert.notEqual(second.descriptor.agent_token, first.descriptor.agent_token, 'credentials rotate on restart');
+    assert.notEqual(second.browserToken, first.browserToken);
+    assert.match(second.output(), /recovered\s+1 abandoned operation attempt/);
+    const after = (cliJson(fixture.path, ['status'])['tasks'] as Array<Record<string, unknown>>)[0];
+    assert.deepEqual(after, before, 'canonical task state is unchanged by the restart');
+  } finally {
+    await second.stop();
+  }
+
+  const recovered = openDatabase(databasePath);
+  const attempt = recovered.prepare('SELECT * FROM operation_attempts WHERE id = ?').get('op-crashed') as Record<string, unknown>;
+  recovered.close();
+  assert.equal(attempt['outcome'], 'abandoned');
+  assert.equal(attempt['reason_code'], 'daemon_restart');
+  assert.ok(attempt['completed_at']);
+  fixture.close();
+});
+
+test('concurrent claims through the daemon produce exactly one owner', async () => {
+  const fixture = createRepository();
+  const daemon = await startDaemon(fixture.path);
+  try {
+    cliJson(fixture.path, ['task', 'create', 'TASK-RACE', '--goal', 'Only one owner may win']);
+    cliJson(fixture.path, ['task', 'assign-roles', 'TASK-RACE', '--actor', 'human', '--implementer', 'codex', '--reviewer', 'claude', '--verifier', 'grok']);
+    const attempts = await Promise.all([
+      runCliAsync(fixture.path, ['task', 'claim', 'TASK-RACE', '--agent', 'codex', '--expected-version', '1']),
+      runCliAsync(fixture.path, ['task', 'claim', 'TASK-RACE', '--agent', 'codex', '--expected-version', '1']),
+    ]);
+    const winners = attempts.filter((attempt) => attempt.status === 0);
+    const losers = attempts.filter((attempt) => attempt.status !== 0);
+    assert.equal(winners.length, 1);
+    assert.equal(losers.length, 1);
+    for (const loser of losers) assert.equal(cliError(loser)['error'], 'stale_version');
+
+    const task = (cliJson(fixture.path, ['status'])['tasks'] as Array<Record<string, unknown>>)[0];
+    assert.equal(task?.['owner_agent_id'], 'codex');
+    assert.equal(task?.['version'], 2);
+  } finally {
+    await daemon.stop();
+    fixture.close();
+  }
+});
+
+test('no /api route is anonymously callable, including the human-authority routes', async () => {
+  const { service, repository, close } = harness();
+  const server = httpServer(service, repository);
+  try {
+    service.createTask({ id: 'TASK-ANON', goal: 'Refuse anonymous authority', acceptance: [], actor: 'human' });
+    service.submitProposal({ taskId: 'TASK-ANON', agent: 'grok', content: 'Stay sealed.' });
+    const decision = service.proposeDecision({
+      taskId: 'TASK-ANON',
+      actor: 'codex',
+      statement: 'Human authority needs a credential.',
+      rationale: 'Loopback is not an authorization decision.',
+    });
+    await new Promise<void>((listening) => server.listen(0, '127.0.0.1', listening));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const origin = `http://127.0.0.1:${address.port}`;
+
+    const humanRoutes = [
+      `${origin}/api/tasks/TASK-ANON/reveal-proposals`,
+      `${origin}/api/decisions/${String(decision['id'])}/accept`,
+      `${origin}/api/tasks/TASK-ANON/accept`,
+    ];
+    for (const route of humanRoutes) {
+      // No Origin at all: exactly the bare shell request that used to reach `actor: human`.
+      const bare = await fetch(route, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ expected_version: 1 }),
+      });
+      assert.equal(bare.status, 401, `${route} must not accept an uncredentialed request`);
+
+      // An Origin is trivially forged, so it must not be what grants authority either.
+      const forged = await fetch(route, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin },
+        body: JSON.stringify({ expected_version: 1 }),
+      });
+      assert.equal(forged.status, 401, `${route} must not accept a forged origin without a credential`);
+    }
+
+    assert.equal((await fetch(`${origin}/api/snapshot`)).status, 401);
+    assert.equal(
+      (await fetch(`${origin}/api/operations`, { method: 'POST', body: JSON.stringify({ operation: 'status' }) })).status,
+      401,
+    );
+
+    const untouched = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    assert.equal(untouched['tasks']?.[0]?.['status'], 'open');
+    assert.equal(untouched['proposals']?.[0]?.['visibility'], 'sealed');
+    assert.equal(untouched['decisions']?.[0]?.['status'], 'proposed');
+  } finally {
+    await new Promise<void>((closed) => server.close(() => closed()));
+    close();
+  }
+});
+
+test('the agent and field-terminal credentials are scoped to their own surfaces', async () => {
+  const { service, repository, close } = harness();
+  const server = httpServer(service, repository);
+  try {
+    service.createTask({ id: 'TASK-SCOPE', goal: 'Keep credentials scoped', acceptance: [], actor: 'human' });
+    await new Promise<void>((listening) => server.listen(0, '127.0.0.1', listening));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const origin = `http://127.0.0.1:${address.port}`;
+
+    const browserOnOperations = await fetch(`${origin}/api/operations`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${BROWSER_TOKEN}` },
+      body: JSON.stringify({ operation: 'status' }),
+    });
+    assert.equal(browserOnOperations.status, 401, 'the page credential cannot drive the operation registry');
+
+    const agentOnHumanRoute = await fetch(`${origin}/api/tasks/TASK-SCOPE/reveal-proposals`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${AGENT_TOKEN}`, origin },
+    });
+    assert.equal(agentOnHumanRoute.status, 401, 'the agent credential is not a field-terminal credential');
+
+    const permitted = await fetch(`${origin}/api/operations`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${AGENT_TOKEN}` },
+      body: JSON.stringify({ operation: 'status' }),
+    });
+    assert.equal(permitted.status, 200);
+    assert.equal(permitted.headers.get('content-type'), 'application/x-ndjson; charset=utf-8');
+    const frames = (await permitted.text()).trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.equal(frames.at(-1)?.['type'], 'result');
+  } finally {
+    await new Promise<void>((closed) => server.close(() => closed()));
     close();
   }
 });

@@ -379,7 +379,7 @@ The server listens on `127.0.0.1:4173` by default and uses the `.collab/collab.d
 - Git and verification boundary: [`collab/git.ts`](../../collab/git.ts)
 - CLI: [`collab/cli.ts`](../../collab/cli.ts)
 - HTTP bridge: [`collab/http.ts`](../../collab/http.ts)
-- Local server: [`collab/server.ts`](../../collab/server.ts)
+- Local daemon: [`collab/collabd.ts`](../../collab/collabd.ts) (replaced `collab/server.ts` at charter step 6)
 - Field terminal: [`src/App.tsx`](../../src/App.tsx)
 - Automated tests: [`tests/collab.test.ts`](../../tests/collab.test.ts)
 

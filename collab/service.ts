@@ -937,7 +937,14 @@ export class CollaborationService {
     });
   }
 
-  async runVerification(input: VerificationInput): Promise<Row> {
+  /**
+   * `onOutput` only forwards the running command's output to whoever requested the run. The exit
+   * code recorded as evidence is always the one this process observed.
+   */
+  async runVerification(
+    input: VerificationInput,
+    onOutput?: (stream: 'stdout' | 'stderr', data: string) => void,
+  ): Promise<Row> {
     return this.preparedAsyncTransaction(
       { name: 'verification.run', actor: input.agent, subjectType: 'task', subjectId: input.taskId },
       async () => {
@@ -945,7 +952,7 @@ export class CollaborationService {
         this.requireTaskRole(input.taskId, 'verifier', input.agent);
         const task = this.requireIndependentVerifier(input.taskId, input.agent);
         const spec = this.verificationSpec(task, input);
-        const execution = await this.repository.runAtCommit(input.commit, spec.command);
+        const execution = await this.repository.runAtCommit(input.commit, spec.command, onOutput);
         return { execution, spec };
       },
       (operationId, { execution, spec }) => {

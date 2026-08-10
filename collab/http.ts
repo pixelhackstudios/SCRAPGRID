@@ -1,9 +1,18 @@
+import { timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { extname, resolve, sep } from 'node:path';
+import { GitError } from './git.js';
+import {
+  operationInput,
+  requireOperation,
+  type DaemonSummary,
+  type OperationContext,
+  type OutputStream,
+} from './operations.js';
+import type { GitRepository } from './git.js';
 import type { CollaborationService } from './service.js';
 import { CollaborationError } from './service.js';
-import { GitError } from './git.js';
 
 const MIME_TYPES: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
@@ -13,6 +22,28 @@ const MIME_TYPES: Record<string, string> = {
   '.svg': 'image/svg+xml',
   '.woff2': 'font/woff2',
 };
+
+const KEEPALIVE_INTERVAL_MS = 10_000;
+
+/**
+ * Two separately scoped credentials, minted fresh by each `collabd` start.
+ *
+ * `agent` reaches the whole operation registry and is published in the owner-only daemon
+ * descriptor. `browser` reaches only the snapshot and the human-control routes, and is delivered
+ * through the URL fragment the daemon prints on its own stdout.
+ */
+export interface DaemonCredentials {
+  agent: string;
+  browser: string;
+}
+
+export interface CollaborationHttpOptions {
+  service: CollaborationService;
+  repository: GitRepository;
+  credentials: DaemonCredentials;
+  daemon: DaemonSummary;
+  staticRoot?: string;
+}
 
 class HttpError extends Error {
   constructor(
@@ -32,12 +63,52 @@ function json(response: ServerResponse, status: number, value: unknown): void {
   response.end(`${JSON.stringify(value)}\n`);
 }
 
-function requireSameOrigin(request: IncomingMessage): void {
+function sameOrigin(request: IncomingMessage): boolean {
   const origin = request.headers.origin;
-  if (!origin) return;
   const host = request.headers.host;
-  if (!host || new URL(origin).host !== host) {
+  if (!origin || !host) return false;
+  try {
+    return new URL(origin).host === host;
+  } catch {
+    return false;
+  }
+}
+
+/** Browser mutation routes: a missing `Origin` is rejected rather than waved through. */
+function requireSameOrigin(request: IncomingMessage): void {
+  if (!sameOrigin(request)) {
     throw new HttpError('cross-origin mutation rejected', 403, 'origin_rejected');
+  }
+}
+
+/**
+ * Operation route: the CLI is not a browser and sends no `Origin`, but any request that does
+ * present one must present a matching one.
+ */
+function rejectForeignOrigin(request: IncomingMessage): void {
+  if (request.headers.origin !== undefined && !sameOrigin(request)) {
+    throw new HttpError('cross-origin mutation rejected', 403, 'origin_rejected');
+  }
+}
+
+function presentedCredential(request: IncomingMessage): string | undefined {
+  const header = request.headers.authorization;
+  if (typeof header !== 'string') return undefined;
+  const match = /^bearer\s+(.+)$/i.exec(header.trim());
+  return match?.[1];
+}
+
+function credentialMatches(presented: string, expected: string): boolean {
+  const left = Buffer.from(presented, 'utf8');
+  const right = Buffer.from(expected, 'utf8');
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
+function requireCredential(request: IncomingMessage, expected: string, scope: string): void {
+  const presented = presentedCredential(request);
+  if (!presented || !credentialMatches(presented, expected)) {
+    throw new HttpError(`a ${scope} credential is required`, 401, 'unauthorized');
   }
 }
 
@@ -88,27 +159,95 @@ async function serveStatic(response: ServerResponse, staticRoot: string, pathnam
   }
 }
 
-export function createCollaborationHttpServer(service: CollaborationService, staticRoot?: string) {
+/**
+ * Runs one operation and answers with a newline-delimited JSON stream.
+ *
+ * Every operation uses the same framing so the client has one code path, and so a long check keeps
+ * the response alive: headers flush before the command starts, output frames arrive as the command
+ * produces them, and keepalive frames cover silent stretches.
+ */
+async function streamOperation(
+  request: IncomingMessage,
+  response: ServerResponse,
+  context: Omit<OperationContext, 'onOutput'>,
+): Promise<void> {
+  const body = await readJson(request);
+  const name = body['operation'];
+  if (typeof name !== 'string' || name.length === 0) {
+    throw new HttpError('operation must be a non-empty string', 400, 'invalid_operation');
+  }
+  let definition;
+  let input;
+  try {
+    definition = requireOperation(name);
+    input = operationInput(body['input']);
+  } catch (error) {
+    if (error instanceof CollaborationError) {
+      throw new HttpError(error.message, error.code === 'unknown_operation' ? 404 : 400, error.code);
+    }
+    throw error;
+  }
+
+  response.writeHead(200, {
+    'cache-control': 'no-store',
+    'content-type': 'application/x-ndjson; charset=utf-8',
+  });
+  const write = (frame: Record<string, unknown>): void => {
+    if (!response.writableEnded) response.write(`${JSON.stringify(frame)}\n`);
+  };
+  const keepalive = setInterval(() => write({ type: 'keepalive' }), KEEPALIVE_INTERVAL_MS);
+  keepalive.unref();
+  try {
+    const onOutput = (stream: OutputStream, data: string): void => write({ type: 'output', stream, data });
+    write({ type: 'result', value: await definition.invoke({ ...context, onOutput }, input) });
+  } catch (error) {
+    if (error instanceof CollaborationError || error instanceof GitError) {
+      write({ type: 'error', code: error.code, message: error.message });
+    } else {
+      console.error(error);
+      write({ type: 'error', code: 'internal_error', message: 'internal server error' });
+    }
+  } finally {
+    clearInterval(keepalive);
+    response.end();
+  }
+}
+
+export function createCollaborationHttpServer(options: CollaborationHttpOptions) {
+  const { service, repository, credentials, daemon, staticRoot } = options;
   return createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`);
+
       if (request.method === 'GET' && url.pathname === '/api/snapshot') {
+        requireCredential(request, credentials.browser, 'field terminal');
         return json(response, 200, service.snapshot());
       }
 
       if (request.method === 'POST') {
-        requireSameOrigin(request);
+        if (url.pathname === '/api/operations') {
+          requireCredential(request, credentials.agent, 'collabd agent');
+          rejectForeignOrigin(request);
+          return await streamOperation(request, response, { service, repository, daemon });
+        }
+
         const revealMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/reveal-proposals$/);
+        const decisionMatch = url.pathname.match(/^\/api\/decisions\/([^/]+)\/accept$/);
+        const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/accept$/);
+        if (revealMatch || decisionMatch || taskMatch) {
+          // Authenticate before applying the cross-origin guard, so an uncredentialed request is
+          // always a 401 no matter what Origin it does or does not present.
+          requireCredential(request, credentials.browser, 'field terminal');
+          requireSameOrigin(request);
+        }
         if (revealMatch) {
           service.revealProposals(decodeURIComponent(revealMatch[1] ?? ''), 'human');
           return json(response, 200, service.snapshot());
         }
-        const decisionMatch = url.pathname.match(/^\/api\/decisions\/([^/]+)\/accept$/);
         if (decisionMatch) {
           service.acceptDecision(decodeURIComponent(decisionMatch[1] ?? ''), 'human');
           return json(response, 200, service.snapshot());
         }
-        const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/accept$/);
         if (taskMatch) {
           const body = await readJson(request);
           const expectedVersion = body['expected_version'];
@@ -131,6 +270,10 @@ export function createCollaborationHttpServer(service: CollaborationService, sta
       if (!staticRoot) throw new HttpError('not found', 404, 'not_found');
       return await serveStatic(response, staticRoot, url.pathname);
     } catch (error) {
+      if (response.headersSent) {
+        console.error(error);
+        return response.end();
+      }
       if (error instanceof HttpError) return json(response, error.status, { error: error.message, code: error.code });
       if (error instanceof CollaborationError || error instanceof GitError) {
         return json(response, errorStatus(error), { error: error.message, code: error.code });

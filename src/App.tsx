@@ -14,6 +14,7 @@ import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { createCodePlugin } from '@streamdown/code'
 import { Streamdown, type Components } from 'streamdown'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { apiFetch, CREDENTIAL_HINT, hasCredential, UnauthorizedError } from '@/lib/api'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -172,19 +173,21 @@ function eventTaskId(event: Row, snapshot: Snapshot): string | undefined {
 function useSnapshot() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [unauthorized, setUnauthorized] = useState(!hasCredential())
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     try {
-      const response = await fetch('/api/snapshot', { signal })
+      const response = await apiFetch('/api/snapshot', { signal })
       const body = await readApiResponse<Snapshot>(response, 'Snapshot service')
       setSnapshot(body)
       setLastUpdated(new Date())
+      setUnauthorized(false)
       setError(null)
     } catch (requestError) {
-      if ((requestError as Error).name !== 'AbortError') {
-        setError(requestError instanceof Error ? requestError.message : 'Snapshot unavailable')
-      }
+      if ((requestError as Error).name === 'AbortError') return
+      setUnauthorized(requestError instanceof UnauthorizedError)
+      setError(requestError instanceof Error ? requestError.message : 'Snapshot unavailable')
     }
   }, [])
 
@@ -198,7 +201,7 @@ function useSnapshot() {
     }
   }, [refresh])
 
-  return { snapshot, setSnapshot, error, lastUpdated, refresh }
+  return { snapshot, setSnapshot, error, unauthorized, lastUpdated, refresh }
 }
 
 function Artifact({ label, children, tone = 'neutral' }: { label: string; children: React.ReactNode; tone?: string }) {
@@ -432,7 +435,7 @@ function LoadingShell() {
 }
 
 function App() {
-  const { snapshot, setSnapshot, error, lastUpdated, refresh } = useSnapshot()
+  const { snapshot, setSnapshot, error, unauthorized, lastUpdated, refresh } = useSnapshot()
   const [selectedTaskId, setSelectedTaskId] = useState<string>('all')
   const [pending, setPending] = useState<string | null>(null)
   const [mutationError, setMutationError] = useState<string | null>(null)
@@ -463,7 +466,7 @@ function App() {
     setPending(key)
     setMutationError(null)
     try {
-      const response = await fetch(path, {
+      const response = await apiFetch(path, {
         method: 'POST',
         headers: body ? { 'content-type': 'application/json' } : undefined,
         body: body ? JSON.stringify(body) : undefined,
@@ -565,15 +568,23 @@ function App() {
           {(error || mutationError) && (
             <Alert variant="destructive" className="stream-alert">
               <AlertCircleIcon />
-              <AlertTitle>{mutationError ? 'Action rejected' : 'Connection interrupted'}</AlertTitle>
+              <AlertTitle>
+                {mutationError ? 'Action rejected' : unauthorized ? 'Credential required' : 'Connection interrupted'}
+              </AlertTitle>
               <AlertDescription>
                 {mutationError ?? error}
-                {!mutationError && <Button variant="ghost" size="xs" onClick={() => void refresh()}>Retry</Button>}
+                {!mutationError && !unauthorized && (
+                  <Button variant="ghost" size="xs" onClick={() => void refresh()}>Retry</Button>
+                )}
               </AlertDescription>
             </Alert>
           )}
 
-          {!snapshot ? (
+          {unauthorized && !snapshot ? (
+            <div className="stream-empty" data-slot="message-scroller-item">
+              {CREDENTIAL_HINT}
+            </div>
+          ) : !snapshot ? (
             <LoadingShell />
           ) : (
             <div className="stream-scroller">
