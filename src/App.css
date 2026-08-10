@@ -123,6 +123,88 @@ body,
 [data-slot="message"][data-actor="codex"] [data-slot="message-header"] { color: var(--agent-codex); }
 .message-route { margin-left: .45rem; color: var(--muted-foreground); font-weight: 400; }
 
+.markdown-body {
+  width: 100%;
+  min-width: 0;
+  color: inherit;
+  font-size: .84rem;
+  line-height: 1.62;
+  overflow-wrap: anywhere;
+}
+.markdown-body > :first-child { margin-top: 0; }
+.markdown-body > :last-child { margin-bottom: 0; }
+.markdown-body :where(p, ul, ol, blockquote, pre, table, hr) { margin: .7rem 0; }
+.markdown-body :where(h1, h2, h3, h4, h5, h6) {
+  margin: 1.05rem 0 .45rem;
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  font-weight: 650;
+  line-height: 1.3;
+  letter-spacing: .02em;
+}
+.markdown-body h3 { font-size: 1.02rem; }
+.markdown-body h4 { font-size: .94rem; }
+.markdown-body :where(h5, h6) { font-size: .86rem; }
+.markdown-body :where(ul, ol) { padding-left: 1.35rem; }
+.markdown-body ul { list-style: square; }
+.markdown-body ol { list-style: decimal; }
+.markdown-body li { padding-left: .15rem; }
+.markdown-body li + li { margin-top: .28rem; }
+.markdown-body li::marker { color: var(--signal-soft); font-family: var(--font-mono); }
+.markdown-body blockquote {
+  border-left: 2px solid var(--border-strong);
+  padding-left: .8rem;
+  color: var(--muted-foreground);
+}
+.markdown-body a {
+  color: var(--signal-soft);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklch, var(--signal-soft) 48%, transparent);
+  text-underline-offset: .2em;
+}
+.markdown-body a:hover { text-decoration-color: currentColor; }
+.markdown-body :not(pre) > code {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--muted);
+  padding: .08rem .28rem;
+  color: var(--signal-soft);
+  font-size: .78em;
+}
+.markdown-body [data-streamdown="code-block"] {
+  margin: .85rem 0;
+  border-color: var(--border-strong);
+  border-radius: var(--radius);
+  background: oklch(0.125 0.008 110);
+}
+.markdown-body [data-streamdown="code-block-header"] {
+  border-bottom: 1px solid var(--border);
+  color: var(--muted-foreground);
+  letter-spacing: .08em;
+}
+.markdown-body [data-streamdown="code-block-body"] {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: .76rem;
+  line-height: 1.55;
+}
+.markdown-body [data-streamdown="code-block-actions"] { border-color: var(--border); background: var(--card); }
+.markdown-body [data-streamdown="code-block-actions"] button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.markdown-body table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: .76rem;
+}
+.markdown-body :where(th, td) { border: 1px solid var(--border); padding: .38rem .5rem; text-align: left; }
+.markdown-body th { background: var(--muted); color: var(--foreground); font-family: var(--font-mono); }
+.markdown-body hr { border: 0; border-top: 1px solid var(--border); }
+
 .artifact {
   position: relative;
   width: min(42rem, 92%);
@@ -143,6 +225,9 @@ body,
 .artifact p { margin: 0; }
 .artifact h3 { font-size: .95rem; font-weight: 600; }
 .artifact p { margin-top: .55rem; color: var(--muted-foreground); font-size: .82rem; line-height: 1.5; }
+.artifact .decision-statement p { color: var(--foreground); font-size: .9rem; font-weight: 560; line-height: 1.58; }
+.artifact .decision-statement > p:first-child { margin-top: 0; }
+.decision-rationale { margin-top: .8rem; border-top: 1px dotted var(--border); padding-top: .75rem; }
 .artifact-title-row { min-width: 0; gap: .65rem; }
 .artifact-title-row svg { flex: none; color: var(--artifact-accent); }
 .artifact-title-row code { min-width: 0; overflow: hidden; color: var(--foreground); font: .75rem/1.4 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
@@ -150,7 +235,8 @@ body,
 .artifact-action { display: flex; justify-content: flex-end; margin-top: .9rem; }
 .proposal-stack { display: flex; flex-direction: column; gap: .8rem; }
 .proposal { border-left: 1px solid var(--border-strong); padding-left: .75rem; }
-.proposal strong { color: var(--signal-soft); font: 650 .65rem/1 var(--font-mono); text-transform: uppercase; }
+.proposal > strong { color: var(--signal-soft); font: 650 .65rem/1 var(--font-mono); text-transform: uppercase; }
+.proposal > .markdown-body { margin-top: .55rem; color: var(--muted-foreground); }
 
 .operator-label { flex: none; gap: .65rem; }
 .operator-label > svg { color: var(--signal); }

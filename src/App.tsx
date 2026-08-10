@@ -11,6 +11,8 @@ import {
   TriangleAlertIcon,
 } from 'lucide-react'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
+import { createCodePlugin } from '@streamdown/code'
+import { Streamdown, type Components } from 'streamdown'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -71,6 +73,17 @@ const StreamList = forwardRef<HTMLDivElement, React.ComponentPropsWithoutRef<'di
 StreamList.displayName = 'StreamList'
 
 const virtuosoComponents = { List: StreamList }
+const markdownPlugins = {
+  code: createCodePlugin({ themes: ['github-dark', 'github-dark'] }),
+}
+const markdownComponents: Components = {
+  h1: 'h3',
+  h2: 'h4',
+  h3: 'h5',
+  h4: 'h6',
+  h5: 'h6',
+  h6: 'h6',
+}
 
 const actorNames: Record<string, string> = {
   claude: 'Claude',
@@ -100,6 +113,19 @@ function formatTime(value: unknown): string {
 
 function titleCase(value: unknown): string {
   return text(value).replaceAll('_', ' ')
+}
+
+function MarkdownBody({ children, className }: { children: string; className?: string }) {
+  return (
+    <Streamdown
+      className={['markdown-body', className].filter(Boolean).join(' ')}
+      components={markdownComponents}
+      mode="static"
+      plugins={markdownPlugins}
+    >
+      {children}
+    </Streamdown>
+  )
 }
 
 async function readApiResponse<T>(response: Response, operation: string): Promise<T> {
@@ -250,7 +276,7 @@ function StreamEvent({
             <span className="message-route">→ {actorNames[text(message['recipient'])] ?? text(message['recipient'])}</span>
           </MessageHeader>
           <Bubble variant={actor === 'human' ? 'tinted' : 'outline'} align={actor === 'human' ? 'end' : 'start'}>
-            <BubbleContent>{text(message['body'])}</BubbleContent>
+            <BubbleContent><MarkdownBody>{text(message['body'])}</MarkdownBody></BubbleContent>
           </Bubble>
           <MessageFooter>{time}</MessageFooter>
         </MessageContent>
@@ -264,8 +290,8 @@ function StreamEvent({
     const mutationKey = `decision:${id}`
     return (
       <Artifact label="Decision proposed" tone="decision">
-        <h3>{text(decision['statement'])}</h3>
-        <p>{text(decision['rationale'])}</p>
+        <MarkdownBody className="decision-statement">{text(decision['statement'])}</MarkdownBody>
+        <MarkdownBody className="decision-rationale">{text(decision['rationale'])}</MarkdownBody>
         <div className="artifact-meta">
           <span>{actorNames[actor] ?? actor}</span>
           <span>{time}</span>
@@ -296,7 +322,7 @@ function StreamEvent({
           {proposals.map((proposal) => (
             <section key={text(proposal['id'])} className="proposal">
               <strong>{actorNames[text(proposal['agent_id'])] ?? text(proposal['agent_id'])}</strong>
-              <p>{text(proposal['content'])}</p>
+              <MarkdownBody>{text(proposal['content'])}</MarkdownBody>
             </section>
           ))}
         </div>
