@@ -29,6 +29,8 @@ type VerificationInput = {
   command?: string[];
   checkId?: string;
 };
+type TaskRole = 'implementer' | 'reviewer' | 'verifier';
+type TaskRoleAssignment = Record<TaskRole, string>;
 
 const REVISION_RESERVATION_TTL_MS = 60 * 60 * 1000;
 const CHECK_POLICY_PATH = '.scrapgrid/checks.json';
@@ -278,6 +280,30 @@ export class CollaborationService {
     return task;
   }
 
+  private requireTaskRole(taskId: string, role: TaskRole, agentId: string): Row {
+    const assignment = this.db
+      .prepare('SELECT * FROM task_roles WHERE task_id = ? AND role = ?')
+      .get(taskId, role) as Row | undefined;
+    if (!assignment) {
+      throw new CollaborationError(`task requires an assigned ${role}`, 'roles_required');
+    }
+    if (assignment['agent_id'] !== agentId) {
+      throw new CollaborationError(
+        `${role} authority belongs to ${String(assignment['agent_id'])}`,
+        'role_forbidden',
+      );
+    }
+    return assignment;
+  }
+
+  private requireAssignedRoles(taskId: string): TaskRoleAssignment {
+    const rows = this.db
+      .prepare('SELECT role, agent_id FROM task_roles WHERE task_id = ?')
+      .all(taskId) as Array<{ role: TaskRole; agent_id: string }>;
+    if (rows.length !== 3) throw new CollaborationError('task requires all three assigned roles', 'roles_required');
+    return Object.fromEntries(rows.map((row) => [row.role, row.agent_id])) as TaskRoleAssignment;
+  }
+
   private requireProjectActive(): void {
     const state = this.db.prepare('SELECT status FROM project_state WHERE singleton = 1').get() as Row;
     if (state['status'] !== 'active') throw new CollaborationError('project is paused', 'project_paused');
@@ -331,6 +357,7 @@ export class CollaborationService {
       tasks,
       active_leases: activeLeases,
       active_claim_reservations: activeClaimReservations,
+      task_roles: this.db.prepare('SELECT * FROM task_roles ORDER BY task_id, role').all() as Row[],
       worktrees,
     };
   }
@@ -375,6 +402,7 @@ export class CollaborationService {
       tasks,
       leases: this.db.prepare('SELECT * FROM leases ORDER BY acquired_at').all() as Row[],
       claim_reservations: this.db.prepare('SELECT * FROM claim_reservations ORDER BY created_at').all() as Row[],
+      task_roles: this.db.prepare('SELECT * FROM task_roles ORDER BY task_id, role').all() as Row[],
       worktrees: this.db.prepare('SELECT * FROM managed_worktrees ORDER BY agent_id').all() as Row[],
       messages: this.db.prepare('SELECT * FROM messages ORDER BY created_at').all() as Row[],
       proposals,
@@ -458,6 +486,9 @@ export class CollaborationService {
          FROM check_policy_overrides ORDER BY created_at`,
       )
       .all() as Row[];
+    const taskRoles = this.db
+      .prepare('SELECT task_id, role, agent_id, assigned_by, assigned_at FROM task_roles ORDER BY task_id, role')
+      .all() as Row[];
     return {
       agent_id: agentId,
       synced_at: timestamp,
@@ -471,6 +502,7 @@ export class CollaborationService {
       open_findings: openFindings,
       verifications,
       check_policy_overrides: checkPolicyOverrides,
+      task_roles: taskRoles,
       status: this.status(),
     };
   }
@@ -514,6 +546,56 @@ export class CollaborationService {
     );
   }
 
+  assignTaskRoles(input: {
+    taskId: string;
+    actor: string;
+    implementer: string;
+    reviewer: string;
+    verifier: string;
+  }): Row[] {
+    return this.transaction(
+      { name: 'task.assign_roles', actor: input.actor, subjectType: 'task', subjectId: input.taskId },
+      (operationId) => {
+        const actor = this.requireAgent(input.actor);
+        if (actor['kind'] !== 'human') {
+          throw new CollaborationError('only a human can assign task roles', 'human_required');
+        }
+        const task = this.requireTask(input.taskId);
+        if (task['status'] !== 'open') {
+          throw new CollaborationError('task roles must be assigned before implementation begins', 'invalid_transition');
+        }
+        const assignments: TaskRoleAssignment = {
+          implementer: input.implementer,
+          reviewer: input.reviewer,
+          verifier: input.verifier,
+        };
+        if (new Set(Object.values(assignments)).size !== 3) {
+          throw new CollaborationError('implementer, reviewer, and verifier must be distinct', 'role_conflict');
+        }
+        const existing = this.db
+          .prepare('SELECT count(*) AS count FROM task_roles WHERE task_id = ?')
+          .get(input.taskId) as { count: number };
+        if (existing.count > 0) {
+          throw new CollaborationError('task roles are already assigned', 'invalid_transition');
+        }
+        const timestamp = now();
+        const insert = this.db.prepare(
+          `INSERT INTO task_roles (task_id, role, agent_id, assigned_by, assigned_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        );
+        for (const [role, agentId] of Object.entries(assignments) as Array<[TaskRole, string]>) {
+          const agent = this.requireAgent(agentId);
+          if (agent['kind'] !== 'model' || agent['status'] !== 'active') {
+            throw new CollaborationError(`${role} must be an enabled model agent`, 'invalid_role_agent');
+          }
+          insert.run(input.taskId, role, agentId, input.actor, timestamp);
+        }
+        this.event(operationId, input.actor, 'task', input.taskId, 'task_roles_assigned', assignments);
+        return this.db.prepare('SELECT * FROM task_roles WHERE task_id = ? ORDER BY role').all(input.taskId) as Row[];
+      },
+    );
+  }
+
   claimTask(input: { taskId: string; agent: string; expectedVersion: number; ttlSeconds: number }): Row {
     return this.transaction({ name: 'task.claim', actor: input.agent, subjectType: 'task', subjectId: input.taskId }, (operationId) => {
       this.requireProjectActive();
@@ -542,6 +624,7 @@ export class CollaborationService {
           'reservation_conflict',
         );
       }
+      this.requireTaskRole(input.taskId, 'implementer', input.agent);
       const existing = this.db.prepare('SELECT * FROM leases WHERE task_id = ?').get(input.taskId) as Row | undefined;
       if (existing && String(existing['expires_at']) > claimedAt && existing['agent_id'] !== input.agent) {
         throw new CollaborationError(`task is leased by ${String(existing['agent_id'])}`, 'lease_conflict');
@@ -701,6 +784,8 @@ export class CollaborationService {
       { name: 'review.request', actor: input.agent, subjectType: 'task', subjectId: input.taskId },
       () => {
         const taskAtRequest = this.requireTask(input.taskId);
+        this.requireAgent(input.agent);
+        this.requireTaskRole(input.taskId, 'implementer', input.agent);
         return this.repository.requireDescendant(
           String(taskAtRequest['base_commit']),
           input.commit,
@@ -709,6 +794,7 @@ export class CollaborationService {
       (operationId, { candidateCommit: commit }) => {
         const task = this.requireTask(input.taskId);
         this.requireAgent(input.agent);
+        this.requireTaskRole(input.taskId, 'implementer', input.agent);
         if (task['owner_agent_id'] !== input.agent) {
           throw new CollaborationError('only the task owner can request review', 'not_task_owner');
         }
@@ -729,10 +815,18 @@ export class CollaborationService {
         this.db
           .prepare(
             `INSERT INTO reviews
-             (id, task_id, requester, repository_identity, commit_sha, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)`,
+             (id, task_id, requester, reviewer, repository_identity, commit_sha, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
           )
-          .run(id, input.taskId, input.agent, this.repository.binding.identity, commit, timestamp);
+          .run(
+            id,
+            input.taskId,
+            input.agent,
+            this.requireAssignedRoles(input.taskId).reviewer,
+            this.repository.binding.identity,
+            commit,
+            timestamp,
+          );
         this.db
           .prepare(
             'UPDATE tasks SET status = \'in_review\', candidate_commit = ?, version = version + 1, updated_at = ? WHERE id = ?',
@@ -741,6 +835,7 @@ export class CollaborationService {
         this.db.prepare('DELETE FROM leases WHERE task_id = ?').run(input.taskId);
         this.event(operationId, input.agent, 'review', id, 'review_requested', {
           task_id: input.taskId,
+          reviewer: this.requireAssignedRoles(input.taskId).reviewer,
           repository: this.repository.binding.identity,
           commit,
         });
@@ -754,6 +849,7 @@ export class CollaborationService {
       this.requireAgent(input.agent);
       const review = this.db.prepare('SELECT * FROM reviews WHERE id = ?').get(input.reviewId) as Row | undefined;
       if (!review) throw new CollaborationError(`unknown review: ${input.reviewId}`, 'unknown_review');
+      this.requireTaskRole(String(review['task_id']), 'reviewer', input.agent);
       if (review['requester'] === input.agent) {
         throw new CollaborationError('requester cannot review their own commit', 'self_review');
       }
@@ -804,6 +900,7 @@ export class CollaborationService {
       this.requireAgent(input.agent);
       const review = this.db.prepare('SELECT * FROM reviews WHERE id = ?').get(input.reviewId) as Row | undefined;
       if (!review) throw new CollaborationError(`unknown review: ${input.reviewId}`, 'unknown_review');
+      this.requireTaskRole(String(review['task_id']), 'reviewer', input.agent);
       if (review['requester'] === input.agent) {
         throw new CollaborationError('requester cannot add findings to their own review', 'self_review');
       }
@@ -845,6 +942,7 @@ export class CollaborationService {
       { name: 'verification.run', actor: input.agent, subjectType: 'task', subjectId: input.taskId },
       async () => {
         this.requireAgent(input.agent);
+        this.requireTaskRole(input.taskId, 'verifier', input.agent);
         const task = this.requireIndependentVerifier(input.taskId, input.agent);
         const spec = this.verificationSpec(task, input);
         const execution = await this.repository.runAtCommit(input.commit, spec.command);
@@ -853,6 +951,7 @@ export class CollaborationService {
       (operationId, { execution, spec }) => {
         const commandArgvJson = JSON.stringify(execution.commandArgv);
         this.requireAgent(input.agent);
+        this.requireTaskRole(input.taskId, 'verifier', input.agent);
         const task = this.requireIndependentVerifier(input.taskId, input.agent);
         if (spec.checkPolicyIdentity && task['check_policy_identity'] !== spec.checkPolicyIdentity) {
           throw new CollaborationError('task check policy changed during verification', 'stale_check_policy');
@@ -995,6 +1094,7 @@ export class CollaborationService {
       const actor = this.requireAgent(input.actor);
       if (actor['kind'] !== 'human') throw new CollaborationError('only a human can accept a task', 'human_required');
       const task = this.requireTask(input.taskId);
+      const roles = this.requireAssignedRoles(input.taskId);
       if (task['version'] !== input.expectedVersion) {
         throw new CollaborationError(
           `stale task version: expected ${input.expectedVersion}, current ${String(task['version'])}`,
@@ -1024,9 +1124,10 @@ export class CollaborationService {
         .prepare(
           `SELECT id FROM reviews
            WHERE task_id = ? AND repository_identity = ? AND commit_sha = ? AND verdict = 'approved'
+             AND reviewer = ?
            ORDER BY submitted_at DESC LIMIT 1`,
         )
-        .get(input.taskId, this.repository.binding.identity, String(task['candidate_commit']));
+        .get(input.taskId, this.repository.binding.identity, String(task['candidate_commit']), roles.reviewer);
       if (!review) throw new CollaborationError('candidate commit lacks an approved review', 'acceptance_gate');
       const override = this.db
         .prepare(
@@ -1047,13 +1148,14 @@ export class CollaborationService {
             .prepare(
               `SELECT id FROM verifications
                WHERE task_id = ? AND repository_identity = ? AND commit_sha = ? AND exit_code = 0
-                 AND runner <> ? AND check_id = ? AND check_policy_identity = ?
+                 AND runner = ? AND runner <> ? AND check_id = ? AND check_policy_identity = ?
                ORDER BY created_at DESC LIMIT 1`,
             )
             .get(
               input.taskId,
               this.repository.binding.identity,
               String(task['candidate_commit']),
+              roles.verifier,
               String(task['owner_agent_id']),
               check.id,
               String(task['check_policy_identity']),

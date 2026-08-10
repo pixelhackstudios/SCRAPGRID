@@ -16,7 +16,7 @@ tests provide executable evidence. No model has supervisory authority over anoth
 
 The repository contains the CLI-first collaboration core plus its first Git-truth slice:
 
-- a SQLite schema for agents, tasks, leases, revision claim reservations, proposals, decisions, messages,
+- a SQLite schema for agents, tasks, temporary task roles, leases, revision claim reservations, proposals, decisions, messages,
   blockers, reviews, findings, verifications, check-policy overrides, operation attempts, and append-only events;
 - a transport-neutral operation boundary that records accepted, rejected, and failed coordination operations
   outside rolled-back domain transactions, while unfinished rows preserve crash or abandonment evidence;
@@ -35,6 +35,7 @@ The repository contains the CLI-first collaboration core plus its first Git-trut
   normalized commit, exact command argv as JSON, and exit code recorded;
 - independent verification enforcement that rejects the task owner as runner and prevents owner-authored evidence
   from satisfying acceptance;
+- human-assigned, task-scoped implementer, reviewer, and verifier authority with three distinct peer models;
 - named required checks loaded from `.scrapgrid/checks.json` at each task's base commit, with the Git blob identity
   pinned to the task and carried by satisfying verification evidence;
 - review requests that require the implementation owner to still hold the live task lease;
@@ -49,8 +50,9 @@ The repository contains the CLI-first collaboration core plus its first Git-trut
   to the existing collaboration service;
 - a JSON-output CLI and implementation-proximate tests.
 
-This slice does **not** yet couple leases to mutable worktree ownership, recover stale post-review edits, run a
-daemon, expose MCP, schedule agents, provide general-purpose human chat input, or implement MMORPG systems. See
+This slice does **not** yet reassign roles after implementation begins, couple leases to mutable worktree
+ownership, recover stale post-review edits, run a daemon, expose MCP, schedule agents, provide general-purpose
+human chat input, or implement MMORPG systems. See
 [`docs/framework-documentation/04 - Pilot 002 Implementation Charter.md`](docs/framework-documentation/04%20-%20Pilot%20002%20Implementation%20Charter.md)
 for the authoritative Pilot 002 prerequisite sequence.
 
@@ -81,6 +83,9 @@ Example flow:
 npm run collab -- task create TASK-001 \
   --goal "Prove one bounded change" \
   --acceptance "An independent review approves the candidate commit"
+
+npm run collab -- task assign-roles TASK-001 --actor human \
+  --implementer codex --reviewer claude --verifier grok
 
 npm run collab -- proposal submit TASK-001 --agent grok --content "Use an exclusive task lease."
 npm run collab -- proposal submit TASK-001 --agent claude --content "Review one immutable commit."

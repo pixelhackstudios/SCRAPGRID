@@ -70,7 +70,19 @@ function harness(): {
   };
 }
 
-test('schema version 1 upgrades reservations, operation linkage, finding authorship, repository binding, and proposal metadata', () => {
+function assignRoles(
+  service: CollaborationService,
+  taskId: string,
+  roles: { implementer: string; reviewer: string; verifier: string } = {
+    implementer: 'codex',
+    reviewer: 'claude',
+    verifier: 'grok',
+  },
+): void {
+  service.assignTaskRoles({ taskId, actor: 'human', ...roles });
+}
+
+test('schema version 1 upgrades roles, reservations, operation linkage, findings, repository binding, and proposals', () => {
   const fixture = createRepository();
   const db = openDatabase(':memory:');
   try {
@@ -120,10 +132,13 @@ test('schema version 1 upgrades reservations, operation linkage, finding authors
     const overridesTable = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'check_policy_overrides'")
       .get() as { name: string } | undefined;
+    const rolesTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_roles'")
+      .get() as { name: string } | undefined;
     const uniqueIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'proposals_task_agent_unique'")
       .get() as { name: string } | undefined;
-    assert.equal(version.user_version, 6);
+    assert.equal(version.user_version, 7);
     assert.ok(columns.some((column) => column.name === 'raised_by'));
     assert.ok(taskColumns.some((column) => column.name === 'check_policy_identity'));
     assert.ok(taskColumns.some((column) => column.name === 'check_policy_json'));
@@ -134,6 +149,7 @@ test('schema version 1 upgrades reservations, operation linkage, finding authors
     assert.equal(operationsTable?.name, 'operation_attempts');
     assert.equal(reservationsTable?.name, 'claim_reservations');
     assert.equal(overridesTable?.name, 'check_policy_overrides');
+    assert.equal(rolesTable?.name, 'task_roles');
     assert.equal(uniqueIndex?.name, 'proposals_task_agent_unique');
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
   } finally {
@@ -146,6 +162,7 @@ test('operation ledger preserves accepted, rejected, and failed attempts with ca
   const { service, close } = harness();
   try {
     service.createTask({ id: 'TASK-OPS', goal: 'Trace service operations', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-OPS');
     service.claimTask({ taskId: 'TASK-OPS', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
     assert.throws(
       () => service.claimTask({ taskId: 'TASK-OPS', agent: 'claude', expectedVersion: 1, ttlSeconds: 900 }),
@@ -226,6 +243,7 @@ test('asynchronous verification events carry the operation that caused them', as
   const { service, repository, close } = harness();
   try {
     service.createTask({ id: 'TASK-ASYNC-OPS', goal: 'Trace verification', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-ASYNC-OPS', { implementer: 'codex', reviewer: 'grok', verifier: 'claude' });
     const verification = await service.runVerification({
       taskId: 'TASK-ASYNC-OPS',
       agent: 'claude',
@@ -249,6 +267,7 @@ test('accepted verification completion commits atomically with verification evid
   const { service, db, repository, close } = harness();
   try {
     service.createTask({ id: 'TASK-ASYNC-ATOMIC', goal: 'Commit verification atomically', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-ASYNC-ATOMIC', { implementer: 'codex', reviewer: 'grok', verifier: 'claude' });
     db.exec(`
       CREATE TRIGGER reject_accepted_verification
       BEFORE UPDATE OF outcome ON operation_attempts
@@ -320,6 +339,7 @@ test('review requests reject invented, missing, non-commit, unreachable, and for
   const foreign = createRepository();
   try {
     service.createTask({ id: 'TASK-GIT', goal: 'Trust Git objects', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-GIT');
     service.claimTask({ taskId: 'TASK-GIT', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
     assert.throws(
       () => service.requestReview({ taskId: 'TASK-GIT', agent: 'codex', commit: 'proof-sha' }),
@@ -357,6 +377,7 @@ test('review candidate must descend from the immutable task base', () => {
   const { service, repositoryPath, close } = harness();
   try {
     service.createTask({ id: 'TASK-LINEAGE', goal: 'Enforce task lineage', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-LINEAGE', { implementer: 'grok', reviewer: 'codex', verifier: 'claude' });
     service.claimTask({ taskId: 'TASK-LINEAGE', agent: 'grok', expectedVersion: 1, ttlSeconds: 900 });
     const tree = git(repositoryPath, ['rev-parse', 'HEAD^{tree}']);
     const unrelatedCommit = git(repositoryPath, ['commit-tree', tree, '-m', 'Reachable unrelated root']);
@@ -391,10 +412,11 @@ test('worktree bootstrap creates stable isolated branches and is idempotent', ()
   }
 });
 
-test('stale claims and competing leases fail closed', () => {
+test('stale and role-forbidden claims fail closed', () => {
   const { service, close } = harness();
   try {
     service.createTask({ id: 'TASK-001', goal: 'Prove leasing', acceptance: ['one owner'], actor: 'human' });
+    assignRoles(service, 'TASK-001', { implementer: 'grok', reviewer: 'codex', verifier: 'claude' });
     service.claimTask({ taskId: 'TASK-001', agent: 'grok', expectedVersion: 1, ttlSeconds: 900 });
     assert.throws(
       () => service.claimTask({ taskId: 'TASK-001', agent: 'claude', expectedVersion: 1, ttlSeconds: 900 }),
@@ -402,7 +424,7 @@ test('stale claims and competing leases fail closed', () => {
     );
     assert.throws(
       () => service.claimTask({ taskId: 'TASK-001', agent: 'claude', expectedVersion: 2, ttlSeconds: 900 }),
-      (error: unknown) => error instanceof CollaborationError && error.code === 'lease_conflict',
+      (error: unknown) => error instanceof CollaborationError && error.code === 'role_forbidden',
     );
   } finally {
     close();
@@ -434,6 +456,7 @@ test('review request requires the requester to still hold an unexpired lease', (
   const { service, repository, close } = harness();
   try {
     service.createTask({ id: 'TASK-LEASE', goal: 'Reject expired owners', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-LEASE');
     service.claimTask({ taskId: 'TASK-LEASE', agent: 'codex', expectedVersion: 1, ttlSeconds: 0 });
     assert.throws(
       () => service.requestReview({ taskId: 'TASK-LEASE', agent: 'codex', commit: repository.headCommit() }),
@@ -448,6 +471,7 @@ test('needs_revision reserves the next claim for the original implementer withou
   const { service, repository, close } = harness();
   try {
     service.createTask({ id: 'TASK-REVISION', goal: 'Preserve revision continuity', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-REVISION');
     service.claimTask({ taskId: 'TASK-REVISION', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
     const review = service.requestReview({
       taskId: 'TASK-REVISION',
@@ -513,10 +537,11 @@ test('needs_revision reserves the next claim for the original implementer withou
   }
 });
 
-test('expired revision reservations restore ordinary claim rules and are consumed by the next claim', () => {
+test('expired revision reservations restore ordinary role-governed claim rules', () => {
   const { service, db, repository, close } = harness();
   try {
     service.createTask({ id: 'TASK-EXPIRED-REVISION', goal: 'Release expired priority', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-EXPIRED-REVISION');
     service.claimTask({ taskId: 'TASK-EXPIRED-REVISION', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
     const review = service.requestReview({
       taskId: 'TASK-EXPIRED-REVISION',
@@ -528,17 +553,26 @@ test('expired revision reservations restore ordinary claim rules and are consume
       'TASK-EXPIRED-REVISION',
     );
 
+    assert.throws(
+      () => service.claimTask({
+        taskId: 'TASK-EXPIRED-REVISION',
+        agent: 'grok',
+        expectedVersion: 4,
+        ttlSeconds: 900,
+      }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'role_forbidden',
+    );
     const claimed = service.claimTask({
       taskId: 'TASK-EXPIRED-REVISION',
-      agent: 'grok',
+      agent: 'codex',
       expectedVersion: 4,
       ttlSeconds: 900,
     });
     const snapshot = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
     const lease = snapshot['leases']?.find((item) => item['task_id'] === 'TASK-EXPIRED-REVISION');
 
-    assert.equal(claimed['owner_agent_id'], 'grok');
-    assert.equal(lease?.['agent_id'], 'grok');
+    assert.equal(claimed['owner_agent_id'], 'codex');
+    assert.equal(lease?.['agent_id'], 'codex');
     assert.equal(snapshot['claim_reservations']?.length, 0);
   } finally {
     close();
@@ -580,6 +614,7 @@ test('required checks are pinned to the task base policy rather than the candida
   const { service, repository, repositoryPath, close } = harness();
   try {
     const task = service.createTask({ id: 'TASK-PINNED-POLICY', goal: 'Pin policy at base', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-PINNED-POLICY', { implementer: 'codex', reviewer: 'grok', verifier: 'claude' });
     const basePolicyIdentity = task['check_policy_identity'];
     assert.equal(
       basePolicyIdentity,
@@ -629,6 +664,7 @@ test('arbitrary passing verification cannot replace every named check required b
     initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
     const service = new CollaborationService(db, fixture.repository);
     service.createTask({ id: 'TASK-REQUIRED-CHECKS', goal: 'Require every named check', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-REQUIRED-CHECKS');
     service.claimTask({ taskId: 'TASK-REQUIRED-CHECKS', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
     const candidate = fixture.repository.headCommit();
     await service.runVerification({
@@ -655,7 +691,7 @@ test('arbitrary passing verification cannot replace every named check required b
     );
     await service.runVerification({
       taskId: 'TASK-REQUIRED-CHECKS',
-      agent: 'claude',
+      agent: 'grok',
       commit: candidate,
       checkId: 'second',
     });
@@ -681,6 +717,7 @@ test('human check-policy override is candidate-scoped, reason-bearing, and audit
     initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
     const service = new CollaborationService(db, fixture.repository);
     service.createTask({ id: 'TASK-OVERRIDE', goal: 'Repair broken policy', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-OVERRIDE');
     service.claimTask({ taskId: 'TASK-OVERRIDE', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
     const candidate = fixture.repository.headCommit();
     const review = service.requestReview({ taskId: 'TASK-OVERRIDE', agent: 'codex', commit: candidate });
@@ -737,6 +774,7 @@ test('three agents can propose, implement, communicate, verify, review, and reac
       acceptance: ['independent proposals', 'immutable review', 'passing verification'],
       actor: 'human',
     });
+    assignRoles(service, 'TASK-ROOM');
     service.submitProposal({ taskId: 'TASK-ROOM', agent: 'grok', content: 'Use explicit leases.' });
     service.submitProposal({ taskId: 'TASK-ROOM', agent: 'claude', content: 'Review immutable commits.' });
     service.submitProposal({ taskId: 'TASK-ROOM', agent: 'codex', content: 'Record verification by SHA.' });
@@ -785,31 +823,88 @@ test('three agents can propose, implement, communicate, verify, review, and reac
   }
 });
 
-test('implementer verification is rejected and cannot satisfy acceptance even when recorded before ownership', async () => {
-  const { service, repository, close } = harness();
+test('task roles are distinct, human-assigned, task-scoped, and enforced at every authority boundary', async () => {
+  const { service, db, repository, close } = harness();
   try {
-    service.createTask({ id: 'TASK-INDEPENDENT', goal: 'Require independent verification', acceptance: [], actor: 'human' });
+    service.createTask({ id: 'TASK-INDEPENDENT', goal: 'Require explicit peer roles', acceptance: [], actor: 'human' });
     const candidate = repository.headCommit();
-    await service.runVerification({
-      taskId: 'TASK-INDEPENDENT',
-      agent: 'codex',
-      commit: candidate,
-      checkId: 'fixture',
-    });
+    assert.throws(
+      () => service.claimTask({ taskId: 'TASK-INDEPENDENT', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'roles_required',
+    );
+    assert.throws(
+      () => service.assignTaskRoles({
+        taskId: 'TASK-INDEPENDENT',
+        actor: 'claude',
+        implementer: 'codex',
+        reviewer: 'claude',
+        verifier: 'grok',
+      }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'human_required',
+    );
+    assert.throws(
+      () => service.assignTaskRoles({
+        taskId: 'TASK-INDEPENDENT',
+        actor: 'human',
+        implementer: 'codex',
+        reviewer: 'claude',
+        verifier: 'claude',
+      }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'role_conflict',
+    );
+    assignRoles(service, 'TASK-INDEPENDENT');
+    assert.throws(
+      () => service.assignTaskRoles({
+        taskId: 'TASK-INDEPENDENT',
+        actor: 'human',
+        implementer: 'grok',
+        reviewer: 'codex',
+        verifier: 'claude',
+      }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'invalid_transition',
+    );
+    assert.throws(
+      () => service.claimTask({ taskId: 'TASK-INDEPENDENT', agent: 'grok', expectedVersion: 1, ttlSeconds: 900 }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'role_forbidden',
+    );
     service.claimTask({ taskId: 'TASK-INDEPENDENT', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
 
     await assert.rejects(
       service.runVerification({
         taskId: 'TASK-INDEPENDENT',
-        agent: 'codex',
+        agent: 'claude',
         commit: candidate,
         checkId: 'fixture',
       }),
-      (error: unknown) => error instanceof CollaborationError && error.code === 'self_verify',
+      (error: unknown) => error instanceof CollaborationError && error.code === 'role_forbidden',
     );
 
     const review = service.requestReview({ taskId: 'TASK-INDEPENDENT', agent: 'codex', commit: candidate });
+    assert.equal(review['reviewer'], 'claude');
+    assert.throws(
+      () => service.submitReview({ reviewId: String(review['id']), agent: 'grok', verdict: 'approved' }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'role_forbidden',
+    );
     service.submitReview({ reviewId: String(review['id']), agent: 'claude', verdict: 'approved' });
+
+    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get('TASK-INDEPENDENT') as Record<string, unknown>;
+    db.prepare(
+      `INSERT INTO verifications
+       (id, task_id, repository_identity, commit_sha, command, command_argv_json,
+        check_id, check_policy_identity, exit_code, runner, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+    ).run(
+      'verify-wrong-role',
+      'TASK-INDEPENDENT',
+      repository.binding.identity,
+      candidate,
+      JSON.stringify(FIXTURE_CHECK_ARGV),
+      JSON.stringify(FIXTURE_CHECK_ARGV),
+      'fixture',
+      String(task['check_policy_identity']),
+      'claude',
+      new Date().toISOString(),
+    );
     assert.throws(
       () => service.acceptTask({ taskId: 'TASK-INDEPENDENT', actor: 'human', expectedVersion: 3 }),
       (error: unknown) =>
@@ -830,13 +925,56 @@ test('implementer verification is rejected and cannot satisfy acceptance even wh
     );
 
     const snapshot = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
-    assert.equal(snapshot['verifications']?.filter((item) => item['task_id'] === 'TASK-INDEPENDENT').length, 2);
+    assert.deepEqual(
+      snapshot['task_roles']?.filter((item) => item['task_id'] === 'TASK-INDEPENDENT').map((item) => item['agent_id']).sort(),
+      ['claude', 'codex', 'grok'],
+    );
     assert.ok(
       snapshot['operations']?.some(
         (operation) =>
           operation['operation'] === 'verification.run' &&
-          operation['actor'] === 'codex' &&
-          operation['reason_code'] === 'self_verify',
+          operation['actor'] === 'claude' &&
+          operation['reason_code'] === 'role_forbidden',
+      ),
+    );
+    const roleOperation = snapshot['operations']?.find(
+      (operation) => operation['operation'] === 'task.assign_roles' && operation['outcome'] === 'accepted',
+    );
+    assert.ok(
+      snapshot['events']?.some(
+        (event) => event['operation_id'] === roleOperation?.['id'] && event['action'] === 'task_roles_assigned',
+      ),
+    );
+  } finally {
+    close();
+  }
+});
+
+test('implementer self-verification remains rejected as defense in depth', async () => {
+  const { service, db, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-SELF-VERIFY', goal: 'Retain independent verification defense', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-SELF-VERIFY');
+    service.claimTask({ taskId: 'TASK-SELF-VERIFY', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+
+    db.prepare("DELETE FROM task_roles WHERE task_id = ? AND role = 'implementer'").run('TASK-SELF-VERIFY');
+    db.prepare("UPDATE task_roles SET agent_id = 'codex' WHERE task_id = ? AND role = 'verifier'").run(
+      'TASK-SELF-VERIFY',
+    );
+
+    await assert.rejects(
+      service.runVerification({
+        taskId: 'TASK-SELF-VERIFY',
+        agent: 'codex',
+        commit: repository.headCommit(),
+        checkId: 'fixture',
+      }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'self_verify',
+    );
+    const snapshot = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    assert.ok(
+      snapshot['operations']?.some(
+        (operation) => operation['operation'] === 'verification.run' && operation['reason_code'] === 'self_verify',
       ),
     );
   } finally {
@@ -848,6 +986,7 @@ test('verification for a different commit cannot satisfy acceptance', async () =
   const { service, repository, repositoryPath, close } = harness();
   try {
     service.createTask({ id: 'TASK-SHA', goal: 'Bind evidence to SHA', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-SHA', { implementer: 'grok', reviewer: 'codex', verifier: 'claude' });
     service.claimTask({ taskId: 'TASK-SHA', agent: 'grok', expectedVersion: 1, ttlSeconds: 900 });
     const oldCommit = repository.headCommit();
     await service.runVerification({
@@ -875,6 +1014,7 @@ test('finding author or human can resolve a finding, while the implementer canno
   const { service, repository, close } = harness();
   try {
     service.createTask({ id: 'TASK-FINDING', goal: 'Close findings', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-FINDING', { implementer: 'grok', reviewer: 'claude', verifier: 'codex' });
     const decision = service.proposeDecision({
       taskId: 'TASK-FINDING',
       actor: 'grok',
@@ -920,6 +1060,7 @@ test('finding author or human can resolve a finding, while the implementer canno
     );
 
     service.createTask({ id: 'TASK-HUMAN-RESOLVE', goal: 'Exercise human authority', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-HUMAN-RESOLVE', { implementer: 'grok', reviewer: 'claude', verifier: 'codex' });
     service.claimTask({ taskId: 'TASK-HUMAN-RESOLVE', agent: 'grok', expectedVersion: 1, ttlSeconds: 900 });
     const humanReview = service.requestReview({
       taskId: 'TASK-HUMAN-RESOLVE',
@@ -956,10 +1097,12 @@ test('sync returns actionable durable state and never leaks sealed proposals', (
     service.submitProposal({ taskId: 'TASK-SEALED', agent: 'claude', content: 'This must remain sealed.' });
 
     service.createTask({ id: 'TASK-BLOCKED', goal: 'Expose blocker details', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-BLOCKED', { implementer: 'grok', reviewer: 'codex', verifier: 'claude' });
     service.claimTask({ taskId: 'TASK-BLOCKED', agent: 'grok', expectedVersion: 1, ttlSeconds: 900 });
     service.addBlocker({ taskId: 'TASK-BLOCKED', agent: 'grok', description: 'A concrete dependency is missing.' });
 
     service.createTask({ id: 'TASK-REVIEW', goal: 'Expose pending review', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-REVIEW', { implementer: 'codex', reviewer: 'grok', verifier: 'claude' });
     service.claimTask({ taskId: 'TASK-REVIEW', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
     const candidate = repository.headCommit();
     const review = service.requestReview({ taskId: 'TASK-REVIEW', agent: 'codex', commit: candidate });

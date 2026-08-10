@@ -75,6 +75,7 @@ Commands:
   agent list
   worktree bootstrap [--root PATH] [--base SHA]
   task create ID --goal TEXT [--acceptance TEXT ...] [--actor human]
+  task assign-roles ID --actor human --implementer ID --reviewer ID --verifier ID
   task claim ID --agent ID --expected-version N [--ttl 900]
   task accept ID --actor human --expected-version N
   proposal submit TASK --agent ID --content TEXT
@@ -142,6 +143,17 @@ async function run(): Promise<void> {
           agent: required(parsed.options, 'agent'),
           expectedVersion: integer(parsed.options, 'expected-version'),
           ttlSeconds: integer(parsed.options, 'ttl', 900),
+        }),
+      );
+    }
+    if (area === 'task' && action === 'assign-roles' && id) {
+      return print(
+        service.assignTaskRoles({
+          taskId: id,
+          actor: required(parsed.options, 'actor'),
+          implementer: required(parsed.options, 'implementer'),
+          reviewer: required(parsed.options, 'reviewer'),
+          verifier: required(parsed.options, 'verifier'),
         }),
       );
     }
