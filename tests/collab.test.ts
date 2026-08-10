@@ -51,7 +51,7 @@ function harness(): {
   };
 }
 
-test('schema version 1 upgrades finding authorship, repository binding, and proposal uniqueness metadata', () => {
+test('schema version 1 upgrades operation linkage, finding authorship, repository binding, and proposal metadata', () => {
   const fixture = createRepository();
   const db = openDatabase(':memory:');
   try {
@@ -75,22 +75,110 @@ test('schema version 1 upgrades finding authorship, repository binding, and prop
         status TEXT NOT NULL DEFAULT 'open',
         created_at TEXT NOT NULL
       );
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        payload TEXT NOT NULL DEFAULT '{}',
+        timestamp TEXT NOT NULL
+      );
       PRAGMA user_version = 1;
     `);
     initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
     const version = db.prepare('PRAGMA user_version').get() as { user_version: number };
     const columns = db.prepare('PRAGMA table_info(review_findings)').all() as Array<{ name: string }>;
     const verificationColumns = db.prepare('PRAGMA table_info(verifications)').all() as Array<{ name: string }>;
+    const eventColumns = db.prepare('PRAGMA table_info(events)').all() as Array<{ name: string }>;
+    const operationsTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'operation_attempts'")
+      .get() as { name: string } | undefined;
     const uniqueIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'proposals_task_agent_unique'")
       .get() as { name: string } | undefined;
-    assert.equal(version.user_version, 3);
+    assert.equal(version.user_version, 4);
     assert.ok(columns.some((column) => column.name === 'raised_by'));
     assert.ok(verificationColumns.some((column) => column.name === 'command_argv_json'));
+    assert.ok(eventColumns.some((column) => column.name === 'operation_id'));
+    assert.equal(operationsTable?.name, 'operation_attempts');
     assert.equal(uniqueIndex?.name, 'proposals_task_agent_unique');
+    assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
   } finally {
     db.close();
     fixture.close();
+  }
+});
+
+test('operation ledger preserves accepted, rejected, and failed attempts with causal event linkage', () => {
+  const { service, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-OPS', goal: 'Trace service operations', acceptance: [], actor: 'human' });
+    service.claimTask({ taskId: 'TASK-OPS', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+    assert.throws(
+      () => service.claimTask({ taskId: 'TASK-OPS', agent: 'claude', expectedVersion: 1, ttlSeconds: 900 }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'stale_version',
+    );
+    assert.throws(
+      () => service.createTask({ id: 'TASK-UNKNOWN-ACTOR', goal: 'Reject unknown actor', acceptance: [], actor: 'nobody' }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'unknown_agent',
+    );
+    assert.throws(() =>
+      service.createTask({ id: 'TASK-OPS', goal: 'Duplicate task', acceptance: [], actor: 'human' }),
+    );
+
+    const snapshot = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    const operations = snapshot['operations'] ?? [];
+    const events = snapshot['events'] ?? [];
+    const acceptedCreate = operations.find(
+      (operation) => operation['operation'] === 'task.create' && operation['outcome'] === 'accepted',
+    );
+    const rejectedClaim = operations.find(
+      (operation) => operation['operation'] === 'task.claim' && operation['outcome'] === 'rejected',
+    );
+    const failedCreate = operations.find(
+      (operation) => operation['operation'] === 'task.create' && operation['outcome'] === 'failed',
+    );
+    const rejectedUnknownActor = operations.find(
+      (operation) => operation['actor'] === 'nobody' && operation['outcome'] === 'rejected',
+    );
+
+    assert.ok(acceptedCreate?.['completed_at']);
+    assert.equal(acceptedCreate?.['actor'], 'human');
+    assert.equal(acceptedCreate?.['subject_id'], 'TASK-OPS');
+    assert.ok(events.some((event) => event['operation_id'] === acceptedCreate?.['id'] && event['action'] === 'task_created'));
+    assert.equal(rejectedClaim?.['reason_code'], 'stale_version');
+    assert.ok(rejectedClaim?.['completed_at']);
+    assert.ok(!events.some((event) => event['operation_id'] === rejectedClaim?.['id']));
+    assert.equal(rejectedUnknownActor?.['reason_code'], 'unknown_agent');
+    assert.ok(failedCreate?.['error_class']);
+    assert.ok(failedCreate?.['completed_at']);
+    assert.ok(!events.some((event) => event['operation_id'] === failedCreate?.['id']));
+  } finally {
+    close();
+  }
+});
+
+test('asynchronous verification events carry the operation that caused them', async () => {
+  const { service, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-ASYNC-OPS', goal: 'Trace verification', acceptance: [], actor: 'human' });
+    const verification = await service.runVerification({
+      taskId: 'TASK-ASYNC-OPS',
+      agent: 'claude',
+      commit: repository.headCommit(),
+      command: ['node', '-e', 'process.exit(7)'],
+    });
+    const snapshot = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    const operation = snapshot['operations']?.find((item) => item['operation'] === 'verification.run');
+    const event = snapshot['events']?.find((item) => item['entity_id'] === verification['id']);
+
+    assert.equal(operation?.['outcome'], 'accepted');
+    assert.equal(event?.['operation_id'], operation?.['id']);
+    assert.equal(event?.['action'], 'verification_failed');
+    assert.equal(verification['exit_code'], 7);
+  } finally {
+    close();
   }
 });
 
@@ -524,6 +612,11 @@ test('HTTP bridge exposes snapshots and delegates human mutations to the service
     const revealed = (await revealResponse.json()) as Record<string, Array<Record<string, unknown>>>;
     assert.equal(revealResponse.status, 200);
     assert.equal(revealed['proposals']?.[0]?.['content'], 'Reveal through the service.');
+    assert.ok(
+      revealed['operations']?.some(
+        (operation) => operation['operation'] === 'proposal.reveal' && operation['outcome'] === 'accepted',
+      ),
+    );
 
     const acceptResponse = await fetch(`${origin}/api/decisions/${String(decision['id'])}/accept`, {
       method: 'POST',

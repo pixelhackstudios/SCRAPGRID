@@ -69,6 +69,11 @@ export function initializeDatabase(db: DatabaseSync, repository: RepositoryBindi
                SET raised_by = (SELECT reviewer FROM reviews WHERE reviews.id = review_findings.review_id)
                WHERE raised_by IS NULL`);
     }
+    const eventColumns = db.prepare('PRAGMA table_info(events)').all() as Array<{ name: string }>;
+    if (!eventColumns.some((column) => column.name === 'operation_id')) {
+      db.exec('ALTER TABLE events ADD COLUMN operation_id TEXT REFERENCES operation_attempts(id)');
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS events_operation ON events(operation_id)');
     const insertAgent = db.prepare(
       'INSERT OR IGNORE INTO agents (id, name, kind, status) VALUES (?, ?, ?, \'active\')',
     );

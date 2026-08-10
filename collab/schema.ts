@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
@@ -136,8 +136,23 @@ CREATE TABLE IF NOT EXISTS managed_worktrees (
   updated_at TEXT NOT NULL
 );
 
+-- Actor and subject identifiers are deliberately not foreign keys: rejected attempts may name unknown targets.
+CREATE TABLE IF NOT EXISTS operation_attempts (
+  id TEXT PRIMARY KEY,
+  operation TEXT NOT NULL,
+  actor TEXT,
+  subject_type TEXT,
+  subject_id TEXT,
+  outcome TEXT CHECK (outcome IN ('accepted', 'rejected', 'failed', 'abandoned')),
+  reason_code TEXT,
+  error_class TEXT,
+  started_at TEXT NOT NULL,
+  completed_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  operation_id TEXT REFERENCES operation_attempts(id),
   actor TEXT NOT NULL REFERENCES agents(id),
   entity_type TEXT NOT NULL,
   entity_id TEXT NOT NULL,
@@ -147,6 +162,8 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS events_actor_cursor ON events(actor, id);
+CREATE INDEX IF NOT EXISTS operation_attempts_started ON operation_attempts(started_at);
+CREATE INDEX IF NOT EXISTS operation_attempts_subject ON operation_attempts(subject_type, subject_id, started_at);
 CREATE INDEX IF NOT EXISTS messages_recipient_cursor ON messages(recipient, created_at);
 CREATE INDEX IF NOT EXISTS proposals_task ON proposals(task_id);
 CREATE UNIQUE INDEX IF NOT EXISTS proposals_task_agent_unique ON proposals(task_id, agent_id);

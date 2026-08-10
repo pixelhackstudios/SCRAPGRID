@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { GitRepository } from './git.js';
+import { GitError, GitRepository } from './git.js';
 
 export class CollaborationError extends Error {
   constructor(
@@ -14,6 +14,12 @@ export class CollaborationError extends Error {
 
 type JsonObject = Record<string, unknown>;
 type Row = Record<string, unknown>;
+type OperationDescriptor = {
+  name: string;
+  actor?: string;
+  subjectType?: string;
+  subjectId?: string;
+};
 
 function now(): string {
   return new Date().toISOString();
@@ -41,7 +47,7 @@ export class CollaborationService {
     private readonly repository: GitRepository,
   ) {}
 
-  private transaction<T>(operation: () => T): T {
+  private domainTransaction<T>(operation: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const result = operation();
@@ -49,6 +55,80 @@ export class CollaborationService {
       return result;
     } catch (error) {
       this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  private startOperation(descriptor: OperationDescriptor): string {
+    const operationId = makeId('op');
+    this.db
+      .prepare(
+        `INSERT INTO operation_attempts
+         (id, operation, actor, subject_type, subject_id, started_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        operationId,
+        descriptor.name,
+        descriptor.actor ?? null,
+        descriptor.subjectType ?? null,
+        descriptor.subjectId ?? null,
+        now(),
+      );
+    return operationId;
+  }
+
+  private completeOperation(
+    operationId: string,
+    outcome: 'accepted' | 'rejected' | 'failed',
+    reasonCode?: string,
+    errorClass?: string,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE operation_attempts
+         SET outcome = ?, reason_code = ?, error_class = ?, completed_at = ?
+         WHERE id = ?`,
+      )
+      .run(outcome, reasonCode ?? null, errorClass ?? null, now(), operationId);
+  }
+
+  private recordOperationError(operationId: string, error: unknown): void {
+    if (error instanceof CollaborationError || error instanceof GitError) {
+      this.completeOperation(operationId, 'rejected', error.code);
+      return;
+    }
+    const errorClass = error instanceof Error ? error.constructor.name : typeof error;
+    this.completeOperation(operationId, 'failed', undefined, errorClass);
+  }
+
+  private operation<T>(descriptor: OperationDescriptor, execute: (operationId: string) => T): T {
+    const operationId = this.startOperation(descriptor);
+    try {
+      const result = execute(operationId);
+      this.completeOperation(operationId, 'accepted');
+      return result;
+    } catch (error) {
+      this.recordOperationError(operationId, error);
+      throw error;
+    }
+  }
+
+  private transaction<T>(descriptor: OperationDescriptor, execute: (operationId: string) => T): T {
+    return this.operation(descriptor, (operationId) => this.domainTransaction(() => execute(operationId)));
+  }
+
+  private async asyncOperation<T>(
+    descriptor: OperationDescriptor,
+    execute: (operationId: string) => Promise<T>,
+  ): Promise<T> {
+    const operationId = this.startOperation(descriptor);
+    try {
+      const result = await execute(operationId);
+      this.completeOperation(operationId, 'accepted');
+      return result;
+    } catch (error) {
+      this.recordOperationError(operationId, error);
       throw error;
     }
   }
@@ -71,12 +151,21 @@ export class CollaborationService {
     if (state['status'] !== 'active') throw new CollaborationError('project is paused', 'project_paused');
   }
 
-  private event(actor: string, entityType: string, entityId: string, action: string, payload: JsonObject = {}): void {
+  private event(
+    operationId: string,
+    actor: string,
+    entityType: string,
+    entityId: string,
+    action: string,
+    payload: JsonObject = {},
+  ): void {
     this.db
       .prepare(
-        'INSERT INTO events (actor, entity_type, entity_id, action, payload, timestamp) VALUES (?, ?, ?, ?, ?, ?)',
+        `INSERT INTO events
+         (operation_id, actor, entity_type, entity_id, action, payload, timestamp)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(actor, entityType, entityId, action, JSON.stringify(payload), now());
+      .run(operationId, actor, entityType, entityId, action, JSON.stringify(payload), now());
   }
 
   listAgents(): Row[] {
@@ -138,11 +227,19 @@ export class CollaborationService {
       reviews: this.db.prepare('SELECT * FROM reviews ORDER BY created_at').all() as Row[],
       findings: this.db.prepare('SELECT * FROM review_findings ORDER BY created_at').all() as Row[],
       verifications,
+      operations: this.db.prepare('SELECT * FROM operation_attempts ORDER BY started_at, id').all() as Row[],
       events,
     };
   }
 
   sync(agentId: string, afterEvent = 0): JsonObject {
+    return this.transaction(
+      { name: 'sync', actor: agentId, subjectType: 'agent', subjectId: agentId },
+      () => this.syncState(agentId, afterEvent),
+    );
+  }
+
+  private syncState(agentId: string, afterEvent: number): JsonObject {
     this.requireAgent(agentId);
     const timestamp = now();
     this.db.prepare('UPDATE agents SET last_seen_at = ? WHERE id = ?').run(timestamp, agentId);
@@ -213,7 +310,7 @@ export class CollaborationService {
   }
 
   createTask(input: { id: string; goal: string; acceptance: string[]; actor: string }): Row {
-    return this.transaction(() => {
+    return this.transaction({ name: 'task.create', actor: input.actor, subjectType: 'task', subjectId: input.id }, (operationId) => {
       this.requireProjectActive();
       this.requireAgent(input.actor);
       const timestamp = now();
@@ -233,7 +330,7 @@ export class CollaborationService {
           timestamp,
         );
       const task = this.requireTask(input.id);
-      this.event(input.actor, 'task', input.id, 'task_created', {
+      this.event(operationId, input.actor, 'task', input.id, 'task_created', {
         acceptance: input.acceptance,
         repository: this.repository.binding.identity,
         base_commit: task['base_commit'],
@@ -243,7 +340,7 @@ export class CollaborationService {
   }
 
   claimTask(input: { taskId: string; agent: string; expectedVersion: number; ttlSeconds: number }): Row {
-    return this.transaction(() => {
+    return this.transaction({ name: 'task.claim', actor: input.agent, subjectType: 'task', subjectId: input.taskId }, (operationId) => {
       this.requireProjectActive();
       this.requireAgent(input.agent);
       const task = this.requireTask(input.taskId);
@@ -274,13 +371,16 @@ export class CollaborationService {
              lease_version = excluded.lease_version, acquired_at = excluded.acquired_at, expires_at = excluded.expires_at`,
         )
         .run(input.taskId, input.agent, nextVersion, acquiredAt, expiresAt);
-      this.event(input.agent, 'task', input.taskId, 'lease_acquired', { expires_at: expiresAt, version: nextVersion });
+      this.event(operationId, input.agent, 'task', input.taskId, 'lease_acquired', {
+        expires_at: expiresAt,
+        version: nextVersion,
+      });
       return this.requireTask(input.taskId);
     });
   }
 
   submitProposal(input: { taskId: string; agent: string; content: string }): Row {
-    return this.transaction(() => {
+    return this.transaction({ name: 'proposal.submit', actor: input.agent, subjectType: 'task', subjectId: input.taskId }, (operationId) => {
       this.requireProjectActive();
       this.requireTask(input.taskId);
       this.requireAgent(input.agent);
@@ -294,26 +394,26 @@ export class CollaborationService {
       this.db
         .prepare('INSERT INTO proposals (id, task_id, agent_id, content, created_at) VALUES (?, ?, ?, ?, ?)')
         .run(id, input.taskId, input.agent, input.content, now());
-      this.event(input.agent, 'proposal', id, 'proposal_submitted', { task_id: input.taskId });
+      this.event(operationId, input.agent, 'proposal', id, 'proposal_submitted', { task_id: input.taskId });
       return this.db.prepare('SELECT * FROM proposals WHERE id = ?').get(id) as Row;
     });
   }
 
   revealProposals(taskId: string, actor: string): Row[] {
-    return this.transaction(() => {
+    return this.transaction({ name: 'proposal.reveal', actor, subjectType: 'task', subjectId: taskId }, (operationId) => {
       this.requireTask(taskId);
       const revealingActor = this.requireAgent(actor);
       if (revealingActor['kind'] !== 'human') {
         throw new CollaborationError('only a human can reveal proposals', 'human_required');
       }
       this.db.prepare('UPDATE proposals SET visibility = \'revealed\' WHERE task_id = ?').run(taskId);
-      this.event(actor, 'task', taskId, 'proposals_revealed');
+      this.event(operationId, actor, 'task', taskId, 'proposals_revealed');
       return this.db.prepare('SELECT * FROM proposals WHERE task_id = ? ORDER BY created_at').all(taskId) as Row[];
     });
   }
 
   proposeDecision(input: { taskId?: string; actor: string; statement: string; rationale: string }): Row {
-    return this.transaction(() => {
+    return this.transaction({ name: 'decision.propose', actor: input.actor, subjectType: input.taskId ? 'task' : undefined, subjectId: input.taskId }, (operationId) => {
       this.requireAgent(input.actor);
       if (input.taskId) this.requireTask(input.taskId);
       const id = makeId('decision');
@@ -323,13 +423,13 @@ export class CollaborationService {
            VALUES (?, ?, ?, ?, 'proposed', ?, ?)`,
         )
         .run(id, input.taskId ?? null, input.statement, input.rationale, input.actor, now());
-      this.event(input.actor, 'decision', id, 'decision_proposed', { task_id: input.taskId ?? null });
+      this.event(operationId, input.actor, 'decision', id, 'decision_proposed', { task_id: input.taskId ?? null });
       return this.db.prepare('SELECT * FROM decisions WHERE id = ?').get(id) as Row;
     });
   }
 
   acceptDecision(decisionId: string, actorId: string): Row {
-    return this.transaction(() => {
+    return this.transaction({ name: 'decision.accept', actor: actorId, subjectType: 'decision', subjectId: decisionId }, (operationId) => {
       const actor = this.requireAgent(actorId);
       if (actor['kind'] !== 'human') throw new CollaborationError('only a human can accept a decision', 'human_required');
       const decision = this.db.prepare('SELECT * FROM decisions WHERE id = ?').get(decisionId) as Row | undefined;
@@ -338,13 +438,15 @@ export class CollaborationService {
         throw new CollaborationError('decision is not proposed', 'invalid_transition');
       }
       this.db.prepare("UPDATE decisions SET status = 'accepted' WHERE id = ?").run(decisionId);
-      this.event(actorId, 'decision', decisionId, 'decision_accepted', { task_id: decision['task_id'] ?? null });
+      this.event(operationId, actorId, 'decision', decisionId, 'decision_accepted', {
+        task_id: decision['task_id'] ?? null,
+      });
       return this.db.prepare('SELECT * FROM decisions WHERE id = ?').get(decisionId) as Row;
     });
   }
 
   sendMessage(input: { from: string; to: string; taskId?: string; body: string }): Row {
-    return this.transaction(() => {
+    return this.transaction({ name: 'message.send', actor: input.from, subjectType: input.taskId ? 'task' : 'agent', subjectId: input.taskId ?? input.to }, (operationId) => {
       this.requireAgent(input.from);
       this.requireAgent(input.to);
       if (input.taskId) this.requireTask(input.taskId);
@@ -352,13 +454,16 @@ export class CollaborationService {
       this.db
         .prepare('INSERT INTO messages (id, sender, recipient, task_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?)')
         .run(id, input.from, input.to, input.taskId ?? null, input.body, now());
-      this.event(input.from, 'message', id, 'message_sent', { recipient: input.to, task_id: input.taskId ?? null });
+      this.event(operationId, input.from, 'message', id, 'message_sent', {
+        recipient: input.to,
+        task_id: input.taskId ?? null,
+      });
       return this.db.prepare('SELECT * FROM messages WHERE id = ?').get(id) as Row;
     });
   }
 
   addBlocker(input: { taskId: string; agent: string; description: string }): Row {
-    return this.transaction(() => {
+    return this.transaction({ name: 'blocker.add', actor: input.agent, subjectType: 'task', subjectId: input.taskId }, (operationId) => {
       const task = this.requireTask(input.taskId);
       this.requireAgent(input.agent);
       if (!['in_progress', 'blocked'].includes(String(task['status']))) {
@@ -372,13 +477,13 @@ export class CollaborationService {
       this.db
         .prepare('UPDATE tasks SET status = \'blocked\', version = version + 1, updated_at = ? WHERE id = ?')
         .run(timestamp, input.taskId);
-      this.event(input.agent, 'blocker', id, 'blocker_added', { task_id: input.taskId });
+      this.event(operationId, input.agent, 'blocker', id, 'blocker_added', { task_id: input.taskId });
       return this.db.prepare('SELECT * FROM blockers WHERE id = ?').get(id) as Row;
     });
   }
 
   resolveBlocker(blockerId: string, agent: string): Row {
-    return this.transaction(() => {
+    return this.transaction({ name: 'blocker.resolve', actor: agent, subjectType: 'blocker', subjectId: blockerId }, (operationId) => {
       this.requireAgent(agent);
       const blocker = this.db.prepare('SELECT * FROM blockers WHERE id = ?').get(blockerId) as Row | undefined;
       if (!blocker) throw new CollaborationError(`unknown blocker: ${blockerId}`, 'unknown_blocker');
@@ -395,58 +500,66 @@ export class CollaborationService {
           .prepare('UPDATE tasks SET status = \'in_progress\', version = version + 1, updated_at = ? WHERE id = ?')
           .run(timestamp, String(blocker['task_id']));
       }
-      this.event(agent, 'blocker', blockerId, 'blocker_resolved');
+      this.event(operationId, agent, 'blocker', blockerId, 'blocker_resolved');
       return this.db.prepare('SELECT * FROM blockers WHERE id = ?').get(blockerId) as Row;
     });
   }
 
   requestReview(input: { taskId: string; agent: string; commit: string }): Row {
-    const taskAtRequest = this.requireTask(input.taskId);
-    const { candidateCommit: commit } = this.repository.requireDescendant(
-      String(taskAtRequest['base_commit']),
-      input.commit,
+    return this.operation(
+      { name: 'review.request', actor: input.agent, subjectType: 'task', subjectId: input.taskId },
+      (operationId) => {
+        const taskAtRequest = this.requireTask(input.taskId);
+        const { candidateCommit: commit } = this.repository.requireDescendant(
+          String(taskAtRequest['base_commit']),
+          input.commit,
+        );
+        return this.domainTransaction(() => {
+          const task = this.requireTask(input.taskId);
+          this.requireAgent(input.agent);
+          if (task['owner_agent_id'] !== input.agent) {
+            throw new CollaborationError('only the task owner can request review', 'not_task_owner');
+          }
+          if (task['status'] !== 'in_progress') {
+            throw new CollaborationError('review requires an in-progress task', 'invalid_transition');
+          }
+          const timestamp = now();
+          const lease = this.db
+            .prepare('SELECT agent_id, expires_at FROM leases WHERE task_id = ?')
+            .get(input.taskId) as Row | undefined;
+          if (!lease || lease['agent_id'] !== input.agent || String(lease['expires_at']) <= timestamp) {
+            throw new CollaborationError(
+              'review requires the requester to hold the current live lease',
+              'lease_required',
+            );
+          }
+          const id = makeId('review');
+          this.db
+            .prepare(
+              `INSERT INTO reviews
+               (id, task_id, requester, repository_identity, commit_sha, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)`,
+            )
+            .run(id, input.taskId, input.agent, this.repository.binding.identity, commit, timestamp);
+          this.db
+            .prepare(
+              'UPDATE tasks SET status = \'in_review\', candidate_commit = ?, version = version + 1, updated_at = ? WHERE id = ?',
+            )
+            .run(commit, timestamp, input.taskId);
+          this.db.prepare('DELETE FROM leases WHERE task_id = ?').run(input.taskId);
+          this.event(operationId, input.agent, 'review', id, 'review_requested', {
+            task_id: input.taskId,
+            repository: this.repository.binding.identity,
+            commit,
+          });
+          return this.db.prepare('SELECT * FROM reviews WHERE id = ?').get(id) as Row;
+        });
+      },
     );
-    return this.transaction(() => {
-      const task = this.requireTask(input.taskId);
-      this.requireAgent(input.agent);
-      if (task['owner_agent_id'] !== input.agent) {
-        throw new CollaborationError('only the task owner can request review', 'not_task_owner');
-      }
-      if (task['status'] !== 'in_progress') {
-        throw new CollaborationError('review requires an in-progress task', 'invalid_transition');
-      }
-      const timestamp = now();
-      const lease = this.db
-        .prepare('SELECT agent_id, expires_at FROM leases WHERE task_id = ?')
-        .get(input.taskId) as Row | undefined;
-      if (!lease || lease['agent_id'] !== input.agent || String(lease['expires_at']) <= timestamp) {
-        throw new CollaborationError('review requires the requester to hold the current live lease', 'lease_required');
-      }
-      const id = makeId('review');
-      this.db
-        .prepare(
-          `INSERT INTO reviews
-           (id, task_id, requester, repository_identity, commit_sha, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-        )
-        .run(id, input.taskId, input.agent, this.repository.binding.identity, commit, timestamp);
-      this.db
-        .prepare(
-          'UPDATE tasks SET status = \'in_review\', candidate_commit = ?, version = version + 1, updated_at = ? WHERE id = ?',
-        )
-        .run(commit, timestamp, input.taskId);
-      this.db.prepare('DELETE FROM leases WHERE task_id = ?').run(input.taskId);
-      this.event(input.agent, 'review', id, 'review_requested', {
-        task_id: input.taskId,
-        repository: this.repository.binding.identity,
-        commit,
-      });
-      return this.db.prepare('SELECT * FROM reviews WHERE id = ?').get(id) as Row;
-    });
   }
 
   submitReview(input: { reviewId: string; agent: string; verdict: 'approved' | 'needs_revision' }): Row {
-    return this.transaction(() => {
+    return this.transaction({ name: 'review.submit', actor: input.agent, subjectType: 'review', subjectId: input.reviewId }, (operationId) => {
       this.requireAgent(input.agent);
       const review = this.db.prepare('SELECT * FROM reviews WHERE id = ?').get(input.reviewId) as Row | undefined;
       if (!review) throw new CollaborationError(`unknown review: ${input.reviewId}`, 'unknown_review');
@@ -465,7 +578,7 @@ export class CollaborationService {
           )
           .run(timestamp, String(review['task_id']));
       }
-      this.event(input.agent, 'review', input.reviewId, `review_${input.verdict}`, {
+      this.event(operationId, input.agent, 'review', input.reviewId, `review_${input.verdict}`, {
         task_id: review['task_id'],
         commit: review['commit_sha'],
       });
@@ -480,7 +593,7 @@ export class CollaborationService {
     description: string;
     location?: string;
   }): Row {
-    return this.transaction(() => {
+    return this.transaction({ name: 'finding.add', actor: input.agent, subjectType: 'review', subjectId: input.reviewId }, (operationId) => {
       this.requireAgent(input.agent);
       const review = this.db.prepare('SELECT * FROM reviews WHERE id = ?').get(input.reviewId) as Row | undefined;
       if (!review) throw new CollaborationError(`unknown review: ${input.reviewId}`, 'unknown_review');
@@ -494,7 +607,7 @@ export class CollaborationService {
            VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(id, input.reviewId, input.agent, input.severity, input.location ?? null, input.description, now());
-      this.event(input.agent, 'review_finding', id, 'review_finding_added', {
+      this.event(operationId, input.agent, 'review_finding', id, 'review_finding_added', {
         review_id: input.reviewId,
         severity: input.severity,
       });
@@ -503,7 +616,7 @@ export class CollaborationService {
   }
 
   resolveReviewFinding(findingId: string, agent: string): Row {
-    return this.transaction(() => {
+    return this.transaction({ name: 'finding.resolve', actor: agent, subjectType: 'finding', subjectId: findingId }, (operationId) => {
       const resolvingAgent = this.requireAgent(agent);
       const finding = this.db.prepare('SELECT * FROM review_findings WHERE id = ?').get(findingId) as Row | undefined;
       if (!finding) throw new CollaborationError(`unknown review finding: ${findingId}`, 'unknown_finding');
@@ -515,83 +628,109 @@ export class CollaborationService {
         );
       }
       this.db.prepare("UPDATE review_findings SET status = 'resolved' WHERE id = ?").run(findingId);
-      this.event(agent, 'review_finding', findingId, 'review_finding_resolved');
+      this.event(operationId, agent, 'review_finding', findingId, 'review_finding_resolved');
       return this.db.prepare('SELECT * FROM review_findings WHERE id = ?').get(findingId) as Row;
     });
   }
 
   async runVerification(input: { taskId: string; agent: string; commit: string; command: string[] }): Promise<Row> {
-    this.requireTask(input.taskId);
-    this.requireAgent(input.agent);
-    const execution = await this.repository.runAtCommit(input.commit, input.command);
-    const commandArgvJson = JSON.stringify(execution.commandArgv);
-    return this.transaction(() => {
-      this.requireTask(input.taskId);
-      this.requireAgent(input.agent);
-      const id = makeId('verify');
-      this.db
-        .prepare(
-          `INSERT INTO verifications
-           (id, task_id, repository_identity, commit_sha, command, command_argv_json, exit_code, runner, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          id,
-          input.taskId,
-          this.repository.binding.identity,
-          execution.commit,
-          commandArgvJson,
-          commandArgvJson,
-          execution.exitCode,
-          input.agent,
-          now(),
-        );
-      this.event(input.agent, 'verification', id, execution.exitCode === 0 ? 'verification_passed' : 'verification_failed', {
-        task_id: input.taskId,
-        repository: this.repository.binding.identity,
-        commit: execution.commit,
-        command_argv: execution.commandArgv,
-        exit_code: execution.exitCode,
-      });
-      return this.db.prepare('SELECT * FROM verifications WHERE id = ?').get(id) as Row;
-    });
+    return this.asyncOperation(
+      { name: 'verification.run', actor: input.agent, subjectType: 'task', subjectId: input.taskId },
+      async (operationId) => {
+        this.requireTask(input.taskId);
+        this.requireAgent(input.agent);
+        const execution = await this.repository.runAtCommit(input.commit, input.command);
+        const commandArgvJson = JSON.stringify(execution.commandArgv);
+        return this.domainTransaction(() => {
+          this.requireTask(input.taskId);
+          this.requireAgent(input.agent);
+          const id = makeId('verify');
+          this.db
+            .prepare(
+              `INSERT INTO verifications
+               (id, task_id, repository_identity, commit_sha, command, command_argv_json, exit_code, runner, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              id,
+              input.taskId,
+              this.repository.binding.identity,
+              execution.commit,
+              commandArgvJson,
+              commandArgvJson,
+              execution.exitCode,
+              input.agent,
+              now(),
+            );
+          this.event(
+            operationId,
+            input.agent,
+            'verification',
+            id,
+            execution.exitCode === 0 ? 'verification_passed' : 'verification_failed',
+            {
+              task_id: input.taskId,
+              repository: this.repository.binding.identity,
+              commit: execution.commit,
+              command_argv: execution.commandArgv,
+              exit_code: execution.exitCode,
+            },
+          );
+          return this.db.prepare('SELECT * FROM verifications WHERE id = ?').get(id) as Row;
+        });
+      },
+    );
   }
 
   bootstrapWorktrees(input: { rootPath: string; baseCommit: string }): Row[] {
-    const worktrees = this.repository.bootstrapWorktrees(input.rootPath, input.baseCommit, ['grok', 'claude', 'codex']);
-    return this.transaction(() => {
-      const timestamp = now();
-      const upsert = this.db.prepare(
-        `INSERT INTO managed_worktrees
-         (agent_id, repository_identity, branch_name, worktree_path, head_commit, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(agent_id) DO UPDATE SET repository_identity = excluded.repository_identity,
-           branch_name = excluded.branch_name, worktree_path = excluded.worktree_path,
-           head_commit = excluded.head_commit, updated_at = excluded.updated_at`,
-      );
-      for (const worktree of worktrees) {
-        upsert.run(
-          worktree.agentId,
-          this.repository.binding.identity,
-          worktree.branch,
-          worktree.path,
-          worktree.headCommit,
-          timestamp,
-          timestamp,
-        );
-        this.event('human', 'worktree', worktree.agentId, 'worktree_managed', {
-          repository: this.repository.binding.identity,
-          branch: worktree.branch,
-          path: worktree.path,
-          head_commit: worktree.headCommit,
+    return this.operation(
+      {
+        name: 'worktree.bootstrap',
+        actor: 'human',
+        subjectType: 'repository',
+        subjectId: this.repository.binding.identity,
+      },
+      (operationId) => {
+        const worktrees = this.repository.bootstrapWorktrees(input.rootPath, input.baseCommit, [
+          'grok',
+          'claude',
+          'codex',
+        ]);
+        return this.domainTransaction(() => {
+          const timestamp = now();
+          const upsert = this.db.prepare(
+            `INSERT INTO managed_worktrees
+             (agent_id, repository_identity, branch_name, worktree_path, head_commit, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(agent_id) DO UPDATE SET repository_identity = excluded.repository_identity,
+               branch_name = excluded.branch_name, worktree_path = excluded.worktree_path,
+               head_commit = excluded.head_commit, updated_at = excluded.updated_at`,
+          );
+          for (const worktree of worktrees) {
+            upsert.run(
+              worktree.agentId,
+              this.repository.binding.identity,
+              worktree.branch,
+              worktree.path,
+              worktree.headCommit,
+              timestamp,
+              timestamp,
+            );
+            this.event(operationId, 'human', 'worktree', worktree.agentId, 'worktree_managed', {
+              repository: this.repository.binding.identity,
+              branch: worktree.branch,
+              path: worktree.path,
+              head_commit: worktree.headCommit,
+            });
+          }
+          return this.db.prepare('SELECT * FROM managed_worktrees ORDER BY agent_id').all() as Row[];
         });
-      }
-      return this.db.prepare('SELECT * FROM managed_worktrees ORDER BY agent_id').all() as Row[];
-    });
+      },
+    );
   }
 
   acceptTask(input: { taskId: string; actor: string; expectedVersion: number }): Row {
-    return this.transaction(() => {
+    return this.transaction({ name: 'task.accept', actor: input.actor, subjectType: 'task', subjectId: input.taskId }, (operationId) => {
       this.requireProjectActive();
       const actor = this.requireAgent(input.actor);
       if (actor['kind'] !== 'human') throw new CollaborationError('only a human can accept a task', 'human_required');
@@ -641,7 +780,9 @@ export class CollaborationService {
       this.db
         .prepare('UPDATE tasks SET status = \'accepted\', version = version + 1, updated_at = ? WHERE id = ?')
         .run(timestamp, input.taskId);
-      this.event(input.actor, 'task', input.taskId, 'task_accepted', { commit: task['candidate_commit'] });
+      this.event(operationId, input.actor, 'task', input.taskId, 'task_accepted', {
+        commit: task['candidate_commit'],
+      });
       return this.requireTask(input.taskId);
     });
   }

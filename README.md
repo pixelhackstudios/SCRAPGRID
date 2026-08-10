@@ -17,7 +17,10 @@ tests provide executable evidence. No model has supervisory authority over anoth
 The repository contains the CLI-first collaboration core plus its first Git-truth slice:
 
 - a SQLite schema for agents, tasks, leases, proposals, decisions, messages, blockers, reviews, findings,
-  verifications, and append-only events;
+  verifications, operation attempts, and append-only events;
+- a transport-neutral operation boundary that records accepted, rejected, and failed coordination operations
+  outside rolled-back domain transactions, while unfinished rows preserve crash or abandonment evidence;
+- causal `operation_id` linkage from successful operations to the domain events they produced;
 - transactional domain rules with optimistic task versions and exclusive leases;
 - one sealed proposal per agent/task, revealed only by the human;
 - actionable synchronization state for restarted agents, including accepted decisions, revealed proposals,
