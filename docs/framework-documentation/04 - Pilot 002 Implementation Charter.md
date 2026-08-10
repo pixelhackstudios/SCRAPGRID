@@ -15,9 +15,9 @@ while the collaboration service remains the authoritative truth and coordination
 1. **Operation ledger + causal `operation_id`**
    - **COMPLETE** — `302c4be98669b3ee40d490c394b15c3a32c88f6b`
 2. **Revision claim reservation**
-   - **NEXT**
+   - **COMPLETE** — `9dbe385cd897eb95520984ea61be2579a2feadbb`
 3. **Independent verification**
-   - **PENDING**
+   - **NEXT**
 4. **Base-pinned required-check policy + explicit human override**
    - **PENDING**
 5. **Temporary task roles**
