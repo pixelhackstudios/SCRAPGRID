@@ -367,23 +367,38 @@ export class CollaborationService {
   }
 
   /**
-   * The lease that is live at `at`, if any.
+   * The lease row and whether it is live at `at` — the single place that comparison is made.
    *
    * Expiry is a timestamp comparison with no backing mutation, so a caller that reads the clock
-   * twice can see the same lease from both sides. Every caller passes the one instant it decided
-   * to evaluate against, and this predicate never reads the clock itself.
+   * twice can see the same lease from both sides. Every caller passes the one instant it decided to
+   * evaluate against, and this predicate never reads the clock itself.
+   *
+   * The row is returned alongside the verdict because the two readers need different things from
+   * it: authority wants the live lease and nothing else, while dispatch records the expired row in
+   * `basis_json` so a later reader can see which side of the boundary the derivation was on. Both
+   * still consume one evaluation, so changing the rule cannot leave dispatch behind.
    */
-  private liveLease(taskId: string, at: string): Row | undefined {
-    const lease = this.db.prepare('SELECT * FROM leases WHERE task_id = ?').get(taskId) as Row | undefined;
-    return lease && String(lease['expires_at']) > at ? lease : undefined;
+  private leaseFact(taskId: string, at: string): { row: Row | undefined; live: boolean } {
+    const row = this.db.prepare('SELECT * FROM leases WHERE task_id = ?').get(taskId) as Row | undefined;
+    return { row, live: row !== undefined && String(row['expires_at']) > at };
   }
 
-  /** The claim reservation that is active at `at`, if any. Same one-instant rule as `liveLease`. */
-  private activeClaimReservation(taskId: string, at: string): Row | undefined {
-    const reservation = this.db
+  /** The claim reservation row and whether it is active at `at`. Same one-instant rule as leases. */
+  private reservationFact(taskId: string, at: string): { row: Row | undefined; active: boolean } {
+    const row = this.db
       .prepare('SELECT * FROM claim_reservations WHERE task_id = ?')
       .get(taskId) as Row | undefined;
-    return reservation && String(reservation['expires_at']) > at ? reservation : undefined;
+    return { row, active: row !== undefined && String(row['expires_at']) > at };
+  }
+
+  private liveLease(taskId: string, at: string): Row | undefined {
+    const fact = this.leaseFact(taskId, at);
+    return fact.live ? fact.row : undefined;
+  }
+
+  private activeClaimReservation(taskId: string, at: string): Row | undefined {
+    const fact = this.reservationFact(taskId, at);
+    return fact.active ? fact.row : undefined;
   }
 
   /**
@@ -1065,6 +1080,7 @@ export class CollaborationService {
         dispatchId: input.dispatchId,
         agentId: input.agent,
         taskId: input.taskId,
+        taskVersion: Number(task['version']),
         terminalOperation: 'task.claim',
       });
       this.event(operationId, input.agent, 'task', input.taskId, 'lease_acquired', {
@@ -1258,6 +1274,7 @@ export class CollaborationService {
           dispatchId: input.dispatchId,
           agentId: input.agent,
           taskId: input.taskId,
+          taskVersion: Number(task['version']),
           terminalOperation: 'review.request',
         });
         this.event(operationId, input.agent, 'review', id, 'review_requested', {
@@ -1286,6 +1303,9 @@ export class CollaborationService {
         throw new CollaborationError('requester cannot review their own commit', 'self_review');
       }
       if (review['verdict'] !== 'pending') throw new CollaborationError('review already submitted', 'invalid_transition');
+      // Captured before the `needs_revision` branch bumps it, so the generation compared against is
+      // the one this review was dispatched for rather than the one this call produces.
+      const reviewedVersion = Number(this.requireTask(String(review['task_id']))['version']);
       const timestamp = now();
       this.db
         .prepare('UPDATE reviews SET reviewer = ?, verdict = ?, submitted_at = ? WHERE id = ?')
@@ -1314,6 +1334,7 @@ export class CollaborationService {
         dispatchId: input.dispatchId,
         agentId: input.agent,
         taskId: String(review['task_id']),
+        taskVersion: reviewedVersion,
         terminalOperation: 'review.submit',
       });
       this.event(operationId, input.agent, 'review', input.reviewId, `review_${input.verdict}`, {
@@ -1429,6 +1450,7 @@ export class CollaborationService {
           dispatchId: input.dispatchId,
           agentId: input.agent,
           taskId: input.taskId,
+          taskVersion: Number(task['version']),
           terminalOperation: 'verification.run',
         });
         this.event(
@@ -1592,10 +1614,11 @@ export class CollaborationService {
       .all(taskId) as Array<{ role: TaskRole; agent_id: string }>;
     const roles: Partial<Record<DispatchRole, string>> = {};
     for (const row of roleRows) roles[row.role] = row.agent_id;
-    const leaseRow = this.db.prepare('SELECT * FROM leases WHERE task_id = ?').get(taskId) as Row | undefined;
-    const reservationRow = this.db
-      .prepare('SELECT * FROM claim_reservations WHERE task_id = ?')
-      .get(taskId) as Row | undefined;
+    // The same evaluated predicates `claimTask()` and `requestReview()` consume, not a second copy
+    // of the expiry comparison: the point of the extraction is that changing the rule there cannot
+    // silently leave dispatcher authority behind.
+    const lease = this.leaseFact(taskId, atIso);
+    const reservation = this.reservationFact(taskId, atIso);
     const projectState = this.db
       .prepare('SELECT status FROM project_state WHERE singleton = 1')
       .get() as Row | undefined;
@@ -1627,18 +1650,18 @@ export class CollaborationService {
       roles,
       project_status: String(projectState?.['status'] ?? 'active'),
       agent_status: agentStatus,
-      lease: leaseRow
+      lease: lease.row
         ? {
-            agent_id: String(leaseRow['agent_id']),
-            expires_at: String(leaseRow['expires_at']),
-            live: String(leaseRow['expires_at']) > atIso,
+            agent_id: String(lease.row['agent_id']),
+            expires_at: String(lease.row['expires_at']),
+            live: lease.live,
           }
         : null,
-      reservation: reservationRow
+      reservation: reservation.row
         ? {
-            agent_id: String(reservationRow['agent_id']),
-            expires_at: String(reservationRow['expires_at']),
-            active: String(reservationRow['expires_at']) > atIso,
+            agent_id: String(reservation.row['agent_id']),
+            expires_at: String(reservation.row['expires_at']),
+            active: reservation.active,
           }
         : null,
       open_blocker_ids: openBlockers.map((row) => String(row['id'])),
@@ -1876,14 +1899,28 @@ export class CollaborationService {
    *
    * Session is deliberately not matched. Recovery can replace a session while the durable agent's
    * work continues, and matching it would break the edge across exactly those events.
+   *
+   * The workflow generation *is* matched. Agent, task, and operation are all stable across a
+   * review-to-revision-to-re-claim cycle, so those three alone let a dispatch issued in an earlier
+   * cycle attach to a later operation — claiming the work happened because of a dispatch whose
+   * recorded basis describes a task version that has since moved on. `task_version` is the
+   * generation marker the basis already carries, and it is what the terminal operation was derived
+   * against, so a legitimate echo matches it and a stale one cannot.
    */
   private attachDispatch(
     operationId: string,
-    params: { dispatchId?: string; agentId: string; taskId: string; terminalOperation: TerminalOperation },
+    params: {
+      dispatchId?: string;
+      agentId: string;
+      taskId: string;
+      /** The task version this operation observed, before the operation mutated it. */
+      taskVersion: number;
+      terminalOperation: TerminalOperation;
+    },
   ): void {
     if (!params.dispatchId) return;
     const dispatch = this.db
-      .prepare('SELECT agent_id, task_id, terminal_operation FROM dispatches WHERE id = ?')
+      .prepare('SELECT agent_id, task_id, terminal_operation, basis_json FROM dispatches WHERE id = ?')
       .get(params.dispatchId) as Row | undefined;
     if (
       !dispatch ||
@@ -1893,6 +1930,9 @@ export class CollaborationService {
     ) {
       return;
     }
+    const basis = parseJsonOrNull(dispatch['basis_json']);
+    if (!basis || typeof basis !== 'object' || Array.isArray(basis)) return;
+    if ((basis as Row)['task_version'] !== params.taskVersion) return;
     this.db
       .prepare('UPDATE operation_attempts SET dispatch_id = ? WHERE id = ?')
       .run(params.dispatchId, operationId);

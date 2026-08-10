@@ -9,6 +9,14 @@ contract, and the durable dispatch record. Document 04 governs scope; where this
 
 Baseline scanned: `9587195`, schema version 8.
 
+**Revision 6 (review findings, proven by reproduction).** `dispatch_id` attachment also matches the workflow
+generation (§5.4). Agent, task, and terminal operation are all stable across a review-to-revision-to-re-claim
+cycle, so revision 4's three-way match let a dispatch issued in an earlier cycle attach to a later operation —
+reproduced against `e0dd0d9`, where a re-claim at task version 4 recorded a dispatch whose `basis_json` reads
+`task_version: 1`. Session remains deliberately unmatched. Separately, `awaiting_unblock` is removed from the
+§4 reason vocabulary: §3's shorthand rule resolves rows 5 and 5a to `awaiting_actor`, which is what row 8
+already spells out for the identical null-address case, so the reason had no emitter.
+
 **Revision 5 (narrow correction, proven by implementation).** The defensive claim guards move *inside* the
 claim branch and are evaluated in the order `claimTask()` actually rejects (§3, §3.11). They were previously
 listed as a global precedence step ahead of rows 2–9a, which contradicted §6.1's requirement that a dispatch
@@ -398,7 +406,7 @@ DispatchResult = one of
   { kind: 'waiting',       task_id, actor: agent_id|'human'|null, action_kind, reason }
       a required action exists on this task but is not this agent's to perform
       actor is null when canonical state cannot uniquely address it (rows 5, 8)
-      reason ∈ awaiting_roles | awaiting_actor | awaiting_unblock
+      reason ∈ awaiting_roles | awaiting_actor
              | awaiting_human_acceptance | awaiting_project_resume   (rows 9 / 9a)
 
   { kind: 'blocked',       task_id, action_kind, reason, refs }
@@ -597,8 +605,27 @@ dispatch_id supplied
         agent_id            (the authenticated principal)
         task_id             (the operation's RESOLVED task — see below)
         terminal_operation  (the operation being invoked)
+        task_version        (the generation the dispatch was derived against — see below)
    → otherwise record NULL, and do not reject the operation
 ```
+
+**The generation must be matched, or the edge is forgeable by accident.** Revision 4 named the first three
+clauses only, and all three are stable across a revision cycle: the same implementer re-claims the same task
+through the same operation. A dispatch issued before `needs_revision` therefore satisfied every clause when
+echoed against the re-claim that followed — recording that the later work happened because of a dispatch whose
+stored basis describes a task version that has since moved on. That is precisely the retry case §5.4 exists to
+disambiguate, so the weakness sat in the clause meant to close it.
+
+`task_version` is the generation marker `basis_json` already carries, and it is what the terminal operation was
+derived against, so the comparison needs no new column. The operation supplies the version it *observed*, before
+its own mutation: `task.claim` compares the version it verified as `expectedVersion`, `review.request` the
+version it read before bumping, `review.submit` the version captured before the `needs_revision` branch moves
+it, and `verification.run` the version it read (which it never mutates — so one `verify` dispatch legitimately
+attaches to each check it carries).
+
+Session stays out of the match for the reason revision 3 gave. Generation is a different question from identity:
+recovery replaces a session while the workflow stands still, whereas a revision cycle moves the workflow while
+the session stands still.
 
 **The task is the operation's resolved task, not its ledger subject.** Three of the four terminal operations
 record `subjectType: 'task'`, but `review.submit` records `subjectType: 'review'` with the review id

@@ -2908,3 +2908,72 @@ test('derivation may be inspected by control for any agent, but by a session onl
     'a session deriving for another agent would silently weaken the identity binding step 7 established',
   );
 });
+
+test('a dispatch from an earlier cycle cannot claim credit for a later operation', async () => {
+  const { service, db, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-STALE', goal: 'Round-trip a revision cycle', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-STALE');
+    const codexSession = { sessionId: String(service.openSession('codex').session['id']), agentId: 'codex' };
+
+    const first = service.issueDispatch({
+      agent: 'codex',
+      taskId: 'TASK-STALE',
+      session: codexSession,
+      workInFlight: false,
+    }).dispatch;
+    assert.equal(first?.['action_kind'], 'claim');
+    const staleId = String(first?.['id']);
+
+    service.claimTask({ taskId: 'TASK-STALE', agent: 'codex', expectedVersion: 1, ttlSeconds: 900, dispatchId: staleId });
+    const candidate = repository.headCommit();
+    const review = service.requestReview({ taskId: 'TASK-STALE', agent: 'codex', commit: candidate });
+    service.submitReview({ reviewId: String(review['id']), agent: 'claude', verdict: 'needs_revision' });
+
+    // The review-to-revision-to-re-review cycle is a Pilot 002 hard path, and it returns the task to
+    // a claimable state at a later version under a fresh reservation for the same implementer.
+    assert.equal(taskVersion(db, 'TASK-STALE'), 4);
+    const reclaim = expectKind(derive(service, 'codex', 'TASK-STALE'), 'action');
+    assert.equal(reclaim.action.kind, 'claim');
+    assert.equal(reclaim.action.task_version, 4);
+
+    // Agent, task, and terminal operation are all identical across the two cycles, so those three
+    // alone would let the first cycle's dispatch attach here.
+    service.claimTask({ taskId: 'TASK-STALE', agent: 'codex', expectedVersion: 4, ttlSeconds: 900, dispatchId: staleId });
+    const claims = db
+      .prepare("SELECT * FROM operation_attempts WHERE operation = 'task.claim' AND subject_id = ? ORDER BY started_at, id")
+      .all('TASK-STALE') as Array<Record<string, unknown>>;
+    assert.equal(claims.length, 2);
+    assert.equal(claims[0]?.['dispatch_id'], staleId, 'the first claim was genuinely caused by this dispatch');
+    assert.equal(
+      claims[1]?.['dispatch_id'],
+      null,
+      'a dispatch whose basis describes version 1 must not be recorded as the cause of a version 4 claim',
+    );
+    // Advisory in both directions: the stale echo cost provenance, never the work.
+    assert.equal(claims[1]?.['outcome'], 'accepted');
+    assert.equal(taskVersion(db, 'TASK-STALE'), 5);
+
+    // The dispatch actually issued for this generation attaches, so the check discriminates rather
+    // than simply refusing every second echo.
+    const current = service.issueDispatch({
+      agent: 'codex',
+      taskId: 'TASK-STALE',
+      session: codexSession,
+      workInFlight: false,
+    }).dispatch;
+    assert.equal(current?.['action_kind'], 'implement');
+    service.requestReview({
+      taskId: 'TASK-STALE',
+      agent: 'codex',
+      commit: candidate,
+      dispatchId: String(current?.['id']),
+    });
+    const requested = db
+      .prepare("SELECT * FROM operation_attempts WHERE operation = 'review.request' AND subject_id = ? ORDER BY started_at DESC LIMIT 1")
+      .get('TASK-STALE') as Record<string, unknown>;
+    assert.equal(requested['dispatch_id'], String(current?.['id']));
+  } finally {
+    close();
+  }
+});

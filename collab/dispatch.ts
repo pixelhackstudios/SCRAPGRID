@@ -50,7 +50,6 @@ export const TERMINAL_OPERATIONS: Record<DispatchActionKind, TerminalOperation> 
 export type WaitingReason =
   | 'awaiting_roles'
   | 'awaiting_actor'
-  | 'awaiting_unblock'
   | 'awaiting_human_acceptance'
   | 'awaiting_project_resume';
 
