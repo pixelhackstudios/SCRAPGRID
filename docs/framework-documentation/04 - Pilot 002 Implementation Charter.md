@@ -23,9 +23,10 @@ while the collaboration service remains the authoritative truth and coordination
 5. **Temporary task roles**
    - **COMPLETE** — `7636555a000f3fba3d75491605fb9a97e8b214e4`
 6. **`collabd`**
-   - **NEXT**
+   - **COMPLETE** — `2a9480cbe3adeea59cde6a7f533874e67d3217b6` (implementation),
+     `4ec211777e0234acfcfa0fa397c1a0ca4dc37cd1` (ownership lifecycle)
 7. **Sessions / heartbeat / recovery**
-   - **PENDING**
+   - **NEXT**
 8. **Deterministic dispatcher**
    - **PENDING**
 9. **Deterministic context bundles + bundle identity**
@@ -42,6 +43,17 @@ step.
 New ideas go into the parking lot unless they are required to complete one of the ten prerequisites or prevent
 Pilot 002 from producing misleading results. Do not expand a prerequisite into a generalized platform before the
 pilot demonstrates that need.
+
+## Parking lot
+
+Deferred until real evidence demands them.
+
+- **Monotonic operation outcomes.** `completeOperation()` overwrites a terminal outcome rather than requiring
+  `outcome IS NULL`. Raised during step 6 review, when a daemon-ownership overlap could have let one process
+  classify an attempt as abandoned while another completed it. That path was removed and regression-tested in
+  `4ec211777e0234acfcfa0fa397c1a0ca4dc37cd1`, so the remaining value is defense in depth — and the guard opens a
+  second question it does not answer: what a caller should do when zero rows change. Revisit only if Pilot 002 or
+  another concrete failure shows the extra defense is needed.
 
 ## Pre-registered Pilot 002 criteria
 
