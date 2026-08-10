@@ -54,7 +54,7 @@ function harness(): {
   };
 }
 
-test('schema version 1 upgrades operation linkage, finding authorship, repository binding, and proposal metadata', () => {
+test('schema version 1 upgrades reservations, operation linkage, finding authorship, repository binding, and proposal metadata', () => {
   const fixture = createRepository();
   const db = openDatabase(':memory:');
   try {
@@ -97,14 +97,18 @@ test('schema version 1 upgrades operation linkage, finding authorship, repositor
     const operationsTable = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'operation_attempts'")
       .get() as { name: string } | undefined;
+    const reservationsTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'claim_reservations'")
+      .get() as { name: string } | undefined;
     const uniqueIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'proposals_task_agent_unique'")
       .get() as { name: string } | undefined;
-    assert.equal(version.user_version, 4);
+    assert.equal(version.user_version, 5);
     assert.ok(columns.some((column) => column.name === 'raised_by'));
     assert.ok(verificationColumns.some((column) => column.name === 'command_argv_json'));
     assert.ok(eventColumns.some((column) => column.name === 'operation_id'));
     assert.equal(operationsTable?.name, 'operation_attempts');
+    assert.equal(reservationsTable?.name, 'claim_reservations');
     assert.equal(uniqueIndex?.name, 'proposals_task_agent_unique');
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
   } finally {
@@ -410,6 +414,107 @@ test('review request requires the requester to still hold an unexpired lease', (
       () => service.requestReview({ taskId: 'TASK-LEASE', agent: 'codex', commit: repository.headCommit() }),
       (error: unknown) => error instanceof CollaborationError && error.code === 'lease_required',
     );
+  } finally {
+    close();
+  }
+});
+
+test('needs_revision reserves the next claim for the original implementer without granting a lease', () => {
+  const { service, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-REVISION', goal: 'Preserve revision continuity', acceptance: [], actor: 'human' });
+    service.claimTask({ taskId: 'TASK-REVISION', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+    const review = service.requestReview({
+      taskId: 'TASK-REVISION',
+      agent: 'codex',
+      commit: repository.headCommit(),
+    });
+    service.submitReview({ reviewId: String(review['id']), agent: 'claude', verdict: 'needs_revision' });
+
+    const revisionState = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    const task = revisionState['tasks']?.find((item) => item['id'] === 'TASK-REVISION');
+    const reservation = revisionState['claim_reservations']?.find((item) => item['task_id'] === 'TASK-REVISION');
+    const revisionEvent = revisionState['events']?.find(
+      (item) => item['entity_id'] === review['id'] && item['action'] === 'review_needs_revision',
+    );
+    const revisionPayload = revisionEvent?.['payload'] as Record<string, unknown> | undefined;
+
+    assert.equal(task?.['status'], 'in_progress');
+    assert.equal(task?.['owner_agent_id'], 'codex');
+    assert.equal(task?.['candidate_commit'], null);
+    assert.equal(revisionState['leases']?.length, 0);
+    assert.equal(reservation?.['agent_id'], 'codex');
+    assert.equal(reservation?.['reason'], 'revision');
+    assert.ok(String(reservation?.['expires_at']) > String(reservation?.['created_at']));
+    assert.equal(revisionPayload?.['claim_reserved_for'], 'codex');
+    assert.equal(revisionPayload?.['claim_reserved_until'], reservation?.['expires_at']);
+
+    assert.throws(
+      () => service.claimTask({ taskId: 'TASK-REVISION', agent: 'grok', expectedVersion: 4, ttlSeconds: 900 }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'reservation_conflict',
+    );
+    const rejectedState = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    assert.ok(
+      rejectedState['operations']?.some(
+        (operation) =>
+          operation['operation'] === 'task.claim' &&
+          operation['actor'] === 'grok' &&
+          operation['reason_code'] === 'reservation_conflict',
+      ),
+    );
+
+    const claimStartedAt = new Date().toISOString();
+    const revised = service.claimTask({
+      taskId: 'TASK-REVISION',
+      agent: 'codex',
+      expectedVersion: 4,
+      ttlSeconds: 900,
+    });
+    const claimedState = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    const lease = claimedState['leases']?.find((item) => item['task_id'] === 'TASK-REVISION');
+    const leaseEvent = claimedState['events']
+      ?.filter((item) => item['entity_id'] === 'TASK-REVISION' && item['action'] === 'lease_acquired')
+      .at(-1);
+    const leasePayload = leaseEvent?.['payload'] as Record<string, unknown> | undefined;
+
+    assert.equal(revised['owner_agent_id'], 'codex');
+    assert.equal(revised['version'], 5);
+    assert.ok(String(lease?.['acquired_at']) >= claimStartedAt);
+    assert.equal(lease?.['agent_id'], 'codex');
+    assert.equal(leasePayload?.['reservation_consumed'], true);
+    assert.equal(claimedState['claim_reservations']?.length, 0);
+  } finally {
+    close();
+  }
+});
+
+test('expired revision reservations restore ordinary claim rules and are consumed by the next claim', () => {
+  const { service, db, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-EXPIRED-REVISION', goal: 'Release expired priority', acceptance: [], actor: 'human' });
+    service.claimTask({ taskId: 'TASK-EXPIRED-REVISION', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+    const review = service.requestReview({
+      taskId: 'TASK-EXPIRED-REVISION',
+      agent: 'codex',
+      commit: repository.headCommit(),
+    });
+    service.submitReview({ reviewId: String(review['id']), agent: 'claude', verdict: 'needs_revision' });
+    db.prepare("UPDATE claim_reservations SET expires_at = '1970-01-01T00:00:00.000Z' WHERE task_id = ?").run(
+      'TASK-EXPIRED-REVISION',
+    );
+
+    const claimed = service.claimTask({
+      taskId: 'TASK-EXPIRED-REVISION',
+      agent: 'grok',
+      expectedVersion: 4,
+      ttlSeconds: 900,
+    });
+    const snapshot = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    const lease = snapshot['leases']?.find((item) => item['task_id'] === 'TASK-EXPIRED-REVISION');
+
+    assert.equal(claimed['owner_agent_id'], 'grok');
+    assert.equal(lease?.['agent_id'], 'grok');
+    assert.equal(snapshot['claim_reservations']?.length, 0);
   } finally {
     close();
   }

@@ -16,12 +16,14 @@ tests provide executable evidence. No model has supervisory authority over anoth
 
 The repository contains the CLI-first collaboration core plus its first Git-truth slice:
 
-- a SQLite schema for agents, tasks, leases, proposals, decisions, messages, blockers, reviews, findings,
-  verifications, operation attempts, and append-only events;
+- a SQLite schema for agents, tasks, leases, revision claim reservations, proposals, decisions, messages,
+  blockers, reviews, findings, verifications, operation attempts, and append-only events;
 - a transport-neutral operation boundary that records accepted, rejected, and failed coordination operations
   outside rolled-back domain transactions, while unfinished rows preserve crash or abandonment evidence;
 - causal `operation_id` linkage from successful operations to the domain events they produced;
 - transactional domain rules with optimistic task versions and exclusive leases;
+- revision continuity through one-hour claim reservations that retain the original implementer's claim priority
+  without granting an execution lease;
 - one sealed proposal per agent/task, revealed only by the human;
 - actionable synchronization state for restarted agents, including accepted decisions, revealed proposals,
   open blockers, pending reviews, and open findings;
@@ -45,8 +47,8 @@ The repository contains the CLI-first collaboration core plus its first Git-trut
 This slice does **not** yet enforce required-check policy, couple leases to mutable worktree ownership, recover
 stale post-review edits, run a daemon, expose MCP, schedule agents, provide general-purpose human chat input, or
 implement MMORPG systems. See
-[`docs/framework-documentation/02 - Collaboration Harness Implementation Plan.md`](docs/framework-documentation/02%20-%20Collaboration%20Harness%20Implementation%20Plan.md)
-for the ordered boundary.
+[`docs/framework-documentation/04 - Pilot 002 Implementation Charter.md`](docs/framework-documentation/04%20-%20Pilot%20002%20Implementation%20Charter.md)
+for the authoritative Pilot 002 prerequisite sequence.
 
 The research starting point is
 [`docs/framework-documentation/01-AI-Colloboration-Report.md`](docs/framework-documentation/01-AI-Colloboration-Report.md). It informs the

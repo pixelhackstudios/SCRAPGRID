@@ -21,6 +21,8 @@ type OperationDescriptor = {
   subjectId?: string;
 };
 
+const REVISION_RESERVATION_TTL_MS = 60 * 60 * 1000;
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -205,8 +207,22 @@ export class CollaborationService {
     const activeLeases = this.db
       .prepare('SELECT task_id, agent_id, lease_version, expires_at FROM leases WHERE expires_at > ? ORDER BY task_id')
       .all(now()) as Row[];
+    const activeClaimReservations = this.db
+      .prepare(
+        `SELECT task_id, agent_id, reason, created_at, expires_at
+         FROM claim_reservations WHERE expires_at > ? ORDER BY task_id`,
+      )
+      .all(now()) as Row[];
     const worktrees = this.db.prepare('SELECT * FROM managed_worktrees ORDER BY agent_id').all() as Row[];
-    return { project, repository, agents: this.listAgents(), tasks, active_leases: activeLeases, worktrees };
+    return {
+      project,
+      repository,
+      agents: this.listAgents(),
+      tasks,
+      active_leases: activeLeases,
+      active_claim_reservations: activeClaimReservations,
+      worktrees,
+    };
   }
 
   snapshot(): JsonObject {
@@ -240,6 +256,7 @@ export class CollaborationService {
       agents: this.listAgents(),
       tasks,
       leases: this.db.prepare('SELECT * FROM leases ORDER BY acquired_at').all() as Row[],
+      claim_reservations: this.db.prepare('SELECT * FROM claim_reservations ORDER BY created_at').all() as Row[],
       worktrees: this.db.prepare('SELECT * FROM managed_worktrees ORDER BY agent_id').all() as Row[],
       messages: this.db.prepare('SELECT * FROM messages ORDER BY created_at').all() as Row[],
       proposals,
@@ -374,11 +391,25 @@ export class CollaborationService {
       if (!['open', 'in_progress'].includes(String(task['status']))) {
         throw new CollaborationError(`task cannot be claimed from ${String(task['status'])}`, 'invalid_transition');
       }
+      const claimedAt = now();
+      const reservation = this.db
+        .prepare('SELECT * FROM claim_reservations WHERE task_id = ?')
+        .get(input.taskId) as Row | undefined;
+      if (
+        reservation &&
+        String(reservation['expires_at']) > claimedAt &&
+        reservation['agent_id'] !== input.agent
+      ) {
+        throw new CollaborationError(
+          `task claim is reserved for ${String(reservation['agent_id'])}`,
+          'reservation_conflict',
+        );
+      }
       const existing = this.db.prepare('SELECT * FROM leases WHERE task_id = ?').get(input.taskId) as Row | undefined;
-      if (existing && String(existing['expires_at']) > now() && existing['agent_id'] !== input.agent) {
+      if (existing && String(existing['expires_at']) > claimedAt && existing['agent_id'] !== input.agent) {
         throw new CollaborationError(`task is leased by ${String(existing['agent_id'])}`, 'lease_conflict');
       }
-      const acquiredAt = now();
+      const acquiredAt = claimedAt;
       const expiresAt = new Date(Date.now() + input.ttlSeconds * 1000).toISOString();
       const nextVersion = input.expectedVersion + 1;
       this.db
@@ -392,9 +423,11 @@ export class CollaborationService {
              lease_version = excluded.lease_version, acquired_at = excluded.acquired_at, expires_at = excluded.expires_at`,
         )
         .run(input.taskId, input.agent, nextVersion, acquiredAt, expiresAt);
+      this.db.prepare('DELETE FROM claim_reservations WHERE task_id = ?').run(input.taskId);
       this.event(operationId, input.agent, 'task', input.taskId, 'lease_acquired', {
         expires_at: expiresAt,
         version: nextVersion,
+        reservation_consumed: Boolean(reservation),
       });
       return this.requireTask(input.taskId);
     });
@@ -592,16 +625,32 @@ export class CollaborationService {
       this.db
         .prepare('UPDATE reviews SET reviewer = ?, verdict = ?, submitted_at = ? WHERE id = ?')
         .run(input.agent, input.verdict, timestamp, input.reviewId);
+      let reservationExpiresAt: string | undefined;
       if (input.verdict === 'needs_revision') {
+        reservationExpiresAt = new Date(Date.parse(timestamp) + REVISION_RESERVATION_TTL_MS).toISOString();
         this.db
           .prepare(
             'UPDATE tasks SET status = \'in_progress\', candidate_commit = NULL, version = version + 1, updated_at = ? WHERE id = ?',
           )
           .run(timestamp, String(review['task_id']));
+        this.db
+          .prepare(
+            `INSERT INTO claim_reservations (task_id, agent_id, reason, created_at, expires_at)
+             VALUES (?, ?, 'revision', ?, ?)
+             ON CONFLICT(task_id) DO UPDATE SET agent_id = excluded.agent_id, reason = excluded.reason,
+               created_at = excluded.created_at, expires_at = excluded.expires_at`,
+          )
+          .run(String(review['task_id']), String(review['requester']), timestamp, reservationExpiresAt);
       }
       this.event(operationId, input.agent, 'review', input.reviewId, `review_${input.verdict}`, {
         task_id: review['task_id'],
         commit: review['commit_sha'],
+        ...(input.verdict === 'needs_revision'
+          ? {
+              claim_reserved_for: review['requester'],
+              claim_reserved_until: reservationExpiresAt,
+            }
+          : {}),
       });
       return this.db.prepare('SELECT * FROM reviews WHERE id = ?').get(input.reviewId) as Row;
     });

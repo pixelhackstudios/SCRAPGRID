@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
@@ -47,6 +47,14 @@ CREATE TABLE IF NOT EXISTS leases (
   agent_id TEXT NOT NULL REFERENCES agents(id),
   lease_version INTEGER NOT NULL,
   acquired_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS claim_reservations (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  reason TEXT NOT NULL CHECK (reason IN ('revision')),
+  created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL
 );
 
@@ -164,6 +172,7 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_actor_cursor ON events(actor, id);
 CREATE INDEX IF NOT EXISTS operation_attempts_started ON operation_attempts(started_at);
 CREATE INDEX IF NOT EXISTS operation_attempts_subject ON operation_attempts(subject_type, subject_id, started_at);
+CREATE INDEX IF NOT EXISTS claim_reservations_expires ON claim_reservations(expires_at);
 CREATE INDEX IF NOT EXISTS messages_recipient_cursor ON messages(recipient, created_at);
 CREATE INDEX IF NOT EXISTS proposals_task ON proposals(task_id);
 CREATE UNIQUE INDEX IF NOT EXISTS proposals_task_agent_unique ON proposals(task_id, agent_id);
