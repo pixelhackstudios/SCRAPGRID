@@ -546,7 +546,7 @@ test('three agents can propose, implement, communicate, verify, review, and reac
     const candidate = repository.headCommit();
     const verification = await service.runVerification({
       taskId: 'TASK-ROOM',
-      agent: 'codex',
+      agent: 'grok',
       commit: candidate,
       command: ['node', '-e', "process.exit(require('fs').readFileSync('artifact.txt', 'utf8') === 'base\\n' ? 0 : 1)"],
     });
@@ -584,6 +584,65 @@ test('three agents can propose, implement, communicate, verify, review, and reac
   }
 });
 
+test('implementer verification is rejected and cannot satisfy acceptance even when recorded before ownership', async () => {
+  const { service, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-INDEPENDENT', goal: 'Require independent verification', acceptance: [], actor: 'human' });
+    const candidate = repository.headCommit();
+    await service.runVerification({
+      taskId: 'TASK-INDEPENDENT',
+      agent: 'codex',
+      commit: candidate,
+      command: ['node', '-e', 'process.exit(0)'],
+    });
+    service.claimTask({ taskId: 'TASK-INDEPENDENT', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+
+    await assert.rejects(
+      service.runVerification({
+        taskId: 'TASK-INDEPENDENT',
+        agent: 'codex',
+        commit: candidate,
+        command: ['node', '-e', 'process.exit(0)'],
+      }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'self_verify',
+    );
+
+    const review = service.requestReview({ taskId: 'TASK-INDEPENDENT', agent: 'codex', commit: candidate });
+    service.submitReview({ reviewId: String(review['id']), agent: 'claude', verdict: 'approved' });
+    assert.throws(
+      () => service.acceptTask({ taskId: 'TASK-INDEPENDENT', actor: 'human', expectedVersion: 3 }),
+      (error: unknown) =>
+        error instanceof CollaborationError &&
+        error.code === 'acceptance_gate' &&
+        error.message.includes('passing verification'),
+    );
+
+    await service.runVerification({
+      taskId: 'TASK-INDEPENDENT',
+      agent: 'grok',
+      commit: candidate,
+      command: ['node', '-e', 'process.exit(0)'],
+    });
+    assert.equal(
+      service.acceptTask({ taskId: 'TASK-INDEPENDENT', actor: 'human', expectedVersion: 3 })['status'],
+      'accepted',
+    );
+
+    const snapshot = service.snapshot() as Record<string, Array<Record<string, unknown>>>;
+    assert.equal(snapshot['verifications']?.filter((item) => item['task_id'] === 'TASK-INDEPENDENT').length, 2);
+    assert.ok(
+      snapshot['operations']?.some(
+        (operation) =>
+          operation['operation'] === 'verification.run' &&
+          operation['actor'] === 'codex' &&
+          operation['reason_code'] === 'self_verify',
+      ),
+    );
+  } finally {
+    close();
+  }
+});
+
 test('verification for a different commit cannot satisfy acceptance', async () => {
   const { service, repository, repositoryPath, close } = harness();
   try {
@@ -592,7 +651,7 @@ test('verification for a different commit cannot satisfy acceptance', async () =
     const oldCommit = repository.headCommit();
     await service.runVerification({
       taskId: 'TASK-SHA',
-      agent: 'grok',
+      agent: 'claude',
       commit: oldCommit,
       command: ['node', '-e', 'process.exit(0)'],
     });

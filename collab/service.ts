@@ -169,6 +169,14 @@ export class CollaborationService {
     return task;
   }
 
+  private requireIndependentVerifier(taskId: string, agentId: string): Row {
+    const task = this.requireTask(taskId);
+    if (task['owner_agent_id'] === agentId) {
+      throw new CollaborationError('task implementer cannot verify their own candidate', 'self_verify');
+    }
+    return task;
+  }
+
   private requireProjectActive(): void {
     const state = this.db.prepare('SELECT status FROM project_state WHERE singleton = 1').get() as Row;
     if (state['status'] !== 'active') throw new CollaborationError('project is paused', 'project_paused');
@@ -707,14 +715,14 @@ export class CollaborationService {
     return this.preparedAsyncTransaction(
       { name: 'verification.run', actor: input.agent, subjectType: 'task', subjectId: input.taskId },
       async () => {
-        this.requireTask(input.taskId);
         this.requireAgent(input.agent);
+        this.requireIndependentVerifier(input.taskId, input.agent);
         return this.repository.runAtCommit(input.commit, input.command);
       },
       (operationId, execution) => {
         const commandArgvJson = JSON.stringify(execution.commandArgv);
-        this.requireTask(input.taskId);
         this.requireAgent(input.agent);
+        this.requireIndependentVerifier(input.taskId, input.agent);
         const id = makeId('verify');
         this.db
           .prepare(
@@ -841,9 +849,15 @@ export class CollaborationService {
         .prepare(
           `SELECT id FROM verifications
            WHERE task_id = ? AND repository_identity = ? AND commit_sha = ? AND exit_code = 0
+             AND runner <> ?
            ORDER BY created_at DESC LIMIT 1`,
         )
-        .get(input.taskId, this.repository.binding.identity, String(task['candidate_commit']));
+        .get(
+          input.taskId,
+          this.repository.binding.identity,
+          String(task['candidate_commit']),
+          String(task['owner_agent_id']),
+        );
       if (!verification) throw new CollaborationError('candidate commit lacks a passing verification', 'acceptance_gate');
       const timestamp = now();
       this.db

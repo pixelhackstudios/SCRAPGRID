@@ -33,6 +33,8 @@ The repository contains the CLI-first collaboration core plus its first Git-trut
 - stable `collab/grok`, `collab/claude`, and `collab/codex` branches in isolated linked worktrees;
 - verification commands executed in disposable detached worktrees at the exact claimed SHA, with repository,
   normalized commit, exact command argv as JSON, and exit code recorded;
+- independent verification enforcement that rejects the task owner as runner and prevents owner-authored evidence
+  from satisfying acceptance;
 - review requests that require the implementation owner to still hold the live task lease;
 - review findings that only their author or the human may resolve;
 - acceptance gates requiring a human actor, an approved review, passing verification for the same candidate,
