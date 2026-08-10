@@ -17,9 +17,9 @@ while the collaboration service remains the authoritative truth and coordination
 2. **Revision claim reservation**
    - **COMPLETE** — `9dbe385cd897eb95520984ea61be2579a2feadbb`
 3. **Independent verification**
-   - **NEXT**
+   - **COMPLETE** — `048ba7cbc3562fcea1c2f386f8a731a6b93e7505`
 4. **Base-pinned required-check policy + explicit human override**
-   - **PENDING**
+   - **NEXT**
 5. **Temporary task roles**
    - **PENDING**
 6. **`collabd`**
