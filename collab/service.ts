@@ -1,5 +1,20 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
+import {
+  acceptanceGapMessage,
+  basisDigest,
+  canonicalJson,
+  deriveDispatchResult,
+  DISPATCH_CONTRACT_VERSION,
+  TERMINAL_OPERATIONS,
+  type AcceptanceGap,
+  type DispatchActionKind,
+  type DispatchEnvelope,
+  type DispatchFacts,
+  type DispatchResult,
+  type DispatchRole,
+  type TerminalOperation,
+} from './dispatch.js';
 import { GitError, GitRepository } from './git.js';
 
 export class CollaborationError extends Error {
@@ -28,6 +43,7 @@ type VerificationInput = {
   commit: string;
   command?: string[];
   checkId?: string;
+  dispatchId?: string;
 };
 type TaskRole = 'implementer' | 'reviewer' | 'verifier';
 type TaskRoleAssignment = Record<TaskRole, string>;
@@ -348,6 +364,136 @@ export class CollaborationService {
   private requireProjectActive(): void {
     const state = this.db.prepare('SELECT status FROM project_state WHERE singleton = 1').get() as Row;
     if (state['status'] !== 'active') throw new CollaborationError('project is paused', 'project_paused');
+  }
+
+  /**
+   * The lease that is live at `at`, if any.
+   *
+   * Expiry is a timestamp comparison with no backing mutation, so a caller that reads the clock
+   * twice can see the same lease from both sides. Every caller passes the one instant it decided
+   * to evaluate against, and this predicate never reads the clock itself.
+   */
+  private liveLease(taskId: string, at: string): Row | undefined {
+    const lease = this.db.prepare('SELECT * FROM leases WHERE task_id = ?').get(taskId) as Row | undefined;
+    return lease && String(lease['expires_at']) > at ? lease : undefined;
+  }
+
+  /** The claim reservation that is active at `at`, if any. Same one-instant rule as `liveLease`. */
+  private activeClaimReservation(taskId: string, at: string): Row | undefined {
+    const reservation = this.db
+      .prepare('SELECT * FROM claim_reservations WHERE task_id = ?')
+      .get(taskId) as Row | undefined;
+    return reservation && String(reservation['expires_at']) > at ? reservation : undefined;
+  }
+
+  /**
+   * Everything still standing between a candidate and acceptance, in the order `acceptTask()`
+   * refuses on them.
+   *
+   * This is the single enumeration of the acceptance gates, with two readers: `acceptTask()`
+   * rejects when the list is non-empty, and dispatch derivation projects the same list onto roles.
+   * Keeping one source is what stops the dispatcher from growing a second, subtly different copy of
+   * the acceptance rules — the failure mode step 8 exists to avoid.
+   *
+   * The caller supplies status and version checks; this answers only "what evidence is missing".
+   */
+  private acceptanceGaps(task: Row, roles: TaskRoleAssignment): AcceptanceGap[] {
+    const taskId = String(task['id']);
+    const candidate = String(task['candidate_commit']);
+    const identity = this.repository.binding.identity;
+    const gaps: AcceptanceGap[] = [];
+
+    const openBlockers = this.db
+      .prepare("SELECT id FROM blockers WHERE task_id = ? AND status = 'open' ORDER BY created_at, id")
+      .all(taskId) as Row[];
+    if (openBlockers.length > 0) {
+      gaps.push({ gate: 'open_blockers', ids: openBlockers.map((row) => String(row['id'])) });
+    }
+
+    const openFindings = this.db
+      .prepare(
+        `SELECT finding.id AS id
+         FROM review_findings AS finding
+         JOIN reviews AS review ON review.id = finding.review_id
+         WHERE review.task_id = ? AND review.commit_sha = ?
+           AND finding.severity = 'blocking' AND finding.status = 'open'
+         ORDER BY finding.created_at, finding.id`,
+      )
+      .all(taskId, candidate) as Row[];
+    if (openFindings.length > 0) {
+      gaps.push({ gate: 'blocking_findings', ids: openFindings.map((row) => String(row['id'])) });
+    }
+
+    const review = this.db
+      .prepare(
+        `SELECT id FROM reviews
+         WHERE task_id = ? AND repository_identity = ? AND commit_sha = ? AND verdict = 'approved'
+           AND reviewer = ?
+         ORDER BY submitted_at DESC LIMIT 1`,
+      )
+      .get(taskId, identity, candidate, roles.reviewer);
+    if (!review) gaps.push({ gate: 'approved_review' });
+
+    const override = this.db
+      .prepare(
+        `SELECT id FROM check_policy_overrides
+         WHERE task_id = ? AND repository_identity = ? AND candidate_commit = ?
+         ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(taskId, identity, candidate) as Row | undefined;
+
+    const independentVerification = this.db
+      .prepare(
+        `SELECT id FROM verifications
+         WHERE task_id = ? AND repository_identity = ? AND commit_sha = ? AND exit_code = 0
+           AND runner = ? AND runner <> ?
+         ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(taskId, identity, candidate, roles.verifier, String(task['owner_agent_id']));
+    if (!independentVerification) gaps.push({ gate: 'independent_verification' });
+
+    // An override waives the named checks and nothing else: the independent-verifier evidence above
+    // is still required, which is why it is gathered before this branch rather than inside it.
+    if (override) return gaps;
+
+    let policy: CheckPolicy;
+    try {
+      policy = this.requireTaskCheckPolicy(task);
+    } catch {
+      gaps.push({ gate: 'check_policy_invalid' });
+      return gaps;
+    }
+    for (const check of policy.checks) {
+      const verification = this.db
+        .prepare(
+          `SELECT id FROM verifications
+           WHERE task_id = ? AND repository_identity = ? AND commit_sha = ? AND exit_code = 0
+             AND runner = ? AND runner <> ? AND check_id = ? AND check_policy_identity = ?
+           ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get(
+          taskId,
+          identity,
+          candidate,
+          roles.verifier,
+          String(task['owner_agent_id']),
+          check.id,
+          String(task['check_policy_identity']),
+        );
+      if (!verification) gaps.push({ gate: 'required_check', check_id: check.id });
+    }
+    return gaps;
+  }
+
+  /** The check policy override recorded against a task's candidate, if a human made one. */
+  private candidateOverride(task: Row): Row | undefined {
+    return this.db
+      .prepare(
+        `SELECT id FROM check_policy_overrides
+         WHERE task_id = ? AND repository_identity = ? AND candidate_commit = ?
+         ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(String(task['id']), this.repository.binding.identity, String(task['candidate_commit'])) as Row | undefined;
   }
 
   private event(
@@ -679,6 +825,7 @@ export class CollaborationService {
       check_policy_overrides: this.db
         .prepare('SELECT * FROM check_policy_overrides ORDER BY created_at')
         .all() as Row[],
+      dispatches: this.db.prepare('SELECT * FROM dispatches ORDER BY issued_at, id').all() as Row[],
       operations: this.db.prepare('SELECT * FROM operation_attempts ORDER BY started_at, id').all() as Row[],
       events,
     };
@@ -861,7 +1008,13 @@ export class CollaborationService {
     );
   }
 
-  claimTask(input: { taskId: string; agent: string; expectedVersion: number; ttlSeconds: number }): Row {
+  claimTask(input: {
+    taskId: string;
+    agent: string;
+    expectedVersion: number;
+    ttlSeconds: number;
+    dispatchId?: string;
+  }): Row {
     return this.transaction({ name: 'task.claim', actor: input.agent, subjectType: 'task', subjectId: input.taskId }, (operationId) => {
       this.requireProjectActive();
       this.requireAgent(input.agent);
@@ -876,22 +1029,21 @@ export class CollaborationService {
         throw new CollaborationError(`task cannot be claimed from ${String(task['status'])}`, 'invalid_transition');
       }
       const claimedAt = now();
-      const reservation = this.db
-        .prepare('SELECT * FROM claim_reservations WHERE task_id = ?')
-        .get(input.taskId) as Row | undefined;
-      if (
-        reservation &&
-        String(reservation['expires_at']) > claimedAt &&
-        reservation['agent_id'] !== input.agent
-      ) {
+      // Any reservation row is consumed by the unconditional delete below, expired or not, so the
+      // event payload counts rows while the conflict test below counts only live ones.
+      const reservationExists = Boolean(
+        this.db.prepare('SELECT 1 FROM claim_reservations WHERE task_id = ?').get(input.taskId),
+      );
+      const reservation = this.activeClaimReservation(input.taskId, claimedAt);
+      if (reservation && reservation['agent_id'] !== input.agent) {
         throw new CollaborationError(
           `task claim is reserved for ${String(reservation['agent_id'])}`,
           'reservation_conflict',
         );
       }
       this.requireTaskRole(input.taskId, 'implementer', input.agent);
-      const existing = this.db.prepare('SELECT * FROM leases WHERE task_id = ?').get(input.taskId) as Row | undefined;
-      if (existing && String(existing['expires_at']) > claimedAt && existing['agent_id'] !== input.agent) {
+      const existing = this.liveLease(input.taskId, claimedAt);
+      if (existing && existing['agent_id'] !== input.agent) {
         throw new CollaborationError(`task is leased by ${String(existing['agent_id'])}`, 'lease_conflict');
       }
       const acquiredAt = claimedAt;
@@ -909,10 +1061,16 @@ export class CollaborationService {
         )
         .run(input.taskId, input.agent, nextVersion, acquiredAt, expiresAt);
       this.db.prepare('DELETE FROM claim_reservations WHERE task_id = ?').run(input.taskId);
+      this.attachDispatch(operationId, {
+        dispatchId: input.dispatchId,
+        agentId: input.agent,
+        taskId: input.taskId,
+        terminalOperation: 'task.claim',
+      });
       this.event(operationId, input.agent, 'task', input.taskId, 'lease_acquired', {
         expires_at: expiresAt,
         version: nextVersion,
-        reservation_consumed: Boolean(reservation),
+        reservation_consumed: reservationExists,
       });
       return this.requireTask(input.taskId);
     });
@@ -1044,7 +1202,7 @@ export class CollaborationService {
     });
   }
 
-  requestReview(input: { taskId: string; agent: string; commit: string }): Row {
+  requestReview(input: { taskId: string; agent: string; commit: string; dispatchId?: string }): Row {
     return this.preparedTransaction(
       { name: 'review.request', actor: input.agent, subjectType: 'task', subjectId: input.taskId },
       () => {
@@ -1067,10 +1225,8 @@ export class CollaborationService {
           throw new CollaborationError('review requires an in-progress task', 'invalid_transition');
         }
         const timestamp = now();
-        const lease = this.db
-          .prepare('SELECT agent_id, expires_at FROM leases WHERE task_id = ?')
-          .get(input.taskId) as Row | undefined;
-        if (!lease || lease['agent_id'] !== input.agent || String(lease['expires_at']) <= timestamp) {
+        const lease = this.liveLease(input.taskId, timestamp);
+        if (!lease || lease['agent_id'] !== input.agent) {
           throw new CollaborationError(
             'review requires the requester to hold the current live lease',
             'lease_required',
@@ -1098,6 +1254,12 @@ export class CollaborationService {
           )
           .run(commit, timestamp, input.taskId);
         this.db.prepare('DELETE FROM leases WHERE task_id = ?').run(input.taskId);
+        this.attachDispatch(operationId, {
+          dispatchId: input.dispatchId,
+          agentId: input.agent,
+          taskId: input.taskId,
+          terminalOperation: 'review.request',
+        });
         this.event(operationId, input.agent, 'review', id, 'review_requested', {
           task_id: input.taskId,
           reviewer: this.requireAssignedRoles(input.taskId).reviewer,
@@ -1109,7 +1271,12 @@ export class CollaborationService {
     );
   }
 
-  submitReview(input: { reviewId: string; agent: string; verdict: 'approved' | 'needs_revision' }): Row {
+  submitReview(input: {
+    reviewId: string;
+    agent: string;
+    verdict: 'approved' | 'needs_revision';
+    dispatchId?: string;
+  }): Row {
     return this.transaction({ name: 'review.submit', actor: input.agent, subjectType: 'review', subjectId: input.reviewId }, (operationId) => {
       this.requireAgent(input.agent);
       const review = this.db.prepare('SELECT * FROM reviews WHERE id = ?').get(input.reviewId) as Row | undefined;
@@ -1140,6 +1307,15 @@ export class CollaborationService {
           )
           .run(String(review['task_id']), String(review['requester']), timestamp, reservationExpiresAt);
       }
+      // The resolved task, not the ledger subject: this operation records `subjectType: 'review'`
+      // and reaches the task through the review row, so a blind subject comparison would never
+      // attach the one action whose causal edge the revision cycle most needs.
+      this.attachDispatch(operationId, {
+        dispatchId: input.dispatchId,
+        agentId: input.agent,
+        taskId: String(review['task_id']),
+        terminalOperation: 'review.submit',
+      });
       this.event(operationId, input.agent, 'review', input.reviewId, `review_${input.verdict}`, {
         task_id: review['task_id'],
         commit: review['commit_sha'],
@@ -1249,6 +1425,12 @@ export class CollaborationService {
             input.agent,
             now(),
           );
+        this.attachDispatch(operationId, {
+          dispatchId: input.dispatchId,
+          agentId: input.agent,
+          taskId: input.taskId,
+          terminalOperation: 'verification.run',
+        });
         this.event(
           operationId,
           input.agent,
@@ -1376,90 +1558,12 @@ export class CollaborationService {
       if (task['status'] !== 'in_review' || !task['candidate_commit']) {
         throw new CollaborationError('task is not awaiting acceptance', 'invalid_transition');
       }
-      const openBlockers = this.db
-        .prepare('SELECT count(*) AS count FROM blockers WHERE task_id = ? AND status = \'open\'')
-        .get(input.taskId) as { count: number };
-      if (openBlockers.count > 0) throw new CollaborationError('task has open blockers', 'acceptance_gate');
-      const openFindings = this.db
-        .prepare(
-          `SELECT count(*) AS count
-           FROM review_findings AS finding
-           JOIN reviews AS review ON review.id = finding.review_id
-           WHERE review.task_id = ? AND review.commit_sha = ?
-             AND finding.severity = 'blocking' AND finding.status = 'open'`,
-        )
-        .get(input.taskId, String(task['candidate_commit'])) as { count: number };
-      if (openFindings.count > 0) {
-        throw new CollaborationError('candidate commit has open blocking review findings', 'acceptance_gate');
-      }
-      const review = this.db
-        .prepare(
-          `SELECT id FROM reviews
-           WHERE task_id = ? AND repository_identity = ? AND commit_sha = ? AND verdict = 'approved'
-             AND reviewer = ?
-           ORDER BY submitted_at DESC LIMIT 1`,
-        )
-        .get(input.taskId, this.repository.binding.identity, String(task['candidate_commit']), roles.reviewer);
-      if (!review) throw new CollaborationError('candidate commit lacks an approved review', 'acceptance_gate');
-      const override = this.db
-        .prepare(
-          `SELECT id FROM check_policy_overrides
-           WHERE task_id = ? AND repository_identity = ? AND candidate_commit = ?
-           ORDER BY created_at DESC LIMIT 1`,
-        )
-        .get(input.taskId, this.repository.binding.identity, String(task['candidate_commit'])) as Row | undefined;
-      const independentVerification = this.db
-        .prepare(
-          `SELECT id FROM verifications
-           WHERE task_id = ? AND repository_identity = ? AND commit_sha = ? AND exit_code = 0
-             AND runner = ? AND runner <> ?
-           ORDER BY created_at DESC LIMIT 1`,
-        )
-        .get(
-          input.taskId,
-          this.repository.binding.identity,
-          String(task['candidate_commit']),
-          roles.verifier,
-          String(task['owner_agent_id']),
-        );
-      if (!independentVerification) {
-        throw new CollaborationError(
-          'candidate commit lacks passing verification from the designated verifier',
-          'acceptance_gate',
-        );
-      }
-      if (!override) {
-        let policy: CheckPolicy;
-        try {
-          policy = this.requireTaskCheckPolicy(task);
-        } catch {
-          throw new CollaborationError('task lacks a valid pinned required-check policy', 'acceptance_gate');
-        }
-        for (const check of policy.checks) {
-          const verification = this.db
-            .prepare(
-              `SELECT id FROM verifications
-               WHERE task_id = ? AND repository_identity = ? AND commit_sha = ? AND exit_code = 0
-                 AND runner = ? AND runner <> ? AND check_id = ? AND check_policy_identity = ?
-               ORDER BY created_at DESC LIMIT 1`,
-            )
-            .get(
-              input.taskId,
-              this.repository.binding.identity,
-              String(task['candidate_commit']),
-              roles.verifier,
-              String(task['owner_agent_id']),
-              check.id,
-              String(task['check_policy_identity']),
-            );
-          if (!verification) {
-            throw new CollaborationError(
-              `candidate commit lacks passing required check: ${check.id}`,
-              'acceptance_gate',
-            );
-          }
-        }
-      }
+      // One enumeration of the gates, shared with dispatch derivation. Rejection names the first
+      // unmet gate, which is the gate this method used to reject on before the list was extracted.
+      const gaps = this.acceptanceGaps(task, roles);
+      const firstGap = gaps[0];
+      if (firstGap) throw new CollaborationError(acceptanceGapMessage(firstGap), 'acceptance_gate');
+      const override = this.candidateOverride(task);
       const timestamp = now();
       this.db
         .prepare('UPDATE tasks SET status = \'accepted\', version = version + 1, updated_at = ? WHERE id = ?')
@@ -1471,5 +1575,326 @@ export class CollaborationService {
       });
       return this.requireTask(input.taskId);
     });
+  }
+
+  /**
+   * Gathers every canonical fact the state table may read, all against one captured instant.
+   *
+   * Nothing here infers: each field is a row or the evaluated comparison of a row against `at`. The
+   * candidate-scoped gates are read only where a candidate exists, so a `blocked` or `in_progress`
+   * task never pays for the acceptance query.
+   */
+  private dispatchFacts(agentId: string, agentStatus: string, task: Row, at: number): DispatchFacts {
+    const taskId = String(task['id']);
+    const atIso = new Date(at).toISOString();
+    const roleRows = this.db
+      .prepare('SELECT role, agent_id FROM task_roles WHERE task_id = ?')
+      .all(taskId) as Array<{ role: TaskRole; agent_id: string }>;
+    const roles: Partial<Record<DispatchRole, string>> = {};
+    for (const row of roleRows) roles[row.role] = row.agent_id;
+    const leaseRow = this.db.prepare('SELECT * FROM leases WHERE task_id = ?').get(taskId) as Row | undefined;
+    const reservationRow = this.db
+      .prepare('SELECT * FROM claim_reservations WHERE task_id = ?')
+      .get(taskId) as Row | undefined;
+    const projectState = this.db
+      .prepare('SELECT status FROM project_state WHERE singleton = 1')
+      .get() as Row | undefined;
+    const openBlockers = this.db
+      .prepare("SELECT id FROM blockers WHERE task_id = ? AND status = 'open' ORDER BY created_at, id")
+      .all(taskId) as Row[];
+
+    const candidate = task['candidate_commit'] ? String(task['candidate_commit']) : null;
+    const scoped = candidate !== null && task['status'] === 'in_review' && roleRows.length === 3;
+    const pendingReview = scoped
+      ? (this.db
+          .prepare(
+            `SELECT id FROM reviews
+             WHERE task_id = ? AND commit_sha = ? AND verdict = 'pending'
+             ORDER BY created_at, id LIMIT 1`,
+          )
+          .get(taskId, candidate) as Row | undefined)
+      : undefined;
+
+    return {
+      agent_id: agentId,
+      task_id: taskId,
+      task_status: String(task['status']),
+      task_version: Number(task['version']),
+      repository_identity: String(task['repository_identity']),
+      base_commit: String(task['base_commit']),
+      candidate_commit: candidate,
+      role: roleRows.find((row) => row.agent_id === agentId)?.role ?? null,
+      roles,
+      project_status: String(projectState?.['status'] ?? 'active'),
+      agent_status: agentStatus,
+      lease: leaseRow
+        ? {
+            agent_id: String(leaseRow['agent_id']),
+            expires_at: String(leaseRow['expires_at']),
+            live: String(leaseRow['expires_at']) > atIso,
+          }
+        : null,
+      reservation: reservationRow
+        ? {
+            agent_id: String(reservationRow['agent_id']),
+            expires_at: String(reservationRow['expires_at']),
+            active: String(reservationRow['expires_at']) > atIso,
+          }
+        : null,
+      open_blocker_ids: openBlockers.map((row) => String(row['id'])),
+      pending_review_id: pendingReview ? String(pendingReview['id']) : null,
+      gaps: scoped ? this.acceptanceGaps(task, roles as TaskRoleAssignment) : [],
+      override_id: scoped ? (this.candidateOverride(task)?.['id'] as string | undefined) ?? null : null,
+      check_policy_identity: task['check_policy_identity'] ? String(task['check_policy_identity']) : null,
+    };
+  }
+
+  /**
+   * The agent as dispatch reads it: unknown is an error, paused is a *fact*.
+   *
+   * `requireAgent()` throws on a paused agent, which is right for a mutation and wrong here — the
+   * contract has to be able to report `blocked(agent_paused)` rather than fail to answer.
+   */
+  private dispatchAgent(agentId: string): Row {
+    const agent = this.db.prepare('SELECT * FROM agents WHERE id = ?').get(agentId) as Row | undefined;
+    if (!agent) throw new CollaborationError(`unknown agent: ${agentId}`, 'unknown_agent');
+    return agent;
+  }
+
+  private deriveOne(
+    agentId: string,
+    agentStatus: string,
+    task: Row,
+    at: number,
+  ): { result: DispatchResult; basis: Record<string, unknown> } {
+    return deriveDispatchResult(this.dispatchFacts(agentId, agentStatus, task, at));
+  }
+
+  /**
+   * The agent's session as the envelope reports it.
+   *
+   * `workInFlight` is passed in rather than probed whenever the caller is an operation that has
+   * already registered its own activity: an issuing request marks its session busy before it can
+   * read the flag, so probing here would always see itself.
+   */
+  private dispatchSession(
+    agentId: string,
+    at: number,
+    workInFlight?: boolean,
+  ): DispatchEnvelope['session'] {
+    const session = this.currentSession(agentId);
+    if (!session) return { session_id: null, liveness: 'none', work_in_flight: false };
+    const working = workInFlight ?? this.hasWorkInFlight(String(session['id']));
+    return {
+      session_id: String(session['id']),
+      liveness: working || !this.sessionIsStale(session, at) ? 'live' : 'stale',
+      work_in_flight: working,
+    };
+  }
+
+  /**
+   * Every obligation this agent currently holds, in a stated non-semantic order.
+   *
+   * The list is deliberately unranked. Canonical state offers nothing to rank two tasks by, so any
+   * order the harness supplied would be scheduling. The actor chooses among its own obligations;
+   * a harness choosing for it would be a supervisor.
+   */
+  deriveDispatch(input: { agent: string; workInFlight?: boolean }): DispatchEnvelope {
+    const at = Date.now();
+    const agent = this.dispatchAgent(input.agent);
+    const session = this.dispatchSession(input.agent, at, input.workInFlight);
+    // Non-terminal tasks this agent holds a role on, plus unassigned tasks: row 1 concerns every
+    // model agent, since any of them may yet be assigned. Not every task as `no_role` noise.
+    const tasks = this.db
+      .prepare(
+        `SELECT * FROM tasks
+         WHERE status NOT IN ('accepted', 'cancelled')
+           AND (id IN (SELECT task_id FROM task_roles WHERE agent_id = ?)
+                OR id NOT IN (SELECT task_id FROM task_roles))
+         ORDER BY created_at, id`,
+      )
+      .all(input.agent) as Row[];
+    return {
+      agent_id: input.agent,
+      derived_at: new Date(at).toISOString(),
+      session,
+      deliverable: session.liveness === 'live' && !session.work_in_flight,
+      tasks: tasks.map((task) => this.deriveOne(input.agent, String(agent['status']), task, at).result),
+    };
+  }
+
+  /** Explicit inspection of one pair, never filtered: `no_role` and `task_terminal` are returned. */
+  deriveDispatchForTask(input: { agent: string; taskId: string }): DispatchResult {
+    const at = Date.now();
+    const agent = this.dispatchAgent(input.agent);
+    const task = this.requireTask(input.taskId);
+    return this.deriveOne(input.agent, String(agent['status']), task, at).result;
+  }
+
+  /**
+   * Writes the delivery record, or returns the one already written for this exact delivery.
+   *
+   * Idempotency is keyed on the session while the digest covers workflow state alone. That split is
+   * what lets a replacement session receive the same obligation as a new, separately attributable
+   * delivery instead of silently overwriting who was told what.
+   */
+  private recordDispatch(params: {
+    agentId: string;
+    sessionId: string;
+    taskId: string;
+    kind: DispatchActionKind;
+    repositoryIdentity: string;
+    baseCommit: string;
+    candidateCommit: string | null;
+    reviewId: string | null;
+    checkIds: string[] | null;
+    basis: Record<string, unknown>;
+    issuedAt: string;
+  }): Row {
+    const digest = basisDigest(params.basis);
+    const existing = this.db
+      .prepare(
+        `SELECT * FROM dispatches
+         WHERE session_id = ? AND task_id = ? AND dispatch_contract_version = ? AND basis_digest = ?`,
+      )
+      .get(params.sessionId, params.taskId, DISPATCH_CONTRACT_VERSION, digest) as Row | undefined;
+    if (existing) return existing;
+    const id = makeId('dispatch');
+    this.db
+      .prepare(
+        `INSERT INTO dispatches
+         (id, agent_id, session_id, task_id, action_kind, terminal_operation, dispatch_contract_version,
+          repository_identity, base_commit, candidate_commit, review_id, subject_json,
+          basis_json, basis_digest, issued_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        params.agentId,
+        params.sessionId,
+        params.taskId,
+        params.kind,
+        TERMINAL_OPERATIONS[params.kind],
+        DISPATCH_CONTRACT_VERSION,
+        params.repositoryIdentity,
+        params.baseCommit,
+        params.candidateCommit,
+        params.reviewId,
+        JSON.stringify(params.checkIds ? { check_ids: params.checkIds } : {}),
+        canonicalJson(params.basis),
+        digest,
+        params.issuedAt,
+      );
+    return this.db.prepare('SELECT * FROM dispatches WHERE id = ?').get(id) as Row;
+  }
+
+  /**
+   * Derives one pair and, on an `action`, records the delivery.
+   *
+   * The operation lifecycle is written out rather than delegated to `transaction()` because an
+   * `indeterminate` result is neither an accepted operation nor a thrown error: it is a harness
+   * defect that must land in the ledger as a rejected attempt while still being returned to the
+   * caller unchanged.
+   */
+  issueDispatch(input: {
+    agent: string;
+    taskId: string;
+    session: SessionPrincipal;
+    workInFlight: boolean;
+  }): { result: DispatchResult; dispatch: Row | null } {
+    const operationId = this.startOperation({
+      name: 'dispatch.issue',
+      actor: input.agent,
+      subjectType: 'task',
+      subjectId: input.taskId,
+    });
+    try {
+      return this.domainTransaction(() => {
+        const at = Date.now();
+        const agent = this.dispatchAgent(input.agent);
+        const session = this.requireSessionRow(input.session.sessionId);
+        if (session['status'] !== 'open' || session['agent_id'] !== input.agent) {
+          throw new CollaborationError(`unknown session: ${input.session.sessionId}`, 'unknown_session');
+        }
+        // Both facts are required. Step 7 reports work in flight *as* liveness, so liveness alone
+        // would let a second action be issued from pre-completion state while the first still runs.
+        if (input.workInFlight) {
+          throw new CollaborationError(
+            `${input.agent} still has accepted daemon work in flight`,
+            'session_busy',
+          );
+        }
+        if (this.sessionIsStale(session, at)) {
+          throw new CollaborationError(`${input.agent} has no live session to deliver to`, 'session_stale');
+        }
+        const task = this.requireTask(input.taskId);
+        const { result, basis } = this.deriveOne(input.agent, String(agent['status']), task, at);
+        if (result.kind === 'indeterminate') {
+          this.completeOperation(operationId, 'rejected', 'dispatch_indeterminate');
+          return { result, dispatch: null };
+        }
+        if (result.kind !== 'action') {
+          this.completeOperation(operationId, 'accepted');
+          return { result, dispatch: null };
+        }
+        const dispatch = this.recordDispatch({
+          agentId: input.agent,
+          sessionId: input.session.sessionId,
+          taskId: input.taskId,
+          kind: result.action.kind,
+          repositoryIdentity: result.action.repository_identity,
+          baseCommit: result.action.base_commit,
+          candidateCommit: result.action.candidate_commit ?? null,
+          reviewId: result.action.review_id ?? null,
+          checkIds: result.action.check_ids ?? null,
+          basis,
+          issuedAt: new Date(at).toISOString(),
+        });
+        this.event(operationId, input.agent, 'dispatch', String(dispatch['id']), 'dispatch_issued', {
+          task_id: input.taskId,
+          action_kind: result.action.kind,
+          terminal_operation: result.action.terminal_operation,
+          session_id: input.session.sessionId,
+          dispatch_contract_version: DISPATCH_CONTRACT_VERSION,
+          basis_digest: result.action.basis_digest,
+        });
+        this.completeOperation(operationId, 'accepted');
+        return { result, dispatch };
+      });
+    } catch (error) {
+      this.recordOperationError(operationId, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Turns "told X to do Y" and "X did Y" into a hard causal edge, when the echoed id checks out.
+   *
+   * Validated, never trusted: an id belonging to another task or agent would otherwise manufacture
+   * false provenance in the very record the pilot reads for causality. Advisory in both directions —
+   * a mismatched or absent id costs provenance, never work, so this never throws.
+   *
+   * Session is deliberately not matched. Recovery can replace a session while the durable agent's
+   * work continues, and matching it would break the edge across exactly those events.
+   */
+  private attachDispatch(
+    operationId: string,
+    params: { dispatchId?: string; agentId: string; taskId: string; terminalOperation: TerminalOperation },
+  ): void {
+    if (!params.dispatchId) return;
+    const dispatch = this.db
+      .prepare('SELECT agent_id, task_id, terminal_operation FROM dispatches WHERE id = ?')
+      .get(params.dispatchId) as Row | undefined;
+    if (
+      !dispatch ||
+      dispatch['agent_id'] !== params.agentId ||
+      dispatch['task_id'] !== params.taskId ||
+      dispatch['terminal_operation'] !== params.terminalOperation
+    ) {
+      return;
+    }
+    this.db
+      .prepare('UPDATE operation_attempts SET dispatch_id = ? WHERE id = ?')
+      .run(params.dispatchId, operationId);
   }
 }

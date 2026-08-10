@@ -42,6 +42,14 @@ export interface OperationContext {
   daemon: DaemonSummary;
   principal: OperationPrincipal;
   sessionActivity?: SessionActivity;
+  /**
+   * Whether this session had work in flight *before* this request registered its own.
+   *
+   * A mutating request marks its session busy before the operation body runs, so an operation that
+   * probed the live flag would always see itself. Sampling belongs to the transport, which is the
+   * only layer that observes the moment before registration.
+   */
+  sessionWorkInFlight?: boolean;
   onOutput?: (stream: OutputStream, data: string) => void;
 }
 
@@ -54,6 +62,15 @@ export interface OperationDefinition {
   control?: boolean;
   /** Requires a model session rather than the control credential. */
   session?: boolean;
+  /**
+   * Input key carrying a claimed identity that control may inspect on behalf of any agent, and a
+   * session may claim only for itself.
+   *
+   * `control` and `identity` cannot express this between them: `control: true` rejects sessions
+   * outright, while `identity` compares the claim against `principal.agentId`, which is the literal
+   * `'human'` for a control principal — so control could never inspect a model agent.
+   */
+  identityOrControl?: string;
   invoke(context: OperationContext, input: Record<string, unknown>): unknown | Promise<unknown>;
 }
 
@@ -78,8 +95,19 @@ export function authorizeOperation(
   if (definition.session && principal.kind !== 'session') {
     throw new CollaborationError('this operation requires a model session', 'session_required');
   }
+  if (definition.identityOrControl && principal.kind !== 'control') {
+    requireClaimedIdentity(input, definition.identityOrControl, principal);
+  }
   if (!definition.identity) return;
-  const claimed = input[definition.identity];
+  requireClaimedIdentity(input, definition.identity, principal);
+}
+
+function requireClaimedIdentity(
+  input: Record<string, unknown>,
+  key: string,
+  principal: OperationPrincipal,
+): void {
+  const claimed = input[key];
   // A malformed claim is left to the operation's own input validation, which reports it precisely.
   if (typeof claimed !== 'string' || claimed.length === 0) return;
   if (claimed !== principal.agentId) {
@@ -282,6 +310,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
         agent: requiredString(input, 'agent'),
         expectedVersion: nonNegativeInteger(input, 'expectedVersion'),
         ttlSeconds: nonNegativeInteger(input, 'ttlSeconds', 900),
+        dispatchId: optionalString(input, 'dispatchId'),
       }),
   },
   'task.accept': {
@@ -362,6 +391,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
         taskId: requiredString(input, 'taskId'),
         agent: requiredString(input, 'agent'),
         commit: requiredString(input, 'commit'),
+        dispatchId: optionalString(input, 'dispatchId'),
       }),
   },
   'review.submit': {
@@ -372,6 +402,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
         reviewId: requiredString(input, 'reviewId'),
         agent: requiredString(input, 'agent'),
         verdict: enumValue(input, 'verdict', ['approved', 'needs_revision']),
+        dispatchId: optionalString(input, 'dispatchId'),
       }),
   },
   'finding.add': {
@@ -418,9 +449,45 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
           commit: requiredString(input, 'commit'),
           checkId,
           command,
+          dispatchId: optionalString(input, 'dispatchId'),
         },
         onOutput,
       );
+    },
+  },
+  /**
+   * Read-only. Writes nothing and leaves no ledger entry, matching the other read operations.
+   *
+   * There is deliberately no `dispatch.next`: an operation asked for *the* next action would have to
+   * rank an agent's tasks, and canonical state offers nothing to rank them by. The actor reads its
+   * unranked obligations here and names the one it takes up in `dispatch.issue`.
+   */
+  'dispatch.derive': {
+    mutating: false,
+    identityOrControl: 'agent',
+    invoke: ({ service, principal, sessionWorkInFlight }, input) => {
+      const agent = requiredString(input, 'agent');
+      const task = optionalString(input, 'task');
+      if (task !== undefined) return service.deriveDispatchForTask({ agent, taskId: task });
+      return service.deriveDispatch({
+        agent,
+        workInFlight: principal.kind === 'session' && principal.agentId === agent ? sessionWorkInFlight : undefined,
+      });
+    },
+  },
+  /** Mutating and session-bound. `task` is required: the harness never picks which one. */
+  'dispatch.issue': {
+    mutating: true,
+    session: true,
+    identity: 'agent',
+    invoke: ({ service, principal, sessionWorkInFlight }, input) => {
+      if (principal.kind !== 'session') throw new CollaborationError('no session principal', 'session_required');
+      return service.issueDispatch({
+        agent: requiredString(input, 'agent'),
+        taskId: requiredString(input, 'task'),
+        session: principal,
+        workInFlight: sessionWorkInFlight ?? false,
+      });
     },
   },
 };

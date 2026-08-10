@@ -10,7 +10,9 @@ import test from 'node:test';
 import { initializeDatabase, openDatabase } from '../collab/database.js';
 import { GitError, GitRepository } from '../collab/git.js';
 import { CollaborationError, CollaborationService } from '../collab/service.js';
-import { createCollaborationHttpServer } from '../collab/http.js';
+import { createCollaborationHttpServer, createSessionActivity } from '../collab/http.js';
+import { authorizeOperation, type SessionActivity } from '../collab/operations.js';
+import { DISPATCH_CONTRACT_VERSION, type DispatchResult } from '../collab/dispatch.js';
 import { daemonRuntimePaths, readDaemonDescriptor, type DaemonDescriptor } from '../collab/runtime.js';
 import { SCHEMA_VERSION } from '../collab/schema.js';
 
@@ -29,10 +31,15 @@ function delay(ms: number): Promise<void> {
 }
 
 /** Builds the in-process HTTP server with fixed credentials, standing in for a real daemon. */
-function httpServer(service: CollaborationService, repository: GitRepository): Server {
+function httpServer(
+  service: CollaborationService,
+  repository: GitRepository,
+  sessionActivity?: SessionActivity,
+): Server {
   return createCollaborationHttpServer({
     service,
     repository,
+    sessionActivity,
     credentials: { agent: AGENT_TOKEN, browser: BROWSER_TOKEN },
     daemon: {
       url: 'http://127.0.0.1:0',
@@ -309,7 +316,17 @@ test('schema version 1 upgrades roles, reservations, operation linkage, findings
     const currentSessionIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'agent_sessions_current'")
       .get() as { name: string } | undefined;
-    assert.equal(version.user_version, 8);
+    const dispatchesTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'dispatches'")
+      .get() as { name: string } | undefined;
+    const dispatchBasisIndex = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'dispatches_basis'")
+      .get() as { name: string } | undefined;
+    const attemptColumns = db.prepare('PRAGMA table_info(operation_attempts)').all() as Array<{ name: string }>;
+    assert.equal(version.user_version, 9);
+    assert.equal(dispatchesTable?.name, 'dispatches');
+    assert.equal(dispatchBasisIndex?.name, 'dispatches_basis');
+    assert.ok(attemptColumns.some((column) => column.name === 'dispatch_id'));
     assert.equal(sessionsTable?.name, 'agent_sessions');
     assert.equal(currentSessionIndex?.name, 'agent_sessions_current');
     assert.ok(columns.some((column) => column.name === 'raised_by'));
@@ -2118,4 +2135,776 @@ test('a session replaced mid-request cannot finish the request it had already au
     await daemon.stop();
     fixture.close();
   }
+});
+
+/** A fourth model agent, so "roles exist but this agent holds none" is reachable at all. */
+function extraModelAgent(db: DatabaseSync, id: string): void {
+  db.prepare("INSERT INTO agents (id, name, kind, status) VALUES (?, ?, 'model', 'active')").run(id, id);
+}
+
+function expectKind<K extends DispatchResult['kind']>(
+  result: DispatchResult,
+  kind: K,
+): Extract<DispatchResult, { kind: K }> {
+  assert.equal(result.kind, kind, `expected a ${kind} result, got ${result.kind}`);
+  return result as Extract<DispatchResult, { kind: K }>;
+}
+
+function derive(service: CollaborationService, agent: string, taskId: string): DispatchResult {
+  return service.deriveDispatchForTask({ agent, taskId });
+}
+
+function taskVersion(db: DatabaseSync, taskId: string): number {
+  return Number((db.prepare('SELECT version FROM tasks WHERE id = ?').get(taskId) as { version: number }).version);
+}
+
+async function callOperation(
+  origin: string,
+  token: string,
+  operation: string,
+  input: Record<string, unknown>,
+): Promise<{ status: number; frames: Array<Record<string, unknown>> }> {
+  const response = await fetch(`${origin}/api/operations`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify({ operation, input }),
+  });
+  const body = (await response.text()).trim();
+  const frames = body ? body.split('\n').map((line) => JSON.parse(line) as Record<string, unknown>) : [];
+  return { status: response.status, frames };
+}
+
+test('every action row dispatches an obligation the service then permits', async () => {
+  const { service, db, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-ROWS', goal: 'Walk the action rows', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-ROWS');
+
+    // Row 2: open, three roles assigned.
+    const claim = expectKind(derive(service, 'codex', 'TASK-ROWS'), 'action');
+    assert.equal(claim.action.kind, 'claim');
+    assert.equal(claim.action.terminal_operation, 'task.claim');
+    assert.equal(claim.action.task_version, taskVersion(db, 'TASK-ROWS'));
+    assert.equal(claim.action.dispatch_contract_version, DISPATCH_CONTRACT_VERSION);
+    assert.equal(claim.action.repository_identity, repository.binding.identity);
+    for (const agent of ['claude', 'grok']) {
+      const pending = expectKind(derive(service, agent, 'TASK-ROWS'), 'waiting');
+      assert.equal(pending.actor, 'codex');
+      assert.equal(pending.action_kind, 'claim');
+      assert.equal(pending.reason, 'awaiting_actor');
+    }
+    // The binding direction: a dispatched action is one the service permits right now.
+    service.claimTask({
+      taskId: 'TASK-ROWS',
+      agent: 'codex',
+      expectedVersion: claim.action.task_version,
+      ttlSeconds: 900,
+    });
+
+    // Row 3: the implementer holds the live lease.
+    const implement = expectKind(derive(service, 'codex', 'TASK-ROWS'), 'action');
+    assert.equal(implement.action.kind, 'implement');
+    assert.equal(implement.action.terminal_operation, 'review.request');
+    const waitingOnImplementer = expectKind(derive(service, 'grok', 'TASK-ROWS'), 'waiting');
+    assert.equal(waitingOnImplementer.action_kind, 'implement');
+    assert.equal(waitingOnImplementer.actor, 'codex');
+    const candidate = repository.headCommit();
+    const review = service.requestReview({ taskId: 'TASK-ROWS', agent: 'codex', commit: candidate });
+
+    // Rows 6 and 7 are concurrent and address different agents, so both are actions at once.
+    const reviewAction = expectKind(derive(service, 'claude', 'TASK-ROWS'), 'action');
+    assert.equal(reviewAction.action.kind, 'review');
+    assert.equal(reviewAction.action.terminal_operation, 'review.submit');
+    assert.equal(reviewAction.action.review_id, String(review['id']));
+    assert.equal(reviewAction.action.candidate_commit, candidate);
+    const verifyAction = expectKind(derive(service, 'grok', 'TASK-ROWS'), 'action');
+    assert.equal(verifyAction.action.kind, 'verify');
+    assert.equal(verifyAction.action.terminal_operation, 'verification.run');
+    assert.deepEqual(verifyAction.action.check_ids, ['fixture']);
+    const implementerWaits = expectKind(derive(service, 'codex', 'TASK-ROWS'), 'waiting');
+    assert.equal(implementerWaits.actor, 'claude');
+    assert.equal(implementerWaits.action_kind, 'review');
+
+    await service.runVerification({ taskId: 'TASK-ROWS', agent: 'grok', commit: candidate, checkId: 'fixture' });
+    service.submitReview({ reviewId: String(review['id']), agent: 'claude', verdict: 'approved' });
+
+    // Row 9, and the shared-predicate obligation: gaps empty <=> row 9 <=> acceptance succeeds.
+    for (const agent of ['codex', 'claude', 'grok']) {
+      const awaitingHuman = expectKind(derive(service, agent, 'TASK-ROWS'), 'waiting');
+      assert.equal(awaitingHuman.actor, 'human');
+      assert.equal(awaitingHuman.action_kind, 'accept');
+      assert.equal(awaitingHuman.reason, 'awaiting_human_acceptance');
+    }
+    assert.equal(
+      service.acceptTask({ taskId: 'TASK-ROWS', actor: 'human', expectedVersion: taskVersion(db, 'TASK-ROWS') })['status'],
+      'accepted',
+    );
+
+    // Row 10.
+    for (const agent of ['codex', 'claude', 'grok']) {
+      assert.equal(expectKind(derive(service, agent, 'TASK-ROWS'), 'none').reason, 'task_terminal');
+    }
+  } finally {
+    close();
+  }
+});
+
+test('an unassigned task waits on the human before role membership is consulted', () => {
+  const { service, db, close } = harness();
+  try {
+    extraModelAgent(db, 'mistral');
+    service.createTask({ id: 'TASK-UNASSIGNED', goal: 'Wait for roles', acceptance: [], actor: 'human' });
+
+    // Row 1 precedes row 11: an agent with no role still reports the human obligation, because it
+    // may yet be the one assigned.
+    for (const agent of ['codex', 'claude', 'grok', 'mistral']) {
+      const pending = expectKind(derive(service, agent, 'TASK-UNASSIGNED'), 'waiting');
+      assert.equal(pending.actor, 'human');
+      assert.equal(pending.action_kind, 'assign_roles');
+      assert.equal(pending.reason, 'awaiting_roles');
+    }
+    assert.ok(
+      service.deriveDispatch({ agent: 'mistral' }).tasks.some((result) => result.task_id === 'TASK-UNASSIGNED'),
+      'an unassigned task concerns every model agent',
+    );
+
+    assignRoles(service, 'TASK-UNASSIGNED');
+
+    // Row 11, now that roles exist and this agent holds none.
+    assert.equal(expectKind(derive(service, 'mistral', 'TASK-UNASSIGNED'), 'none').reason, 'no_role');
+    assert.ok(
+      !service.deriveDispatch({ agent: 'mistral' }).tasks.some((result) => result.task_id === 'TASK-UNASSIGNED'),
+      'the envelope does not enumerate other agents’ tasks as no_role noise',
+    );
+    // Explicit inspection is never filtered, even when the envelope omits it.
+    assert.equal(expectKind(derive(service, 'mistral', 'TASK-UNASSIGNED'), 'none').reason, 'no_role');
+  } finally {
+    close();
+  }
+});
+
+test('a lease crossing its expiry changes the derived action while the task version does not move', () => {
+  const { service, db, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-TTL', goal: 'Cross a TTL', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-TTL');
+    service.claimTask({ taskId: 'TASK-TTL', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+
+    const held = expectKind(derive(service, 'codex', 'TASK-TTL'), 'action');
+    assert.equal(held.action.kind, 'implement');
+    const versionWhileHeld = taskVersion(db, 'TASK-TTL');
+
+    // The sharpest case in the contract: a dispatch-relevant change with no database mutation at
+    // all. A version-derived basis could not see this, which is why the basis stores the evaluated
+    // lease fact rather than a version.
+    db.prepare("UPDATE leases SET expires_at = '1970-01-01T00:00:00.000Z' WHERE task_id = ?").run('TASK-TTL');
+
+    const expired = expectKind(derive(service, 'codex', 'TASK-TTL'), 'action');
+    assert.equal(expired.action.kind, 'claim', 'row 3 becomes row 4 purely because the lease lapsed');
+    assert.equal(taskVersion(db, 'TASK-TTL'), versionWhileHeld, 'nothing about the task itself moved');
+    assert.notEqual(held.action.basis_digest, expired.action.basis_digest, 'the basis records which side it was on');
+    for (const agent of ['claude', 'grok']) {
+      const pending = expectKind(derive(service, agent, 'TASK-TTL'), 'waiting');
+      assert.equal(pending.action_kind, 'claim');
+      assert.equal(pending.actor, 'codex');
+    }
+    // Row 4 is dispatchable, so the service must permit the re-claim it names.
+    service.claimTask({
+      taskId: 'TASK-TTL',
+      agent: 'codex',
+      expectedVersion: expired.action.task_version,
+      ttlSeconds: 900,
+    });
+  } finally {
+    close();
+  }
+});
+
+test('a blocked task names the kind the implementer resumes with and addresses unblocking to nobody', () => {
+  const { service, db, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-BLOCKED', goal: 'Stall on a blocker', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-BLOCKED');
+    service.claimTask({ taskId: 'TASK-BLOCKED', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+    const blocker = service.addBlocker({
+      taskId: 'TASK-BLOCKED',
+      agent: 'codex',
+      description: 'The upstream contract is undecided.',
+    });
+
+    // Row 5: the lease survives the blocked interval, so clearing the blocker returns the
+    // implementer straight to work.
+    const withLease = expectKind(derive(service, 'codex', 'TASK-BLOCKED'), 'blocked');
+    assert.equal(withLease.action_kind, 'implement');
+    assert.equal(withLease.reason, 'task_blocked');
+    assert.deepEqual(withLease.refs['blocker_ids'], [String(blocker['id'])]);
+    // `resolveBlocker()` has no authority rule at all, so no actor can be named.
+    for (const agent of ['claude', 'grok']) {
+      const pending = expectKind(derive(service, agent, 'TASK-BLOCKED'), 'waiting');
+      assert.equal(pending.actor, null);
+      assert.equal(pending.action_kind, 'unblock');
+      assert.equal(pending.reason, 'awaiting_actor');
+    }
+
+    // Row 5a: the same blocker, but the lease has since lapsed, so a re-claim comes first.
+    db.prepare("UPDATE leases SET expires_at = '1970-01-01T00:00:00.000Z' WHERE task_id = ?").run('TASK-BLOCKED');
+    const withoutLease = expectKind(derive(service, 'codex', 'TASK-BLOCKED'), 'blocked');
+    assert.equal(withoutLease.action_kind, 'claim');
+    assert.equal(withoutLease.reason, 'task_blocked');
+  } finally {
+    close();
+  }
+});
+
+test('an approved review with an open blocking finding stalls with no model action to dispatch', async () => {
+  const { service, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-FINDING', goal: 'Stall on a finding', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-FINDING');
+    service.claimTask({ taskId: 'TASK-FINDING', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+    const candidate = repository.headCommit();
+    const review = service.requestReview({ taskId: 'TASK-FINDING', agent: 'codex', commit: candidate });
+    await service.runVerification({ taskId: 'TASK-FINDING', agent: 'grok', commit: candidate, checkId: 'fixture' });
+    service.addReviewFinding({
+      reviewId: String(review['id']),
+      agent: 'claude',
+      severity: 'blocking',
+      description: 'The lease is released before the candidate is durable.',
+    });
+    service.submitReview({ reviewId: String(review['id']), agent: 'claude', verdict: 'approved' });
+
+    // Row 8. `resolveReviewFinding()` authorizes the author *or* any human, flatly, so canonical
+    // state does not say who must act. The contract represents the gap instead of choosing.
+    for (const agent of ['codex', 'claude', 'grok']) {
+      const pending = expectKind(derive(service, agent, 'TASK-FINDING'), 'waiting');
+      assert.equal(pending.actor, null);
+      assert.equal(pending.action_kind, 'resolve_finding');
+      assert.equal(pending.reason, 'awaiting_actor');
+    }
+    assert.throws(
+      () => service.acceptTask({ taskId: 'TASK-FINDING', actor: 'human', expectedVersion: 3 }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'acceptance_gate',
+    );
+  } finally {
+    close();
+  }
+});
+
+test('a check-policy override waives the named checks and leaves the verifier without a command', async () => {
+  const fixture = createRepository(
+    JSON.stringify({ version: 1, checks: [{ id: 'broken', argv: ['node', '-e', 'process.exit(7)'] }] }),
+  );
+  const db = openDatabase(':memory:');
+  try {
+    initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
+    const service = new CollaborationService(db, fixture.repository);
+    service.createTask({ id: 'TASK-7A', goal: 'Waive a broken check', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-7A');
+    service.claimTask({ taskId: 'TASK-7A', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+    const candidate = fixture.repository.headCommit();
+    const review = service.requestReview({ taskId: 'TASK-7A', agent: 'codex', commit: candidate });
+    service.submitReview({ reviewId: String(review['id']), agent: 'claude', verdict: 'approved' });
+
+    // Row 7 first: the pinned check is still required, so it is dispatched by name.
+    const beforeOverride = expectKind(derive(service, 'grok', 'TASK-7A'), 'action');
+    assert.equal(beforeOverride.action.kind, 'verify');
+    assert.deepEqual(beforeOverride.action.check_ids, ['broken']);
+
+    const override = service.overrideCheckPolicy({
+      taskId: 'TASK-7A',
+      actor: 'human',
+      reason: 'The pinned check is deliberately broken at this base.',
+    });
+
+    // Row 7a: the named check is waived, but `acceptTask()` still demands independent verification
+    // and the policy no longer supplies a command for it. The kind is certain; only argv is not.
+    const stalled = expectKind(derive(service, 'grok', 'TASK-7A'), 'blocked');
+    assert.equal(stalled.action_kind, 'verify');
+    assert.equal(stalled.reason, 'verification_spec_required');
+    assert.equal(stalled.refs['override_id'], String(override['id']));
+    const implementerWaits = expectKind(derive(service, 'codex', 'TASK-7A'), 'waiting');
+    assert.equal(implementerWaits.action_kind, 'verify');
+    assert.equal(implementerWaits.actor, 'grok');
+
+    // Supplying the missing evidence closes the gap rather than nagging forever.
+    await service.runVerification({
+      taskId: 'TASK-7A',
+      agent: 'grok',
+      commit: candidate,
+      command: ['node', '-e', 'process.exit(0)'],
+    });
+    const awaitingHuman = expectKind(derive(service, 'grok', 'TASK-7A'), 'waiting');
+    assert.equal(awaitingHuman.action_kind, 'accept');
+    assert.equal(awaitingHuman.reason, 'awaiting_human_acceptance');
+    assert.equal(service.acceptTask({ taskId: 'TASK-7A', actor: 'human', expectedVersion: 3 })['status'], 'accepted');
+  } finally {
+    db.close();
+    fixture.close();
+  }
+});
+
+test('project pause reaches exactly the operations the service gates, and no further', async () => {
+  const { service, db, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-PAUSE', goal: 'Mirror the pause asymmetry', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-PAUSE');
+    service.claimTask({ taskId: 'TASK-PAUSE', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+    service.createTask({ id: 'TASK-PAUSE-OPEN', goal: 'Stay claimable', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-PAUSE-OPEN');
+    db.prepare("UPDATE project_state SET status = 'paused' WHERE singleton = 1").run();
+
+    // `claimTask()` consults `requireProjectActive()`, so row 2 becomes blocked...
+    const claimBlocked = expectKind(derive(service, 'codex', 'TASK-PAUSE-OPEN'), 'blocked');
+    assert.equal(claimBlocked.action_kind, 'claim');
+    assert.equal(claimBlocked.reason, 'project_paused');
+    assert.throws(
+      () => service.claimTask({ taskId: 'TASK-PAUSE-OPEN', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'project_paused',
+    );
+
+    // ...while `requestReview()` does not, so row 3 is unaffected and still dispatchable.
+    const stillImplementing = expectKind(derive(service, 'codex', 'TASK-PAUSE'), 'action');
+    assert.equal(stillImplementing.action.kind, 'implement');
+    const candidate = repository.headCommit();
+    const review = service.requestReview({ taskId: 'TASK-PAUSE', agent: 'codex', commit: candidate });
+    const stillReviewing = expectKind(derive(service, 'claude', 'TASK-PAUSE'), 'action');
+    assert.equal(stillReviewing.action.kind, 'review');
+    const stillVerifying = expectKind(derive(service, 'grok', 'TASK-PAUSE'), 'action');
+    assert.equal(stillVerifying.action.kind, 'verify');
+    await service.runVerification({ taskId: 'TASK-PAUSE', agent: 'grok', commit: candidate, checkId: 'fixture' });
+    service.submitReview({ reviewId: String(review['id']), agent: 'claude', verdict: 'approved' });
+
+    // Row 9a: the gaps are empty, but acceptance is awaiting a resume rather than a decision.
+    for (const agent of ['codex', 'claude', 'grok']) {
+      const pending = expectKind(derive(service, agent, 'TASK-PAUSE'), 'waiting');
+      assert.equal(pending.actor, 'human');
+      assert.equal(pending.action_kind, 'accept');
+      assert.equal(pending.reason, 'awaiting_project_resume');
+    }
+    assert.throws(
+      () => service.acceptTask({ taskId: 'TASK-PAUSE', actor: 'human', expectedVersion: 3 }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'project_paused',
+    );
+
+    // Resuming turns the same state into row 9, and acceptance then succeeds.
+    db.prepare("UPDATE project_state SET status = 'active' WHERE singleton = 1").run();
+    assert.equal(
+      expectKind(derive(service, 'codex', 'TASK-PAUSE'), 'waiting').reason,
+      'awaiting_human_acceptance',
+    );
+    assert.equal(service.acceptTask({ taskId: 'TASK-PAUSE', actor: 'human', expectedVersion: 3 })['status'], 'accepted');
+  } finally {
+    close();
+  }
+});
+
+test('a paused agent is blocked on its own action without blocking anyone else', () => {
+  const { service, db, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-AGENT-PAUSE', goal: 'Pause one agent', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-AGENT-PAUSE');
+    db.prepare("UPDATE agents SET status = 'paused' WHERE id = 'codex'").run();
+
+    const blocked = expectKind(derive(service, 'codex', 'TASK-AGENT-PAUSE'), 'blocked');
+    assert.equal(blocked.action_kind, 'claim');
+    assert.equal(blocked.reason, 'agent_paused');
+    assert.throws(
+      () => service.claimTask({ taskId: 'TASK-AGENT-PAUSE', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'agent_paused',
+    );
+    // The other roles still report the obligation as the implementer's, not as blocked for them.
+    const pending = expectKind(derive(service, 'claude', 'TASK-AGENT-PAUSE'), 'waiting');
+    assert.equal(pending.action_kind, 'claim');
+    assert.equal(pending.actor, 'codex');
+  } finally {
+    close();
+  }
+});
+
+test('defensive claim guards fire in the order claimTask rejects, and only on the claim path', () => {
+  const { service, db, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-C1', goal: 'Corrupt a reservation', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-C1');
+    // Structurally unreachable through the service: reservations are only ever created for the
+    // implementer. Written directly so the guard is executable rather than asserted-impossible.
+    db.prepare(
+      `INSERT INTO claim_reservations (task_id, agent_id, reason, created_at, expires_at)
+       VALUES (?, 'claude', 'revision', ?, ?)`,
+    ).run('TASK-C1', new Date().toISOString(), new Date(Date.now() + 3_600_000).toISOString());
+
+    const c1 = expectKind(derive(service, 'codex', 'TASK-C1'), 'blocked');
+    assert.equal(c1.action_kind, 'claim');
+    assert.equal(c1.reason, 'reservation_conflict');
+    assert.equal(c1.refs['reserved_for'], 'claude');
+    assert.throws(
+      () => service.claimTask({ taskId: 'TASK-C1', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'reservation_conflict',
+    );
+
+    // Revision 5: pause is tested before the conflict guards, because `claimTask()` rejects in that
+    // order. Deriving `reservation_conflict` here would name a barrier the service never reaches.
+    db.prepare("UPDATE project_state SET status = 'paused' WHERE singleton = 1").run();
+    const paused = expectKind(derive(service, 'codex', 'TASK-C1'), 'blocked');
+    assert.equal(paused.reason, 'project_paused', 'the dispatch reason names the barrier the service hits first');
+    assert.throws(
+      () => service.claimTask({ taskId: 'TASK-C1', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'project_paused',
+    );
+    db.prepare("UPDATE project_state SET status = 'active' WHERE singleton = 1").run();
+    db.prepare("UPDATE agents SET status = 'paused' WHERE id = 'codex'").run();
+    assert.equal(expectKind(derive(service, 'codex', 'TASK-C1'), 'blocked').reason, 'agent_paused');
+    assert.throws(
+      () => service.claimTask({ taskId: 'TASK-C1', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'agent_paused',
+    );
+    db.prepare("UPDATE agents SET status = 'active' WHERE id = 'codex'").run();
+
+    // C2: a live lease held by another agent, on a task the implementer would otherwise re-claim.
+    service.createTask({ id: 'TASK-C2', goal: 'Corrupt a lease', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-C2');
+    service.claimTask({ taskId: 'TASK-C2', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+    db.prepare("UPDATE leases SET agent_id = 'claude' WHERE task_id = ?").run('TASK-C2');
+    const c2 = expectKind(derive(service, 'codex', 'TASK-C2'), 'blocked');
+    assert.equal(c2.action_kind, 'claim');
+    assert.equal(c2.reason, 'lease_conflict');
+    assert.equal(c2.refs['lease_holder'], 'claude');
+    assert.throws(
+      () => service.claimTask({ taskId: 'TASK-C2', agent: 'codex', expectedVersion: 2, ttlSeconds: 900 }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'lease_conflict',
+    );
+
+    // Revision 5, second half: the guards belong to the claim branch. A corrupted reservation on an
+    // in-review task must not surface as a claim conflict the service would never evaluate.
+    service.createTask({ id: 'TASK-C3', goal: 'Corrupt a reservation in review', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-C3');
+    service.claimTask({ taskId: 'TASK-C3', agent: 'codex', expectedVersion: 1, ttlSeconds: 900 });
+    service.requestReview({ taskId: 'TASK-C3', agent: 'codex', commit: repository.headCommit() });
+    db.prepare(
+      `INSERT INTO claim_reservations (task_id, agent_id, reason, created_at, expires_at)
+       VALUES (?, 'grok', 'revision', ?, ?)`,
+    ).run('TASK-C3', new Date().toISOString(), new Date(Date.now() + 3_600_000).toISOString());
+    const reviewing = expectKind(derive(service, 'claude', 'TASK-C3'), 'action');
+    assert.equal(reviewing.action.kind, 'review');
+    const verifying = expectKind(derive(service, 'grok', 'TASK-C3'), 'action');
+    assert.equal(verifying.action.kind, 'verify');
+    const implementerWaiting = expectKind(derive(service, 'codex', 'TASK-C3'), 'waiting');
+    assert.equal(implementerWaiting.action_kind, 'review');
+  } finally {
+    close();
+  }
+});
+
+test('a dispatch record is keyed on the session while its basis covers workflow state alone', () => {
+  const { service, db, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-RECORD', goal: 'Record a delivery', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-RECORD');
+    const opened = service.openSession('codex');
+    const session = { sessionId: String(opened.session['id']), agentId: 'codex' };
+
+    const issued = service.issueDispatch({ agent: 'codex', taskId: 'TASK-RECORD', session, workInFlight: false });
+    assert.equal(issued.result.kind, 'action');
+    assert.ok(issued.dispatch);
+    assert.equal(issued.dispatch?.['action_kind'], 'claim');
+    assert.equal(issued.dispatch?.['terminal_operation'], 'task.claim');
+    assert.equal(issued.dispatch?.['dispatch_contract_version'], DISPATCH_CONTRACT_VERSION);
+    assert.equal(issued.dispatch?.['session_id'], session.sessionId);
+    assert.equal(issued.dispatch?.['agent_id'], 'codex');
+
+    // Reading is free: derivation writes nothing, however often it is polled.
+    for (let poll = 0; poll < 5; poll += 1) service.deriveDispatch({ agent: 'codex' });
+    // And an equivalent poll of the issuing operation returns the delivery already recorded.
+    const repeated = service.issueDispatch({ agent: 'codex', taskId: 'TASK-RECORD', session, workInFlight: false });
+    assert.equal(repeated.dispatch?.['id'], issued.dispatch?.['id']);
+    assert.equal(
+      Number((db.prepare('SELECT count(*) AS count FROM dispatches').get() as { count: number }).count),
+      1,
+      'unchanged workflow state polled by the same session is one delivery, not many',
+    );
+
+    // Step 7 recovery: the durable agent owns the workflow, the session owns the delivery. The same
+    // obligation reaching a replacement session is a new, separately attributable delivery.
+    db.prepare("UPDATE agent_sessions SET last_heartbeat_at = '1970-01-01T00:00:00.000Z' WHERE id = ?").run(
+      session.sessionId,
+    );
+    const replacement = service.replaceSession({ agentId: 'codex', reason: 'the agent process was restarted' });
+    const nextSession = { sessionId: String(replacement.session['id']), agentId: 'codex' };
+    const afterRecovery = service.issueDispatch({
+      agent: 'codex',
+      taskId: 'TASK-RECORD',
+      session: nextSession,
+      workInFlight: false,
+    });
+    assert.notEqual(afterRecovery.dispatch?.['id'], issued.dispatch?.['id']);
+    assert.equal(
+      afterRecovery.dispatch?.['basis_digest'],
+      issued.dispatch?.['basis_digest'],
+      'the digest is a statement about the task, so it survives the recovery unchanged',
+    );
+    assert.equal(afterRecovery.dispatch?.['session_id'], nextSession.sessionId);
+    assert.equal(Number((db.prepare('SELECT count(*) AS count FROM dispatches').get() as { count: number }).count), 2);
+
+    // The contract version is part of the key, so a derivation change can re-dispatch state that has
+    // not otherwise moved rather than colliding with the pre-change delivery.
+    db.prepare('UPDATE dispatches SET dispatch_contract_version = 0 WHERE id = ?').run(
+      String(afterRecovery.dispatch?.['id']),
+    );
+    const afterVersionChange = service.issueDispatch({
+      agent: 'codex',
+      taskId: 'TASK-RECORD',
+      session: nextSession,
+      workInFlight: false,
+    });
+    assert.notEqual(afterVersionChange.dispatch?.['id'], afterRecovery.dispatch?.['id']);
+    assert.equal(Number((db.prepare('SELECT count(*) AS count FROM dispatches').get() as { count: number }).count), 3);
+
+    // The record explains itself: re-running the table against the stored basis is possible because
+    // the basis is stored, and the digest pins it.
+    const stored = db.prepare('SELECT * FROM dispatches WHERE id = ?').get(String(issued.dispatch?.['id'])) as Record<string, unknown>;
+    const basis = JSON.parse(String(stored['basis_json'])) as Record<string, unknown>;
+    assert.equal(basis['task_status'], 'open');
+    assert.equal(basis['role'], 'implementer');
+    assert.equal(basis['project_status'], 'active');
+    assert.ok(!Object.hasOwn(basis, 'issued_at'), 'the captured instant is not part of the basis');
+    assert.ok(!Object.hasOwn(basis, 'session_id'), 'the basis is workflow state alone');
+    assert.ok(Object.hasOwn(stored, 'issued_at') && stored['issued_at']);
+  } finally {
+    close();
+  }
+});
+
+test('a session busy with accepted work is live but not deliverable', () => {
+  const fixture = createRepository();
+  const db = openDatabase(':memory:');
+  const busy = new Set<string>();
+  try {
+    initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
+    const service = new CollaborationService(db, fixture.repository, {
+      hasWorkInFlight: (sessionId) => busy.has(sessionId),
+    });
+    service.createTask({ id: 'TASK-BUSY', goal: 'Refuse a second delivery', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-BUSY');
+    const opened = service.openSession('codex');
+    const session = { sessionId: String(opened.session['id']), agentId: 'codex' };
+
+    const quiet = service.deriveDispatch({ agent: 'codex' });
+    assert.equal(quiet.session.liveness, 'live');
+    assert.equal(quiet.session.work_in_flight, false);
+    assert.equal(quiet.deliverable, true);
+
+    busy.add(session.sessionId);
+    const working = service.deriveDispatch({ agent: 'codex' });
+    // Step 7 reports work in flight *as* liveness, which is exactly why liveness alone is not enough.
+    assert.equal(working.session.liveness, 'live');
+    assert.equal(working.session.work_in_flight, true);
+    assert.equal(working.deliverable, false, 'both facts are required, which is why step 7 kept them separate');
+    // Derivation itself is never gated: reading obligations is legitimate while working.
+    assert.ok(working.tasks.length > 0);
+
+    assert.throws(
+      () => service.issueDispatch({ agent: 'codex', taskId: 'TASK-BUSY', session, workInFlight: true }),
+      (error: unknown) => error instanceof CollaborationError && error.code === 'session_busy',
+    );
+    assert.equal(Number((db.prepare('SELECT count(*) AS count FROM dispatches').get() as { count: number }).count), 0);
+
+    busy.delete(session.sessionId);
+    assert.ok(service.issueDispatch({ agent: 'codex', taskId: 'TASK-BUSY', session, workInFlight: false }).dispatch);
+  } finally {
+    db.close();
+    fixture.close();
+  }
+});
+
+test('an issuing request reads the work-in-flight flag sampled before it registered its own', async () => {
+  const fixture = createRepository();
+  const db = openDatabase(':memory:');
+  const sessionActivity = createSessionActivity();
+  try {
+    initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
+    const service = new CollaborationService(db, fixture.repository, {
+      hasWorkInFlight: (sessionId) => sessionActivity.busy(sessionId),
+    });
+    service.createTask({ id: 'TASK-SAMPLE', goal: 'Sample before registering', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-SAMPLE');
+    const opened = service.openSession('codex');
+    const sessionId = String(opened.session['id']);
+    const server = httpServer(service, fixture.repository, sessionActivity);
+    await new Promise<void>((listening) => server.listen(0, '127.0.0.1', listening));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const origin = `http://127.0.0.1:${address.port}`;
+    try {
+      // `dispatch.issue` is mutating, so the transport marks this very session busy before the
+      // operation body runs. Reading the live flag would make every issue refuse itself.
+      const issued = await callOperation(origin, opened.token, 'dispatch.issue', {
+        agent: 'codex',
+        task: 'TASK-SAMPLE',
+      });
+      assert.equal(issued.status, 200);
+      const result = issued.frames.at(-1);
+      assert.equal(result?.['type'], 'result', JSON.stringify(result));
+      const value = result?.['value'] as { dispatch: Record<string, unknown> | null };
+      assert.ok(value.dispatch, 'a quiet session is deliverable even though the request itself is tracked');
+
+      // A session genuinely busy with other accepted work is refused, which is the fact the
+      // sampling exists to preserve rather than erase.
+      sessionActivity.begin(sessionId);
+      try {
+        const refused = await callOperation(origin, opened.token, 'dispatch.issue', {
+          agent: 'codex',
+          task: 'TASK-SAMPLE',
+        });
+        const failure = refused.frames.at(-1);
+        assert.equal(failure?.['type'], 'error');
+        assert.equal(failure?.['code'], 'session_busy');
+      } finally {
+        sessionActivity.end(sessionId);
+      }
+    } finally {
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  } finally {
+    db.close();
+    fixture.close();
+  }
+});
+
+test('an echoed dispatch id is attached only when it matches the agent, resolved task, and operation', async () => {
+  const { service, db, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-CAUSAL', goal: 'Close the causal loop', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-CAUSAL');
+    service.createTask({ id: 'TASK-OTHER', goal: 'Hold a foreign dispatch', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-OTHER');
+    const codexSession = { sessionId: String(service.openSession('codex').session['id']), agentId: 'codex' };
+    const claudeSession = { sessionId: String(service.openSession('claude').session['id']), agentId: 'claude' };
+
+    const claimDispatch = service.issueDispatch({
+      agent: 'codex',
+      taskId: 'TASK-CAUSAL',
+      session: codexSession,
+      workInFlight: false,
+    }).dispatch;
+    const foreignDispatch = service.issueDispatch({
+      agent: 'codex',
+      taskId: 'TASK-OTHER',
+      session: codexSession,
+      workInFlight: false,
+    }).dispatch;
+    assert.ok(claimDispatch && foreignDispatch);
+
+    const attemptFor = (operation: string, subjectId: string): Record<string, unknown> =>
+      db
+        .prepare(
+          `SELECT * FROM operation_attempts WHERE operation = ? AND subject_id = ?
+           ORDER BY started_at DESC, id DESC LIMIT 1`,
+        )
+        .get(operation, subjectId) as Record<string, unknown>;
+
+    // A dispatch for another task must not manufacture provenance, and must not cost the work.
+    service.claimTask({
+      taskId: 'TASK-CAUSAL',
+      agent: 'codex',
+      expectedVersion: 1,
+      ttlSeconds: 900,
+      dispatchId: String(foreignDispatch['id']),
+    });
+    assert.equal(attemptFor('task.claim', 'TASK-CAUSAL')['dispatch_id'], null);
+    assert.equal(attemptFor('task.claim', 'TASK-CAUSAL')['outcome'], 'accepted');
+
+    const candidate = repository.headCommit();
+    const implementDispatch = service.issueDispatch({
+      agent: 'codex',
+      taskId: 'TASK-CAUSAL',
+      session: codexSession,
+      workInFlight: false,
+    }).dispatch;
+    assert.equal(implementDispatch?.['action_kind'], 'implement');
+    // A real id for the wrong terminal operation is refused just as firmly.
+    service.requestReview({
+      taskId: 'TASK-CAUSAL',
+      agent: 'codex',
+      commit: candidate,
+      dispatchId: String(claimDispatch['id']),
+    });
+    assert.equal(attemptFor('review.request', 'TASK-CAUSAL')['dispatch_id'], null);
+
+    // The matching case: agent, resolved task, and terminal operation all agree.
+    const reviewDispatch = service.issueDispatch({
+      agent: 'claude',
+      taskId: 'TASK-CAUSAL',
+      session: claudeSession,
+      workInFlight: false,
+    }).dispatch;
+    assert.equal(reviewDispatch?.['action_kind'], 'review');
+    const review = db.prepare('SELECT id FROM reviews WHERE task_id = ?').get('TASK-CAUSAL') as { id: string };
+    service.submitReview({
+      reviewId: review.id,
+      agent: 'claude',
+      verdict: 'approved',
+      dispatchId: String(reviewDispatch?.['id']),
+    });
+    // `review.submit` records `subjectType: 'review'` and reaches the task through the review row,
+    // so a blind comparison against the ledger subject would never attach this edge at all.
+    const submitAttempt = attemptFor('review.submit', review.id);
+    assert.equal(submitAttempt['dispatch_id'], String(reviewDispatch?.['id']));
+    assert.equal(submitAttempt['subject_type'], 'review');
+
+    // An unknown id is advisory in the same direction: no provenance, no refusal.
+    await service.runVerification({
+      taskId: 'TASK-CAUSAL',
+      agent: 'grok',
+      commit: candidate,
+      checkId: 'fixture',
+      dispatchId: 'dispatch-does-not-exist',
+    });
+    assert.equal(attemptFor('verification.run', 'TASK-CAUSAL')['dispatch_id'], null);
+    assert.equal(attemptFor('verification.run', 'TASK-CAUSAL')['outcome'], 'accepted');
+  } finally {
+    close();
+  }
+});
+
+test('a derivation that fails to reduce is returned intact and recorded as a rejected attempt', () => {
+  const { service, db, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-PARTIAL', goal: 'Break the role invariant', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-PARTIAL');
+    const session = { sessionId: String(service.openSession('codex').session['id']), agentId: 'codex' };
+    // Roles are inserted as one atomic set, so a partial set is a harness defect rather than a state
+    // the workflow can reach. The contract says so out loud instead of guessing an action.
+    db.prepare("DELETE FROM task_roles WHERE task_id = ? AND role = 'verifier'").run('TASK-PARTIAL');
+
+    const derived = expectKind(derive(service, 'codex', 'TASK-PARTIAL'), 'indeterminate');
+    assert.deepEqual(derived.candidates, []);
+    assert.equal(derived.basis['role_count'], 2);
+
+    const issued = service.issueDispatch({ agent: 'codex', taskId: 'TASK-PARTIAL', session, workInFlight: false });
+    assert.equal(issued.result.kind, 'indeterminate', 'the result is returned unchanged');
+    assert.equal(issued.dispatch, null, 'and nothing is recorded as delivered');
+    const attempt = db
+      .prepare("SELECT * FROM operation_attempts WHERE operation = 'dispatch.issue' ORDER BY started_at DESC LIMIT 1")
+      .get() as Record<string, unknown>;
+    assert.equal(attempt['outcome'], 'rejected');
+    assert.equal(attempt['reason_code'], 'dispatch_indeterminate');
+  } finally {
+    close();
+  }
+});
+
+test('derivation may be inspected by control for any agent, but by a session only for itself', () => {
+  const definition = { mutating: false, identityOrControl: 'agent', invoke: () => null };
+  const control = { kind: 'control', agentId: 'human' } as const;
+  const claude = { kind: 'session', agentId: 'claude', sessionId: 'session-1' } as const;
+
+  // `control: true` would reject sessions outright, and `identity` would compare against the literal
+  // 'human' a control principal carries — so neither existing rule can express this on its own.
+  assert.doesNotThrow(() => authorizeOperation(definition, control, { agent: 'codex' }));
+  assert.doesNotThrow(() => authorizeOperation(definition, claude, { agent: 'claude' }));
+  assert.throws(
+    () => authorizeOperation(definition, claude, { agent: 'codex' }),
+    (error: unknown) => error instanceof CollaborationError && error.code === 'identity_mismatch',
+    'a session deriving for another agent would silently weaken the identity binding step 7 established',
+  );
 });

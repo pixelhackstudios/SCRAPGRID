@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
@@ -183,7 +183,34 @@ CREATE TABLE IF NOT EXISTS managed_worktrees (
   updated_at TEXT NOT NULL
 );
 
+-- What one agent was told to do on one task at one instant, and the canonical facts that implied it.
+--
+-- A row exists only where an action was issued to a deliverable session, so this table is the
+-- delivery record rather than a poll log. basis_json is immutable historical evidence: it is never
+-- read as current authority and never fed back into derivation, and it is expected to disagree with
+-- the domain tables as those move on. dispatch_contract_version names the derivation function that
+-- consumed it, because the stored inputs only explain the answer if the function is known too.
+CREATE TABLE IF NOT EXISTS dispatches (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  action_kind TEXT NOT NULL CHECK (action_kind IN ('claim', 'implement', 'review', 'verify')),
+  terminal_operation TEXT NOT NULL,
+  dispatch_contract_version INTEGER NOT NULL,
+  repository_identity TEXT NOT NULL,
+  base_commit TEXT NOT NULL,
+  candidate_commit TEXT,
+  review_id TEXT REFERENCES reviews(id),
+  subject_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(subject_json)),
+  basis_json TEXT NOT NULL CHECK (json_valid(basis_json)),
+  basis_digest TEXT NOT NULL,
+  issued_at TEXT NOT NULL
+);
+
 -- Actor and subject identifiers are deliberately not foreign keys: rejected attempts may name unknown targets.
+-- dispatch_id is the exception and does carry one, because it is attached only after the referenced
+-- dispatch has been validated against the authenticated agent, the resolved task, and the operation.
 CREATE TABLE IF NOT EXISTS operation_attempts (
   id TEXT PRIMARY KEY,
   operation TEXT NOT NULL,
@@ -193,6 +220,7 @@ CREATE TABLE IF NOT EXISTS operation_attempts (
   outcome TEXT CHECK (outcome IN ('accepted', 'rejected', 'failed', 'abandoned')),
   reason_code TEXT,
   error_class TEXT,
+  dispatch_id TEXT REFERENCES dispatches(id),
   started_at TEXT NOT NULL,
   completed_at TEXT
 );
@@ -224,4 +252,13 @@ CREATE INDEX IF NOT EXISTS reviews_task_commit ON reviews(task_id, commit_sha);
 CREATE INDEX IF NOT EXISTS verifications_task_commit ON verifications(task_id, commit_sha);
 CREATE INDEX IF NOT EXISTS check_policy_overrides_task_commit
   ON check_policy_overrides(task_id, repository_identity, candidate_commit);
+
+-- Idempotency is keyed on the session, never the durable agent: unchanged workflow state re-polled by
+-- the same session returns the existing row, while a replacement session is a separately attributable
+-- delivery of the same obligation. The contract version joins the key because a derivation change must
+-- be allowed to re-dispatch state that has not otherwise moved.
+CREATE UNIQUE INDEX IF NOT EXISTS dispatches_basis
+  ON dispatches(session_id, task_id, dispatch_contract_version, basis_digest);
+CREATE INDEX IF NOT EXISTS dispatches_agent ON dispatches(agent_id, task_id, issued_at);
+CREATE INDEX IF NOT EXISTS operation_attempts_dispatch ON operation_attempts(dispatch_id);
 `;

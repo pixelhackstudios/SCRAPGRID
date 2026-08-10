@@ -9,6 +9,15 @@ contract, and the durable dispatch record. Document 04 governs scope; where this
 
 Baseline scanned: `9587195`, schema version 8.
 
+**Revision 5 (narrow correction, proven by implementation).** The defensive claim guards move *inside* the
+claim branch and are evaluated in the order `claimTask()` actually rejects (§3, §3.11). They were previously
+listed as a global precedence step ahead of rows 2–9a, which contradicted §6.1's requirement that a dispatch
+reason naming a service rejection matches the service's own code: in a state that was both paused and
+conflict-corrupted, this document said `reservation_conflict` while `claimTask()` says `project_paused`, and a
+corrupted reservation on a `blocked` or `in_review` task could surface as a claim conflict the service would
+never evaluate. Nothing else about the guards changes — they remain defensive, structurally unreachable under
+the role invariants, and named rather than assumed away.
+
 **Revision 4 (literal).** Row 5 names the implementer's blocked `action_kind` (§3, §3.5); the two
 structurally unreachable claim conflicts become executable defensive branches (§3.11); and `dispatch_id`
 attachment compares the terminal operation's *resolved task* rather than its ledger subject (§5.4).
@@ -127,8 +136,9 @@ Read per (agent, task). `L` = a row in `leases` for the task with `expires_at > 
 2. no `task_roles` rows exist for the task → row 1  *(before role membership: the workflow is waiting on the
    human, and this agent may yet be assigned)*
 3. this agent holds no `task_roles` row → row 11
-4. defensive claim guards → rows C1, C2 (§3.11)
-5. otherwise, by `tasks.status` → rows 2–9a
+4. otherwise, by `tasks.status` → rows 2–9a
+
+Where rows 2 or 4 derive `claim`, that branch is then resolved in the order `claimTask()` rejects (§3.11).
 
 Cells use `waiting(actor, action_kind)` shorthand; the reason is `awaiting_actor` unless the cell names one.
 A `null` actor means canonical state cannot address the obligation to anyone (rows 5 and 8).
@@ -295,12 +305,27 @@ rule with no row able to produce them. Worse, if either state ever *did* exist, 
 `claim` into a service that rejects it — breaking the one-way property in §6.1, which is the contract's
 load-bearing guarantee.
 
-So they become real branches, evaluated before rows 2 and 4:
+So they become real branches — but *within* the claim branch, not ahead of it. Reaching them already means the
+table has derived that `claim` is this agent's obligation, so the guards resolve in the order `claimTask()`
+itself rejects (`collab/service.ts`: `requireProjectActive()`, then `requireAgent()`, then the reservation
+check, then the lease check):
 
 | # | Guard | Result |
 |---|---|---|
+| — | project is paused | `blocked(claim, project_paused)` |
+| — | this agent is paused | `blocked(claim, agent_paused)` |
 | C1 | active `claim_reservations` row for the task owned by another agent | `blocked(claim, reservation_conflict, {reserved_for})` |
 | C2 | live lease on the task held by another agent | `blocked(claim, lease_conflict, {lease_holder})` |
+| — | otherwise | **`claim`** |
+
+Both parts of the placement are load-bearing, and revision 4's global ordering got both wrong:
+
+- **Pause precedes the conflict guards**, because the service tests it first. Deriving `reservation_conflict`
+  for a paused project would name a barrier `claimTask()` never reaches, breaking the §6.1 clause that pins
+  dispatch's reason vocabulary to the service's `CollaborationError.code`.
+- **The guards belong to the claim branch only.** As a global precedence step they would fire on a `blocked` or
+  `in_review` task whose reservation or lease row was corrupted, reporting a claim conflict for a task the
+  service would refuse on its status long before it looked at either row.
 
 They cost two comparisons against rows the derivation already reads. Neither should fire under the role
 invariants; if one does, Pilot 002 has caught an authority regression with a named reason code rather than

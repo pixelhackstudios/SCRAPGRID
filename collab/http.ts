@@ -290,6 +290,12 @@ async function streamOperation(
   // Only accepted mutations make a session unreplaceable. Reads cannot leave canonical state
   // half-written, and treating them as work in flight would make recovery hostage to polling.
   const tracked = principal.kind === 'session' && definition.mutating;
+  // Sampled before this request registers its own activity. An issuing operation is mutating, so it
+  // marks its own session busy below and would otherwise always observe itself as work in flight —
+  // which would make a busy session indistinguishable from a quiet one at exactly the moment the
+  // distinction decides whether a second action may be delivered.
+  const sessionWorkInFlight =
+    principal.kind === 'session' ? (sessionActivity?.busy(principal.sessionId) ?? false) : undefined;
   if (tracked) sessionActivity?.begin(principal.sessionId);
 
   response.writeHead(200, {
@@ -303,7 +309,10 @@ async function streamOperation(
   keepalive.unref();
   try {
     const onOutput = (stream: OutputStream, data: string): void => write({ type: 'output', stream, data });
-    write({ type: 'result', value: await definition.invoke({ ...context, principal, onOutput }, input) });
+    write({
+      type: 'result',
+      value: await definition.invoke({ ...context, principal, sessionWorkInFlight, onOutput }, input),
+    });
   } catch (error) {
     if (error instanceof CollaborationError || error instanceof GitError) {
       write({ type: 'error', code: error.code, message: error.message });

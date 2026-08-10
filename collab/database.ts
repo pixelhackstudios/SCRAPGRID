@@ -101,6 +101,10 @@ export function initializeDatabase(db: DatabaseSync, repository: RepositoryBindi
                SET raised_by = (SELECT reviewer FROM reviews WHERE reviews.id = review_findings.review_id)
                WHERE raised_by IS NULL`);
     }
+    const attemptColumns = db.prepare('PRAGMA table_info(operation_attempts)').all() as Array<{ name: string }>;
+    if (!attemptColumns.some((column) => column.name === 'dispatch_id')) {
+      db.exec('ALTER TABLE operation_attempts ADD COLUMN dispatch_id TEXT REFERENCES dispatches(id)');
+    }
     const eventColumns = db.prepare('PRAGMA table_info(events)').all() as Array<{ name: string }>;
     if (!eventColumns.some((column) => column.name === 'operation_id')) {
       db.exec('ALTER TABLE events ADD COLUMN operation_id TEXT REFERENCES operation_attempts(id)');
