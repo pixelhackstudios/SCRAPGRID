@@ -21,9 +21,9 @@ while the collaboration service remains the authoritative truth and coordination
 4. **Base-pinned required-check policy + explicit human override**
    - **COMPLETE** — `20ce79b0039009d715983528b1fdb2b236d7dc5f`
 5. **Temporary task roles**
-   - **NEXT**
+   - **COMPLETE** — `7636555a000f3fba3d75491605fb9a97e8b214e4`
 6. **`collabd`**
-   - **PENDING**
+   - **NEXT**
 7. **Sessions / heartbeat / recovery**
    - **PENDING**
 8. **Deterministic dispatcher**
