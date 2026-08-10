@@ -162,7 +162,7 @@ npm run collab -- proposal reveal TASK-001 --actor human
 npm run collab -- task claim TASK-001 --agent codex --expected-version 1
 npm run collab -- message send --from codex --to claude --task TASK-001 --body "Candidate is ready."
 npm run collab -- review request TASK-001 --agent codex --commit "$(git rev-parse HEAD)"
-npm run collab -- verify TASK-001 --agent claude --commit "$(git rev-parse HEAD)" --check quality
+npm run collab -- verify TASK-001 --agent grok --commit "$(git rev-parse HEAD)" --check quality
 ```
 
 `verify --check ID` resolves the named argv from the task's base-pinned `.scrapgrid/checks.json`. An explicit
