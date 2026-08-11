@@ -11,6 +11,16 @@ wrong.
 
 Baseline scanned: `2ef4a7a`, schema version 9.
 
+**Revision 2 (review finding, blocking).** The load-bearing property was scoped too broadly, and §12
+inherited the error as an impossible test obligation. Revision 1 asked every bundle-changing operation to
+leave `dispatches.id` unchanged, but roughly half of them — `task.claim`, `review.submit`,
+`check_policy.override`, and the rest — are *supposed* to move workflow state, and a dispatch identity that
+survived `task.claim` would mean step 8 was broken. The property is now stated over the class it was always
+about: changes that alter selected context while leaving step 8's `DispatchFacts` alone (§6, §6.2, §12).
+Separately, P1 no longer claims injectivity of SHA-256, which no fixed-width digest has (§6); a
+`context_bundles` row is named as one distinct content record rather than one delivery (§7); and
+`context_bundles` itself is written into the fixpoint exclusion (§6.3).
+
 **Revision 1.** First freeze. Nothing accepted yet.
 
 The question this document answers:
@@ -18,13 +28,22 @@ The question this document answers:
 > What is the minimum deterministic snapshot of shared coordination truth an agent needs to carry out an
 > already-issued dispatch, such that exactly what it received can later be reconstructed by identity?
 
-And the property it must make true, which is to step 9 what `ACTION ⇒ the service permits it` was to step 8:
+And the property it must make true, which is to step 9 what `ACTION ⇒ the service permits it` was to step 8.
+Canonical changes fall into exactly three classes with respect to one (agent, task), and the property names
+all three:
 
-> **Every canonical change that should alter what this agent knows changes the bundle digest without
-> altering dispatch identity, and every canonical change that is irrelevant or invisible to this agent
-> leaves the bundle digest unchanged.**
+> **Context-only** — a change that alters the selected context but leaves step 8's `DispatchFacts`
+> unchanged **must** change the bundle digest and **must not** produce a new dispatch.
+>
+> **Workflow** — a change that alters `DispatchFacts` may legitimately produce a new dispatch, a different
+> action, or no action at all; step 9 must never be the *cause* of that movement, and where an action is
+> still delivered its bundle reflects the new state.
+>
+> **Neither** — a change that is irrelevant or invisible to this agent leaves the bundle digest and the
+> dispatch alike unchanged.
 
-Sections 4, 6, and 6.2 exist to make that sentence checkable rather than aspirational.
+The first class is the one step 9 exists for and the one nothing in step 8 can express. Sections 4, 6, and
+6.2 exist to make all three checkable rather than aspirational.
 
 ---
 
@@ -348,23 +367,31 @@ Reuse `canonicalJson()` and the SHA-256 path step 8 already has (`collab/dispatc
 conformance, and not a new dependency: one implementation and one versioned contract is the property that
 matters, and a second canonicalizer would be a second answer to a question that must have one.
 
-Write the contract as two properties over the selection function `S(agent, task, state)`:
+Write the contract as three properties over the selection function `S(agent, task, state)`:
 
-- **P1 — sensitivity.** If `S` differs in content, the digest differs. This is injectivity of the
-  serialization, and it follows from §5.1 (literal values, not ids) plus canonical serialization.
+- **P1 — sensitivity.** If `S` differs in content, its canonical serialization differs in bytes. This
+  follows from §5.1 (literal values, not ids) plus canonical serialization over the restricted value domain
+  of §5. Bundle identity is the SHA-256 digest of those bytes, and **collision resistance is assumed** for
+  identity purposes. It is not injectivity: no fixed 256-bit function is injective over arbitrary-length
+  input, and a contract that claimed otherwise would be claiming something false. What the suite asserts is
+  that each concrete sensitivity mutation moves the digest, not that no collision exists.
 - **P2 — stability.** If `S` is unchanged, the digest is unchanged. This follows only from what is
   *excluded*: no clock (§4.7), no counters, no presence, no delivery metadata, no row-order dependence.
+- **P3 — non-interference.** No change visible to `S` and invisible to `DispatchFacts` may alter the
+  dispatch. This is structural rather than statistical: `deriveDispatchResult()` takes `DispatchFacts` and
+  nothing else (`collab/dispatch.ts:168-194`), that record contains no message, decision, proposal, or
+  bundle, and §2 forbids context from reaching `basis_json` or the dispatch idempotency key. P3 is why the
+  bundle can move while the obligation stands still.
 
-Stated that way, the load-bearing sentence in the header decomposes cleanly. P1 is "every change that should
-alter what the agent knows changes the digest", **given** that `S` is the right selection; P2 is "every
-change irrelevant or invisible leaves it unchanged." §3 and §4 are the argument that `S` is the right
-selection, and §6.2 is the enumeration that makes both directions checkable.
+P1 and P2 are properties of the digest. P3 is a property of the *boundary between* step 8 and step 9, and it
+is the one the header's context-only class rests on. §3 and §4 are the argument that `S` is the right
+selection; §6.2 is the enumeration that makes all three checkable.
 
-The second half of the sentence — *without altering dispatch identity* — is not a property of the digest at
-all. It holds because the bundle is never an input to derivation: §2 forbids context in `basis_json` and in
-the dispatch idempotency key, so no bundle-visible change can reach `deriveDispatchResult()`, whose inputs
-are exactly `DispatchFacts` (`collab/dispatch.ts:168-194`). The dispatcher consults nothing outside `facts`,
-and `facts` contains no message, decision, proposal, or bundle.
+**P3 is not the claim that a bundle change implies dispatch stability.** Most canonical changes move both,
+and are supposed to: `task.claim` changes the task version, the status, and the lease, so the next dispatch
+is a different obligation with a different basis, and a `dispatches.id` that survived it would mean step 8
+had stopped observing the workflow. P3 constrains only the direction step 9 could break — context leaking
+into derivation — and says nothing about workflow changes moving both records at once.
 
 ### 6.1 Two agents, two digests
 
@@ -374,37 +401,51 @@ the digest deliberately does *not* depend on is the session, which is what makes
 
 ### 6.2 Change classes, enumerated
 
-Every mutating operation in `collab/operations.ts`, against the bundle of agent `A` on task `T`. This is the
-step 9 analogue of Doc 05 §1's operation table, and it is the table the test suite in §12 is written from.
+Every mutating operation in `collab/operations.ts`, against agent `A` on task `T`, on **two independent
+axes**: does it change the bundle selection `S`, and does it change step 8's `DispatchFacts`? Collapsing
+those into one column is what produced revision 1's impossible test obligation. This is the step 9 analogue
+of Doc 05 §1's operation table, and it is the table §12 is written from.
 
-| Operation | Changes A's bundle for T | Why |
-|---|---|---|
-| `sync` | **no** | writes `agents.last_seen_at` only (`collab/service.ts:859`); presence is excluded (§3) |
-| `session.open` / `close` / `replace` / `heartbeat` | **no** | delivery identity, not content (§7.1) |
-| `worktree.bootstrap` | **no** | `managed_worktrees` excluded (§3) |
-| `task.create` | **no** | another task; per-task independence (§4.1) |
-| `task.assign_roles` on T | **yes** | `roles` — and the dispatch basis too |
-| `task.claim` on T | **yes** | status, version, lease — and the dispatch basis too |
-| `proposal.submit` on T | **no** | sealed proposals are invisible (§4.3) |
-| `proposal.reveal` on T | **yes** | the revealed set changes for every recipient |
-| `decision.propose` | **no** | only `accepted` decisions are selected |
-| `decision.accept`, task = T or NULL | **yes** | durable project truth (§4.1) |
-| `decision.accept`, task = some other task | **no** | task scope |
-| `message.send`, T, A is sender or recipient | **yes** | enters the window; may evict the oldest |
-| `message.send`, T, between the other two agents | **no** | participant visibility (§4.2) |
-| `message.send`, no task | **no** | untargeted messages are excluded (§4.1) |
-| `blocker.add` / `blocker.resolve` on T | **yes** | open-blocker set, and task status |
-| `review.request` on T | **yes** | candidate, new pending review, status, version |
-| `review.submit` on T | **yes** | verdict, and on `needs_revision` the candidate clear |
-| `finding.add` / `finding.resolve` on a review of T | **yes** | the revision instructions themselves |
-| `verification.run` at a commit in T's review set | **yes** | evidence and exit code |
-| `check_policy.override` on T | **yes** | changes what acceptance requires |
-| `task.accept` on T | **n/a** | terminal; dispatch returns `none`, so no bundle is issued (§7.3) |
-| `dispatch.derive` | **no** | read-only, writes nothing |
-| `dispatch.issue` | **no** | required by §6.3 |
+`MAY` means the answer depends on state the operation does not itself determine, and both branches are
+listed in the reason. `Class` is the header's three-way split: **C** context-only, **W** workflow, **N**
+neither.
 
-Two rows in that table are the ones worth attacking in review, because they are where a plausible design
-gets it wrong: `sync` (which mutates on every call and must still be inert) and `dispatch.issue` (next).
+| Operation | Bundle `S` | `DispatchFacts` | Class | Why |
+|---|---|---|---|---|
+| `sync` | no | no | N | writes `agents.last_seen_at` only (`collab/service.ts:859`); presence is excluded (§3) |
+| `session.open` / `close` / `replace` / `heartbeat` | no | no | N | delivery identity, not content (§7.1); liveness gates *issuance*, not derivation |
+| `worktree.bootstrap` | no | no | N | `managed_worktrees` excluded (§3) |
+| `task.create` | no | no | N | another task; per-task independence (§4.1) |
+| `proposal.submit` on T | no | no | N | sealed proposals are invisible (§4.3) |
+| `decision.propose` | no | no | N | only `accepted` decisions are selected |
+| `decision.accept`, another task | no | no | N | task scope |
+| `message.send`, T, between the other two agents | no | no | N | participant visibility (§4.2) |
+| `message.send`, no task | no | no | N | untargeted messages are excluded (§4.1) |
+| `dispatch.derive` | no | no | N | read-only, writes nothing |
+| `dispatch.issue` | no | no | N | required by §6.3 |
+| **`message.send`, T, A is sender or recipient** | **yes** | **no** | **C** | enters the window, may evict the oldest; no message is a `DispatchFacts` field |
+| **`proposal.reveal` on T** | **yes** | **no** | **C** | the revealed set changes for every recipient; acceptance never consults proposals |
+| **`decision.accept`, task = T or NULL** | **yes** | **no** | **C** | durable project truth (§4.1); decisions are a parallel track, not an acceptance gate |
+| `task.assign_roles` on T | yes | yes | W | `roles` and `role` are read by both |
+| `task.claim` on T | yes | yes | W | status, version, lease |
+| `blocker.add` / `blocker.resolve` on T | yes | yes | W | open-blocker set and task status |
+| `review.request` on T | yes | yes | W | candidate, pending review, status, version |
+| `review.submit` on T | yes | yes | W | verdict; on `needs_revision`, status, version, candidate, reservation |
+| `check_policy.override` on T | yes | yes | W | `override_id`, and the gates the override waives |
+| `finding.add` / `finding.resolve` on a review of T | yes | **MAY** | W | a *blocking* finding at the candidate changes `gaps`; a `non_blocking` one changes no fact, and neither reaches `gaps` unless the task is scoped (`collab/service.ts:1630`) |
+| `verification.run` at a commit in T's review set | yes | **MAY** | W | a passing required check at the current candidate closes a gap; a failing run, or any run at an earlier reviewed commit, changes no fact |
+| `task.accept` on T | n/a | yes | W | terminal; dispatch returns `none`, so no bundle is issued (§7.3) |
+
+**The C rows are the whole reason step 9 exists.** Three operations move what an agent should know while
+leaving its obligation identical, and step 8 has no way to express any of them. Everything else either moves
+both records — which is ordinary, and which the W class exists to stop anyone from testing as a defect — or
+moves neither.
+
+Four rows are the ones worth attacking in review. `sync` mutates on every call and must still be inert.
+`dispatch.issue` must be inert or §6.3 fails. And the two `MAY` rows are where a plausible implementation
+gets the class wrong: `verification.run` looks like a pure workflow mutation, but a failing check at the
+candidate changes the evidence in the bundle while leaving every `DispatchFacts` field — including `gaps` —
+exactly as it was, which makes it behave as class C in that branch.
 
 ### 6.3 The fixpoint requirement
 
@@ -417,8 +458,11 @@ issuance would compute `B₂ ≠ B₁`, and the one after that `B₃`, forever. 
 construction, two agents polling the same task would churn each other's digests, and the "same context →
 same bundle" case in §7.1 could never be observed.
 
-This single requirement is why `dispatches`, `operation_attempts`, and `events` are excluded from §3, and it
-is a stronger reason than tidiness. It is also the sharpest available argument against ever letting the
+This single requirement is why `dispatches`, `operation_attempts`, `events`, and **`context_bundles`
+itself** are excluded from §3, and it is a stronger reason than tidiness. `context_bundles` does not exist at
+schema version 9, so it has no row in §3's table; naming it here is what stops a later reader from concluding
+that a table absent from that table was merely overlooked. A bundle that carried the bundle history of its
+own dispatch would be the purest form of the defect. It is also the sharpest available argument against ever letting the
 bundle grow "what I was told last time" — that is a self-referential field, and self-reference is what
 breaks the fixpoint.
 
@@ -449,8 +493,11 @@ CREATE UNIQUE INDEX context_bundles_content
 CREATE INDEX context_bundles_dispatch ON context_bundles(dispatch_id, created_at);
 ```
 
-The row id is one recorded bundle delivery. `(bundle_contract_version, bundle_digest)` is the content
-identity. `bundle_json` stores the canonical serialization, immutable, never read as current authority —
+A row is **one distinct bundle-content record for one dispatch**, not one delivery.
+`(bundle_contract_version, bundle_digest)` is the content identity, and because context that changes and
+later reverts lands back on the earlier row (§7.2), the count of rows is a count of distinct things said
+rather than a count of times they were said. The delivery *occurrence* is the `dispatch.issue` operation
+attempt and its `dispatch_issued` event, which are written every time (§7.2). `bundle_json` stores the canonical serialization, immutable, never read as current authority —
 the same standing `basis_json` has (`collab/schema.ts:186-192`).
 
 No `context_sources`, no `bundle_members`, no `bundle_revisions`, no join table per included class. Pilot
@@ -643,27 +690,40 @@ the moment it acquires a scoring function it stops being reconstructible by iden
 
 ## 12. Test obligation
 
-Written directly from §6.2, in two directions, because one direction alone is what would let this contract
-rot.
+Written directly from §6.2, one obligation per class, because a single assertion applied to every
+bundle-changing operation is exactly what revision 1 got wrong.
 
-1. **Sensitivity (P1).** For every row marked **yes**: construct the state, issue, apply the change, issue
-   again, and assert the digest **differs** while `dispatches.id` is **unchanged**. That pairing is the
-   load-bearing sentence made executable — a test that only asserts the digest moved would pass on a design
-   that also manufactured a new dispatch, which is the failure §2 exists to prevent.
-2. **Stability (P2).** For every row marked **no**: apply the change and assert the digest is byte-identical
-   and the same `context_bundles.id` is returned. `sync` and `dispatch.issue` are the two that matter most.
-3. **Visibility.** A Claude→Grok message on `T` does not change Codex's digest. A sealed proposal does not.
+1. **Class C — context-only (P1 + P3).** For each **C** row: construct the state, issue, apply the change,
+   issue again from the same session, and assert the digest **differs** while `dispatches.id` and
+   `dispatches.basis_digest` are **unchanged**. Additionally assert that `dispatch.derive` returns an
+   identical result across the change, modulo `derived_at`. That pairing is the load-bearing property made
+   executable: a test asserting only that the digest moved would pass on a design that also manufactured a
+   new dispatch, which is the failure §2 exists to prevent.
+2. **Class W — workflow.** For each **W** row: apply the change and assert that the bundle reflects the new
+   state, that a non-`action` result writes **no** bundle (§7.3), and that the recorded `basis_digest` for
+   the resulting state equals the value the step 8 suite already pins for that state. Do **not** assert that
+   `dispatches.id` is unchanged — for most of these it must change, and requiring otherwise would assert
+   step 8 is broken. The direction under test is only that step 9 never *causes* dispatch movement, which is
+   why the assertion is on the step 8 basis rather than on the absence of a new row.
+   For the two **MAY** rows, test both branches and assert the class they actually land in: a blocking
+   finding at the candidate behaves as W, a `non_blocking` one as C; a passing required check at the
+   candidate behaves as W, a failing run at the same commit as C.
+3. **Class N — neither (P2).** For each **N** row: apply the change and assert the digest is byte-identical,
+   the same `context_bundles.id` is returned, and no new `dispatches` row appears. `sync` and
+   `dispatch.issue` are the two that matter most — the first mutates on every call, the second must satisfy
+   §6.3.
+4. **Visibility.** A Claude→Grok message on `T` does not change Codex's digest. A sealed proposal does not.
    A decision accepted against another task does not. An untargeted message does not.
-4. **Determinism.** Assemble twice over unchanged state and assert byte-identical `bundle_json`, not merely
+5. **Determinism.** Assemble twice over unchanged state and assert byte-identical `bundle_json`, not merely
    equal digests — this catches a key-order or array-order regression at the point it happens.
-5. **Delivery versus content.** Replace the session under unchanged state: assert a new `dispatches` row, a
+6. **Delivery versus content.** Replace the session under unchanged state: assert a new `dispatches` row, a
    new `context_bundles` row, and an **equal** `bundle_digest`.
-6. **Window boundary.** With more than `CONTEXT_BUNDLE_MESSAGE_LIMIT` visible messages, assert `truncated`,
+7. **Window boundary.** With more than `CONTEXT_BUNDLE_MESSAGE_LIMIT` visible messages, assert `truncated`,
    assert `total`, and assert the window is the most recent by the stated total order.
-7. **Attachment.** An older bundle from the same generation attaches. A bundle whose dispatch is from an
+8. **Attachment.** An older bundle from the same generation attaches. A bundle whose dispatch is from an
    earlier generation does not. A bundle belonging to another agent or another task does not. An absent,
    unknown, or malformed id costs provenance and **never** work — assert the domain mutation still succeeds.
-8. **No I/O.** Assert bundle assembly performs no repository read, so §5.2 cannot erode into "just this one
+9. **No I/O.** Assert bundle assembly performs no repository read, so §5.2 cannot erode into "just this one
    diff".
 
 ---
