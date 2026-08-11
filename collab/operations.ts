@@ -311,6 +311,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
         expectedVersion: nonNegativeInteger(input, 'expectedVersion'),
         ttlSeconds: nonNegativeInteger(input, 'ttlSeconds', 900),
         dispatchId: optionalString(input, 'dispatchId'),
+        contextBundleId: optionalString(input, 'contextBundleId'),
       }),
   },
   'task.accept': {
@@ -392,6 +393,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
         agent: requiredString(input, 'agent'),
         commit: requiredString(input, 'commit'),
         dispatchId: optionalString(input, 'dispatchId'),
+        contextBundleId: optionalString(input, 'contextBundleId'),
       }),
   },
   'review.submit': {
@@ -403,6 +405,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
         agent: requiredString(input, 'agent'),
         verdict: enumValue(input, 'verdict', ['approved', 'needs_revision']),
         dispatchId: optionalString(input, 'dispatchId'),
+        contextBundleId: optionalString(input, 'contextBundleId'),
       }),
   },
   'finding.add': {
@@ -450,6 +453,7 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
           checkId,
           command,
           dispatchId: optionalString(input, 'dispatchId'),
+          contextBundleId: optionalString(input, 'contextBundleId'),
         },
         onOutput,
       );

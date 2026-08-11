@@ -105,6 +105,9 @@ export function initializeDatabase(db: DatabaseSync, repository: RepositoryBindi
     if (!attemptColumns.some((column) => column.name === 'dispatch_id')) {
       db.exec('ALTER TABLE operation_attempts ADD COLUMN dispatch_id TEXT REFERENCES dispatches(id)');
     }
+    if (!attemptColumns.some((column) => column.name === 'context_bundle_id')) {
+      db.exec('ALTER TABLE operation_attempts ADD COLUMN context_bundle_id TEXT REFERENCES context_bundles(id)');
+    }
     const eventColumns = db.prepare('PRAGMA table_info(events)').all() as Array<{ name: string }>;
     if (!eventColumns.some((column) => column.name === 'operation_id')) {
       db.exec('ALTER TABLE events ADD COLUMN operation_id TEXT REFERENCES operation_attempts(id)');

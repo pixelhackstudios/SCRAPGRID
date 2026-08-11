@@ -12,7 +12,7 @@ import { GitError, GitRepository } from '../collab/git.js';
 import { CollaborationError, CollaborationService } from '../collab/service.js';
 import { createCollaborationHttpServer, createSessionActivity } from '../collab/http.js';
 import { authorizeOperation, type SessionActivity } from '../collab/operations.js';
-import { DISPATCH_CONTRACT_VERSION, type DispatchResult } from '../collab/dispatch.js';
+import { canonicalJson, DISPATCH_CONTRACT_VERSION, type DispatchResult } from '../collab/dispatch.js';
 import { daemonRuntimePaths, readDaemonDescriptor, type DaemonDescriptor } from '../collab/runtime.js';
 import { SCHEMA_VERSION } from '../collab/schema.js';
 
@@ -322,11 +322,20 @@ test('schema version 1 upgrades roles, reservations, operation linkage, findings
     const dispatchBasisIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'dispatches_basis'")
       .get() as { name: string } | undefined;
+    const bundlesTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'context_bundles'")
+      .get() as { name: string } | undefined;
+    const bundleContentIndex = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'context_bundles_content'")
+      .get() as { name: string } | undefined;
     const attemptColumns = db.prepare('PRAGMA table_info(operation_attempts)').all() as Array<{ name: string }>;
-    assert.equal(version.user_version, 9);
+    assert.equal(version.user_version, 10);
     assert.equal(dispatchesTable?.name, 'dispatches');
     assert.equal(dispatchBasisIndex?.name, 'dispatches_basis');
+    assert.equal(bundlesTable?.name, 'context_bundles');
+    assert.equal(bundleContentIndex?.name, 'context_bundles_content');
     assert.ok(attemptColumns.some((column) => column.name === 'dispatch_id'));
+    assert.ok(attemptColumns.some((column) => column.name === 'context_bundle_id'));
     assert.equal(sessionsTable?.name, 'agent_sessions');
     assert.equal(currentSessionIndex?.name, 'agent_sessions_current');
     assert.ok(columns.some((column) => column.name === 'raised_by'));
@@ -2975,5 +2984,564 @@ test('a dispatch from an earlier cycle cannot claim credit for a later operation
     assert.equal(requested['dispatch_id'], String(current?.['id']));
   } finally {
     close();
+  }
+});
+
+// --- Step 9: deterministic context bundles ---------------------------------
+
+interface TestSession {
+  sessionId: string;
+  agentId: string;
+}
+
+function sessionFor(service: CollaborationService, agentId: string): TestSession {
+  const opened = service.openSession(agentId);
+  return { sessionId: String(opened.session['id']), agentId };
+}
+
+function issue(
+  service: CollaborationService,
+  agent: string,
+  taskId: string,
+  session: TestSession,
+): { result: DispatchResult; dispatch: Record<string, unknown> | null; context_bundle: Record<string, unknown> | null } {
+  return service.issueDispatch({ agent, taskId, session, workInFlight: false });
+}
+
+/** The recorded delivery, as a reader of the ledger would reconstruct it. */
+function delivered(
+  service: CollaborationService,
+  agent: string,
+  taskId: string,
+  session: TestSession,
+): { dispatchId: string; bundleId: string; digest: string; bundle: Record<string, unknown> } {
+  const issued = issue(service, agent, taskId, session);
+  assert.equal(issued.result.kind, 'action', `expected an action for ${agent} on ${taskId}`);
+  assert.ok(issued.dispatch && issued.context_bundle);
+  return {
+    dispatchId: String(issued.dispatch?.['id']),
+    bundleId: String(issued.context_bundle?.['id']),
+    digest: String(issued.context_bundle?.['bundle_digest']),
+    bundle: JSON.parse(String(issued.context_bundle?.['bundle_json'])) as Record<string, unknown>,
+  };
+}
+
+function bundleCount(db: DatabaseSync): number {
+  return Number((db.prepare('SELECT count(*) AS count FROM context_bundles').get() as { count: number }).count);
+}
+
+function latestAttempt(db: DatabaseSync, operation: string, subjectId: string): Record<string, unknown> {
+  return db
+    .prepare(
+      `SELECT * FROM operation_attempts WHERE operation = ? AND subject_id = ?
+       ORDER BY started_at DESC, id DESC LIMIT 1`,
+    )
+    .get(operation, subjectId) as Record<string, unknown>;
+}
+
+function canonicalBundle(bundle: Record<string, unknown>): string {
+  return canonicalJson(bundle);
+}
+
+function dispatchCount(db: DatabaseSync): number {
+  return Number((db.prepare('SELECT count(*) AS count FROM dispatches').get() as { count: number }).count);
+}
+
+/** Derivation as a comparable value: the captured instant is the one field allowed to move. */
+function derivedShape(service: CollaborationService, agent: string): string {
+  const { derived_at: _instant, ...rest } = service.deriveDispatch({ agent });
+  return JSON.stringify(rest);
+}
+
+test('context that moves while the obligation stands still is a new bundle, not a new dispatch', () => {
+  const { service, db, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-CONTEXT', goal: 'Carry context', acceptance: ['ships'], actor: 'human' });
+    assignRoles(service, 'TASK-CONTEXT');
+    const codex = sessionFor(service, 'codex');
+
+    const first = delivered(service, 'codex', 'TASK-CONTEXT', codex);
+    const beforeDerivation = derivedShape(service, 'codex');
+
+    // Class C, row one: a task message this agent is party to. The obligation is untouched — same
+    // action, same basis — so step 8 must return the record it already wrote.
+    service.sendMessage({ from: 'claude', to: 'codex', taskId: 'TASK-CONTEXT', body: 'Base moved to abc123' });
+    const afterMessage = delivered(service, 'codex', 'TASK-CONTEXT', codex);
+    assert.equal(afterMessage.dispatchId, first.dispatchId, 'a message is not an obligation');
+    assert.notEqual(afterMessage.digest, first.digest);
+    assert.notEqual(afterMessage.bundleId, first.bundleId);
+    assert.equal(
+      derivedShape(service, 'codex'),
+      beforeDerivation,
+      'derivation cannot see the message at all: the bundle is never an input to it',
+    );
+    const conversation = afterMessage.bundle['conversation'] as Record<string, unknown>;
+    assert.equal((conversation['messages'] as unknown[]).length, 1);
+    assert.equal(conversation['total'], 1);
+    assert.equal(conversation['truncated'], false);
+
+    // Class C, row two: a revealed proposal. Submitting one is invisible; revealing it is not.
+    service.submitProposal({ taskId: 'TASK-CONTEXT', agent: 'codex', content: 'Try the smaller migration' });
+    const afterSeal = delivered(service, 'codex', 'TASK-CONTEXT', codex);
+    assert.equal(afterSeal.digest, afterMessage.digest, 'a sealed proposal is absent, not redacted');
+    assert.equal(afterSeal.bundleId, afterMessage.bundleId);
+    service.revealProposals('TASK-CONTEXT', 'human');
+    const afterReveal = delivered(service, 'codex', 'TASK-CONTEXT', codex);
+    assert.equal(afterReveal.dispatchId, first.dispatchId);
+    assert.notEqual(afterReveal.digest, afterSeal.digest);
+    assert.equal((afterReveal.bundle['proposals'] as unknown[]).length, 1);
+
+    // Class C, row three: an accepted decision, scoped to this task or to the project.
+    const proposed = service.proposeDecision({
+      taskId: 'TASK-CONTEXT',
+      actor: 'claude',
+      statement: 'Migrate in two commits',
+      rationale: 'Reviewability',
+    });
+    const afterProposal = delivered(service, 'codex', 'TASK-CONTEXT', codex);
+    assert.equal(afterProposal.digest, afterReveal.digest, 'only accepted decisions are selected');
+    service.acceptDecision(String(proposed['id']), 'human');
+    const afterDecision = delivered(service, 'codex', 'TASK-CONTEXT', codex);
+    assert.equal(afterDecision.dispatchId, first.dispatchId);
+    assert.notEqual(afterDecision.digest, afterProposal.digest);
+    const global = service.proposeDecision({
+      actor: 'claude',
+      statement: 'Every task pins its checks at base',
+      rationale: 'Reproducibility',
+    });
+    service.acceptDecision(String(global['id']), 'human');
+    const afterGlobal = delivered(service, 'codex', 'TASK-CONTEXT', codex);
+    assert.notEqual(afterGlobal.digest, afterDecision.digest, 'project-wide truth reaches every bundle');
+    assert.equal((afterGlobal.bundle['decisions'] as unknown[]).length, 2);
+
+    // Four distinct things were said, and exactly one obligation was ever issued.
+    assert.equal(dispatchCount(db), 1, 'one obligation, however much was said about it');
+    assert.equal(bundleCount(db), 5, 'and five distinct things said');
+  } finally {
+    close();
+  }
+});
+
+test('a change invisible or irrelevant to an agent leaves its bundle byte-identical', () => {
+  const { service, db, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-QUIET', goal: 'Stay quiet', acceptance: [], actor: 'human' });
+    service.createTask({ id: 'TASK-OTHER', goal: 'Somewhere else', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-QUIET');
+    assignRoles(service, 'TASK-OTHER', { implementer: 'claude', reviewer: 'grok', verifier: 'codex' });
+    const codex = sessionFor(service, 'codex');
+    const baseline = delivered(service, 'codex', 'TASK-QUIET', codex);
+
+    // Repeated issuance is the fixpoint case: what issuing writes must never feed the next bundle,
+    // or no two consecutive deliveries could ever agree.
+    for (let poll = 0; poll < 3; poll += 1) {
+      const repeated = delivered(service, 'codex', 'TASK-QUIET', codex);
+      assert.equal(repeated.bundleId, baseline.bundleId);
+      assert.equal(repeated.digest, baseline.digest);
+    }
+    const serialized = JSON.stringify(baseline.bundle);
+    assert.ok(!serialized.includes(baseline.dispatchId), 'a bundle never names the dispatch row it rides');
+    assert.ok(!serialized.includes(baseline.bundleId), 'nor itself');
+    for (const key of ['dispatches', 'operations', 'events', 'context_bundles', 'sessions']) {
+      assert.ok(!Object.hasOwn(baseline.bundle, key), `${key} is excluded by the fixpoint requirement`);
+    }
+
+    // sync mutates on every call, and must still be inert: presence is not task truth.
+    service.sync('codex');
+    service.sync('claude');
+    // Messages this agent is not party to, and messages scoped to no task at all.
+    service.sendMessage({ from: 'claude', to: 'grok', taskId: 'TASK-QUIET', body: 'Between the two of us' });
+    service.sendMessage({ from: 'claude', to: 'codex', body: 'Unscoped remark' });
+    // Another task entirely, including its accepted decisions.
+    const elsewhere = service.proposeDecision({
+      taskId: 'TASK-OTHER',
+      actor: 'claude',
+      statement: 'Not this task',
+      rationale: 'Scope',
+    });
+    service.acceptDecision(String(elsewhere['id']), 'human');
+    service.sendMessage({ from: 'claude', to: 'codex', taskId: 'TASK-OTHER', body: 'About the other task' });
+    // A proposal nobody has revealed, and a decision nobody has accepted.
+    service.submitProposal({ taskId: 'TASK-QUIET', agent: 'claude', content: 'Sealed' });
+    service.proposeDecision({ taskId: 'TASK-QUIET', actor: 'grok', statement: 'Merely proposed', rationale: 'Not yet' });
+    // Presence, and a read that writes nothing.
+    service.heartbeat(codex);
+    service.deriveDispatch({ agent: 'codex' });
+
+    const quiet = delivered(service, 'codex', 'TASK-QUIET', codex);
+    assert.equal(quiet.digest, baseline.digest, 'none of that is addressed to codex on this task');
+    assert.equal(quiet.bundleId, baseline.bundleId, 'and so it is the same recorded content');
+    assert.equal(
+      String(
+        (
+          db.prepare('SELECT bundle_json FROM context_bundles WHERE id = ?').get(baseline.bundleId) as {
+            bundle_json: string;
+          }
+        ).bundle_json,
+      ),
+      canonicalBundle(baseline.bundle),
+      'the stored serialization is canonical and stable',
+    );
+    assert.equal(bundleCount(db), 1);
+  } finally {
+    close();
+  }
+});
+
+test('a workflow change may move the dispatch, and the bundle follows the state it moved to', async () => {
+  const { service, db, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-FLOW', goal: 'Walk the workflow', acceptance: ['green'], actor: 'human' });
+    assignRoles(service, 'TASK-FLOW');
+    const codex = sessionFor(service, 'codex');
+    const claude = sessionFor(service, 'claude');
+    const grok = sessionFor(service, 'grok');
+
+    const claim = delivered(service, 'codex', 'TASK-FLOW', codex);
+    assert.equal((claim.bundle['action'] as Record<string, unknown>)['kind'], 'claim');
+    assert.equal(claim.bundle['lease'], null, 'nothing is leased yet');
+    assert.equal((claim.bundle['task'] as Record<string, unknown>)['status'], 'open');
+    assert.deepEqual((claim.bundle['task'] as Record<string, unknown>)['acceptance'], ['green']);
+    assert.deepEqual((claim.bundle['check_policy'] as Record<string, unknown>)['checks'], [
+      { id: 'fixture', argv: FIXTURE_CHECK_ARGV },
+    ]);
+
+    // Class W: the obligation itself moves, so a new dispatch is correct rather than a defect.
+    service.claimTask({
+      taskId: 'TASK-FLOW',
+      agent: 'codex',
+      expectedVersion: taskVersion(db, 'TASK-FLOW'),
+      ttlSeconds: 900,
+      dispatchId: claim.dispatchId,
+      contextBundleId: claim.bundleId,
+    });
+    const implement = delivered(service, 'codex', 'TASK-FLOW', codex);
+    assert.notEqual(implement.dispatchId, claim.dispatchId, 'the workflow moved, so the delivery did too');
+    assert.equal((implement.bundle['action'] as Record<string, unknown>)['kind'], 'implement');
+    assert.equal((implement.bundle['task'] as Record<string, unknown>)['status'], 'in_progress');
+    const lease = implement.bundle['lease'] as Record<string, unknown>;
+    assert.equal(lease['agent_id'], 'codex');
+    assert.ok(String(lease['expires_at']).length > 0, 'requestReview refuses without a live lease, so the deadline rides along');
+
+    const first = commitArtifact(repository.binding.rootPath, 'candidate one\n');
+    const reviewOne = service.requestReview({ taskId: 'TASK-FLOW', agent: 'codex', commit: first });
+    service.addReviewFinding({
+      reviewId: String(reviewOne['id']),
+      agent: 'claude',
+      severity: 'blocking',
+      description: 'Missing migration guard',
+      location: 'src/migrate.ts',
+    });
+    service.submitReview({ reviewId: String(reviewOne['id']), agent: 'claude', verdict: 'needs_revision' });
+
+    // The re-claiming implementer has no candidate any more, and the evidence it needs is the
+    // history of the commit it is about to revise.
+    const reclaim = delivered(service, 'codex', 'TASK-FLOW', codex);
+    assert.equal((reclaim.bundle['action'] as Record<string, unknown>)['kind'], 'claim');
+    assert.equal((reclaim.bundle['task'] as Record<string, unknown>)['candidate_commit'], null);
+    const carriedReviews = reclaim.bundle['reviews'] as Array<Record<string, unknown>>;
+    assert.equal(carriedReviews.length, 1);
+    assert.equal(carriedReviews[0]?.['verdict'], 'needs_revision');
+    assert.equal(carriedReviews[0]?.['commit_sha'], first);
+    const carriedFindings = carriedReviews[0]?.['findings'] as Array<Record<string, unknown>>;
+    assert.equal(carriedFindings.length, 1);
+    assert.equal(carriedFindings[0]?.['description'], 'Missing migration guard');
+    assert.equal(carriedFindings[0]?.['severity'], 'blocking');
+
+    service.claimTask({
+      taskId: 'TASK-FLOW',
+      agent: 'codex',
+      expectedVersion: taskVersion(db, 'TASK-FLOW'),
+      ttlSeconds: 900,
+    });
+    service.resolveReviewFinding(String(carriedFindings[0]?.['id']), 'claude');
+    const second = commitArtifact(repository.binding.rootPath, 'candidate two\n');
+    const reviewTwo = service.requestReview({ taskId: 'TASK-FLOW', agent: 'codex', commit: second });
+
+    // Both cycles are carried, so the reviewer sees what it already said.
+    const reviewing = delivered(service, 'claude', 'TASK-FLOW', claude);
+    assert.equal((reviewing.bundle['action'] as Record<string, unknown>)['kind'], 'review');
+    assert.equal((reviewing.bundle['reviews'] as unknown[]).length, 2);
+    assert.equal(reviewing.bundle['role'], 'reviewer');
+    assert.equal(reviewing.bundle['lease'], null, 'the lease belongs to the implementer, not the reviewer');
+
+    // Conditional row, C branch: a failing check at the candidate changes the evidence and no fact.
+    const verifying = delivered(service, 'grok', 'TASK-FLOW', grok);
+    await service.runVerification({
+      taskId: 'TASK-FLOW',
+      agent: 'grok',
+      commit: second,
+      command: ['node', '-e', 'process.exit(3)'],
+    });
+    const afterFailure = delivered(service, 'grok', 'TASK-FLOW', grok);
+    assert.equal(afterFailure.dispatchId, verifying.dispatchId, 'a failing run closes no gap');
+    assert.notEqual(afterFailure.digest, verifying.digest, 'but the agent should still know it failed');
+    const failures = afterFailure.bundle['verifications'] as Array<Record<string, unknown>>;
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0]?.['exit_code'], 3);
+    assert.deepEqual(failures[0]?.['command_argv'], ['node', '-e', 'process.exit(3)']);
+
+    // Conditional row, W branch: the passing required check closes the gap the dispatch was derived
+    // on, and with no verifier work left the obligation is the reviewer's.
+    await service.runVerification({ taskId: 'TASK-FLOW', agent: 'grok', commit: second, checkId: 'fixture' });
+    const afterPass = issue(service, 'grok', 'TASK-FLOW', grok);
+    assert.equal(afterPass.result.kind, 'waiting');
+    assert.equal(afterPass.dispatch, null);
+    assert.equal(afterPass.context_bundle, null, 'no obligation, no context to carry it out with');
+
+    // Conditional row, C branch: a blocking finding on an earlier review is history, not a gate.
+    const beforeStale = delivered(service, 'claude', 'TASK-FLOW', claude);
+    const staleFinding = service.addReviewFinding({
+      reviewId: String(reviewOne['id']),
+      agent: 'claude',
+      severity: 'blocking',
+      description: 'Still worth recording against the old candidate',
+    });
+    const afterStale = delivered(service, 'claude', 'TASK-FLOW', claude);
+    assert.equal(
+      afterStale.dispatchId,
+      beforeStale.dispatchId,
+      'the gap query joins on the candidate, so an earlier review reaches no fact',
+    );
+    assert.notEqual(afterStale.digest, beforeStale.digest);
+    assert.ok(
+      JSON.stringify(afterStale.bundle).includes(String(staleFinding['id'])),
+      'and the bundle carries it as revision history',
+    );
+
+    // Conditional row, C branch: a non-blocking finding at the current candidate.
+    const beforeSoft = delivered(service, 'claude', 'TASK-FLOW', claude);
+    service.addReviewFinding({
+      reviewId: String(reviewTwo['id']),
+      agent: 'claude',
+      severity: 'non_blocking',
+      description: 'Naming nit',
+    });
+    const afterSoft = delivered(service, 'claude', 'TASK-FLOW', claude);
+    assert.equal(afterSoft.dispatchId, beforeSoft.dispatchId, 'non-blocking findings gate nothing');
+    assert.notEqual(afterSoft.digest, beforeSoft.digest);
+
+    // A terminal task carries no obligation, and so no context to carry it out with.
+    service.submitReview({ reviewId: String(reviewTwo['id']), agent: 'claude', verdict: 'approved' });
+    service.acceptTask({ taskId: 'TASK-FLOW', actor: 'human', expectedVersion: taskVersion(db, 'TASK-FLOW') });
+    const terminal = issue(service, 'codex', 'TASK-FLOW', codex);
+    assert.equal(terminal.result.kind, 'none');
+    assert.equal(terminal.dispatch, null);
+    assert.equal(terminal.context_bundle, null, 'no action, no bundle');
+  } finally {
+    close();
+  }
+});
+
+test('a replacement session is a new delivery of the same content', () => {
+  const { service, db, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-RECOVER', goal: 'Survive recovery', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-RECOVER');
+    const codex = sessionFor(service, 'codex');
+    const before = delivered(service, 'codex', 'TASK-RECOVER', codex);
+
+    db.prepare("UPDATE agent_sessions SET last_heartbeat_at = '1970-01-01T00:00:00.000Z' WHERE id = ?").run(
+      codex.sessionId,
+    );
+    const replacement = service.replaceSession({ agentId: 'codex', reason: 'the agent process was restarted' });
+    const next: TestSession = { sessionId: String(replacement.session['id']), agentId: 'codex' };
+    const after = delivered(service, 'codex', 'TASK-RECOVER', next);
+
+    assert.notEqual(after.dispatchId, before.dispatchId, 'the session owns the delivery');
+    assert.notEqual(after.bundleId, before.bundleId);
+    assert.equal(after.digest, before.digest, 'while the content is a statement about the task');
+    assert.equal(dispatchCount(db), 2);
+    assert.equal(bundleCount(db), 2);
+  } finally {
+    close();
+  }
+});
+
+test('the conversation window is the most recent by a stated total order, and nothing else is capped', () => {
+  const { service, db, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-WINDOW', goal: 'Bound the conversation', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-WINDOW');
+    const codex = sessionFor(service, 'codex');
+
+    for (let index = 0; index < 60; index += 1) {
+      service.sendMessage({ from: 'claude', to: 'codex', taskId: 'TASK-WINDOW', body: `message ${index}` });
+      // Not addressed to codex: these move nobody's window here, nor the total it reports.
+      service.sendMessage({ from: 'claude', to: 'grok', taskId: 'TASK-WINDOW', body: `aside ${index}` });
+      // Sixty sends land inside the same millisecond, where the contract says the id tiebreak is
+      // stable but arbitrary. Recency is a claim about `created_at`, so the test states it.
+      db.prepare('UPDATE messages SET created_at = ? WHERE body = ?').run(
+        new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+        `message ${index}`,
+      );
+    }
+
+    const bundle = delivered(service, 'codex', 'TASK-WINDOW', codex).bundle;
+    const conversation = bundle['conversation'] as Record<string, unknown>;
+    const messages = conversation['messages'] as Array<Record<string, unknown>>;
+    assert.equal(conversation['limit'], 50);
+    assert.equal(conversation['total'], 60, 'the total counts what this agent can see, not what exists');
+    assert.equal(conversation['truncated'], true);
+    assert.equal(messages.length, 50);
+    assert.equal(messages[0]?.['body'], 'message 10', 'the window is the most recent, not the first');
+    assert.equal(messages.at(-1)?.['body'], 'message 59');
+    // The window is the tail of the whole visible set under the stated total order, computed here
+    // independently of the query that produced it.
+    const visible = (
+      db
+        .prepare('SELECT id, created_at FROM messages WHERE task_id = ? AND (sender = ? OR recipient = ?)')
+        .all('TASK-WINDOW', 'codex', 'codex') as Array<{ id: string; created_at: string }>
+    ).sort((left, right) =>
+      left.created_at === right.created_at
+        ? left.id.localeCompare(right.id)
+        : left.created_at.localeCompare(right.created_at),
+    );
+    assert.deepEqual(
+      messages.map((message) => String(message['id'])),
+      visible.slice(-50).map((message) => message.id),
+      'emitted ascending after a descending selection, tiebroken on the stored id',
+    );
+    for (const message of messages) {
+      assert.ok(message['sender'] === 'codex' || message['recipient'] === 'codex');
+    }
+  } finally {
+    close();
+  }
+});
+
+test('an echoed bundle id is attached through its own dispatch, and never inferred', async () => {
+  const { service, db, repository, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-ECHO', goal: 'Attach provenance', acceptance: [], actor: 'human' });
+    service.createTask({ id: 'TASK-ELSE', goal: 'Somewhere else', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-ECHO');
+    assignRoles(service, 'TASK-ELSE');
+    const codex = sessionFor(service, 'codex');
+    const claude = sessionFor(service, 'claude');
+
+    const first = delivered(service, 'codex', 'TASK-ECHO', codex);
+    // The agent keeps working from what it was handed while the context moves on beneath it.
+    service.sendMessage({ from: 'claude', to: 'codex', taskId: 'TASK-ECHO', body: 'Landed after you started' });
+    const second = delivered(service, 'codex', 'TASK-ECHO', codex);
+    assert.equal(second.dispatchId, first.dispatchId);
+    assert.notEqual(second.bundleId, first.bundleId);
+
+    const elsewhere = delivered(service, 'codex', 'TASK-ELSE', codex);
+    service.claimTask({
+      taskId: 'TASK-ECHO',
+      agent: 'codex',
+      expectedVersion: taskVersion(db, 'TASK-ECHO'),
+      ttlSeconds: 900,
+      contextBundleId: elsewhere.bundleId,
+    });
+    let attempt = latestAttempt(db, 'task.claim', 'TASK-ECHO');
+    assert.equal(attempt['context_bundle_id'], null, 'a bundle from another task manufactures no provenance');
+    assert.equal(attempt['outcome'], 'accepted', 'and costs no work');
+
+    // The stale bundle is the truth of what this agent worked from, so it is what gets recorded.
+    const candidate = commitArtifact(repository.binding.rootPath, 'echoed candidate\n');
+    const implement = delivered(service, 'codex', 'TASK-ECHO', codex);
+    service.sendMessage({ from: 'claude', to: 'codex', taskId: 'TASK-ECHO', body: 'Arrived mid-implementation' });
+    const fresher = delivered(service, 'codex', 'TASK-ECHO', codex);
+    assert.equal(fresher.dispatchId, implement.dispatchId);
+    const review = service.requestReview({
+      taskId: 'TASK-ECHO',
+      agent: 'codex',
+      commit: candidate,
+      contextBundleId: implement.bundleId,
+    });
+    attempt = latestAttempt(db, 'review.request', 'TASK-ECHO');
+    assert.equal(
+      attempt['context_bundle_id'],
+      implement.bundleId,
+      'an older bundle from the same generation attaches: that is what it actually worked from',
+    );
+    assert.equal(attempt['dispatch_id'], null, 'and nothing is inferred from it about the dispatch echo');
+
+    // The bundle is validated through its own dispatch, which carries the generation clause.
+    const reviewDelivery = delivered(service, 'claude', 'TASK-ECHO', claude);
+    service.addReviewFinding({
+      reviewId: String(review['id']),
+      agent: 'claude',
+      severity: 'blocking',
+      description: 'Send it back',
+    });
+    service.submitReview({ reviewId: String(review['id']), agent: 'claude', verdict: 'needs_revision' });
+    service.claimTask({
+      taskId: 'TASK-ECHO',
+      agent: 'codex',
+      expectedVersion: taskVersion(db, 'TASK-ECHO'),
+      ttlSeconds: 900,
+    });
+    const nextCandidate = commitArtifact(repository.binding.rootPath, 'second candidate\n');
+    const reRequested = service.requestReview({ taskId: 'TASK-ECHO', agent: 'codex', commit: nextCandidate });
+    service.submitReview({
+      reviewId: String(reRequested['id']),
+      agent: 'claude',
+      verdict: 'approved',
+      contextBundleId: reviewDelivery.bundleId,
+    });
+    attempt = latestAttempt(db, 'review.submit', String(reRequested['id']));
+    assert.equal(
+      attempt['context_bundle_id'],
+      null,
+      'a bundle from an earlier revision generation cannot claim credit for later work',
+    );
+    assert.equal(attempt['outcome'], 'accepted');
+
+    // Unknown, malformed, and absent ids all cost provenance and nothing else.
+    await service.runVerification({
+      taskId: 'TASK-ECHO',
+      agent: 'grok',
+      commit: nextCandidate,
+      checkId: 'fixture',
+      contextBundleId: 'bundle-does-not-exist',
+    });
+    attempt = latestAttempt(db, 'verification.run', 'TASK-ECHO');
+    assert.equal(attempt['context_bundle_id'], null);
+    assert.equal(attempt['outcome'], 'accepted');
+  } finally {
+    close();
+  }
+});
+
+test('bundle assembly reads canonical rows and never the repository', () => {
+  const fixture = createRepository();
+  const db = openDatabase(':memory:');
+  try {
+    initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
+    const service = new CollaborationService(db, fixture.repository);
+    service.createTask({ id: 'TASK-NOIO', goal: 'Touch no files', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-NOIO');
+
+    // Every method on the binding throws, so any Git, file, or subprocess read during issuance is a
+    // failure rather than a slow path. Property access stays open: `binding.identity` is a value.
+    const sealed = new Proxy(fixture.repository, {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver) as unknown;
+        if (typeof value === 'function') {
+          return () => {
+            throw new Error(`bundle assembly reached the repository: ${String(property)}`);
+          };
+        }
+        return value;
+      },
+    }) as GitRepository;
+    const guarded = new CollaborationService(db, sealed);
+    const codex = sessionFor(guarded, 'codex');
+    const issued = guarded.issueDispatch({
+      agent: 'codex',
+      taskId: 'TASK-NOIO',
+      session: codex,
+      workInFlight: false,
+    });
+    assert.equal(issued.result.kind, 'action');
+    assert.ok(issued.context_bundle);
+    const bundle = JSON.parse(String(issued.context_bundle?.['bundle_json'])) as Record<string, unknown>;
+    assert.equal((bundle['action'] as Record<string, unknown>)['base_commit'], fixture.repository.headCommit());
+  } finally {
+    db.close();
+    fixture.close();
   }
 });

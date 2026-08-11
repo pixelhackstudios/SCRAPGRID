@@ -87,7 +87,7 @@ Commands:
   worktree bootstrap [--root PATH] [--base SHA]
   task create ID --goal TEXT [--acceptance TEXT ...] [--actor human]
   task assign-roles ID --actor human --implementer ID --reviewer ID --verifier ID
-  task claim ID --agent ID --expected-version N [--ttl 900] [--dispatch ID]
+  task claim ID --agent ID --expected-version N [--ttl 900] [--dispatch ID] [--bundle ID]
   task accept ID --actor human --expected-version N
   proposal submit TASK --agent ID --content TEXT
   proposal reveal TASK [--actor human]
@@ -96,18 +96,20 @@ Commands:
   message send --from ID --to ID [--task TASK] --body TEXT
   blocker add TASK --agent ID --description TEXT
   blocker resolve BLOCKER --agent ID
-  review request TASK --agent ID --commit SHA [--dispatch ID]
-  review submit REVIEW --agent ID --verdict approved|needs_revision [--dispatch ID]
+  review request TASK --agent ID --commit SHA [--dispatch ID] [--bundle ID]
+  review submit REVIEW --agent ID --verdict approved|needs_revision [--dispatch ID] [--bundle ID]
   finding add REVIEW --agent ID --severity blocking|non_blocking --description TEXT [--location TEXT]
   finding resolve FINDING --agent ID
   policy override TASK --actor human --reason TEXT
-  verify TASK --agent ID --commit SHA [--check ID | -- COMMAND [ARG ...]] [--dispatch ID]
+  verify TASK --agent ID --commit SHA [--check ID | -- COMMAND [ARG ...]] [--dispatch ID] [--bundle ID]
   dispatch derive --agent ID [--task TASK]
   dispatch issue --agent ID --task TASK
 
 "dispatch derive" lists an agent's current obligations in a stated non-semantic order. That order is
 not a priority: the actor picks one and names it to "dispatch issue", which records the delivery and
-returns the dispatch id to echo back with --dispatch on the terminal operation.
+returns both the dispatch id to echo back with --dispatch and the context bundle it was delivered with,
+whose id is echoed back with --bundle. Both echoes are advisory: an id that does not check out costs
+provenance, never work.
 `);
 }
 
@@ -168,6 +170,7 @@ function resolveInvocation(parsed: ReturnType<typeof parseArguments>): Invocatio
         expectedVersion: integer(options, 'expected-version'),
         ttlSeconds: integer(options, 'ttl', 900),
         dispatchId: optional(options, 'dispatch'),
+        contextBundleId: optional(options, 'bundle'),
       },
     };
   }
@@ -232,6 +235,7 @@ function resolveInvocation(parsed: ReturnType<typeof parseArguments>): Invocatio
         agent: required(options, 'agent'),
         commit: required(options, 'commit'),
         dispatchId: optional(options, 'dispatch'),
+        contextBundleId: optional(options, 'bundle'),
       },
     };
   }
@@ -243,6 +247,7 @@ function resolveInvocation(parsed: ReturnType<typeof parseArguments>): Invocatio
         agent: required(options, 'agent'),
         verdict: required(options, 'verdict'),
         dispatchId: optional(options, 'dispatch'),
+        contextBundleId: optional(options, 'bundle'),
       },
     };
   }
@@ -277,6 +282,7 @@ function resolveInvocation(parsed: ReturnType<typeof parseArguments>): Invocatio
         checkId: optional(options, 'check'),
         command: command.length > 0 ? command : undefined,
         dispatchId: optional(options, 'dispatch'),
+        contextBundleId: optional(options, 'bundle'),
       },
     };
   }

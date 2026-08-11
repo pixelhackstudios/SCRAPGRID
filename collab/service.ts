@@ -8,6 +8,7 @@ import {
   DISPATCH_CONTRACT_VERSION,
   TERMINAL_OPERATIONS,
   type AcceptanceGap,
+  type DispatchActionDescriptor,
   type DispatchActionKind,
   type DispatchEnvelope,
   type DispatchFacts,
@@ -15,6 +16,16 @@ import {
   type DispatchRole,
   type TerminalOperation,
 } from './dispatch.js';
+import {
+  contextBundleDigest,
+  CONTEXT_BUNDLE_CONTRACT_VERSION,
+  CONTEXT_BUNDLE_MESSAGE_LIMIT,
+  type ContextBundle,
+  type ContextCheckPolicy,
+  type ContextFinding,
+  type ContextMessage,
+  type ContextReview,
+} from './context.js';
 import { GitError, GitRepository } from './git.js';
 
 export class CollaborationError extends Error {
@@ -44,6 +55,7 @@ type VerificationInput = {
   command?: string[];
   checkId?: string;
   dispatchId?: string;
+  contextBundleId?: string;
 };
 type TaskRole = 'implementer' | 'reviewer' | 'verifier';
 type TaskRoleAssignment = Record<TaskRole, string>;
@@ -841,6 +853,9 @@ export class CollaborationService {
         .prepare('SELECT * FROM check_policy_overrides ORDER BY created_at')
         .all() as Row[],
       dispatches: this.db.prepare('SELECT * FROM dispatches ORDER BY issued_at, id').all() as Row[],
+      context_bundles: this.db
+        .prepare('SELECT * FROM context_bundles ORDER BY created_at, id')
+        .all() as Row[],
       operations: this.db.prepare('SELECT * FROM operation_attempts ORDER BY started_at, id').all() as Row[],
       events,
     };
@@ -1029,6 +1044,7 @@ export class CollaborationService {
     expectedVersion: number;
     ttlSeconds: number;
     dispatchId?: string;
+    contextBundleId?: string;
   }): Row {
     return this.transaction({ name: 'task.claim', actor: input.agent, subjectType: 'task', subjectId: input.taskId }, (operationId) => {
       this.requireProjectActive();
@@ -1082,6 +1098,7 @@ export class CollaborationService {
         taskId: input.taskId,
         taskVersion: Number(task['version']),
         terminalOperation: 'task.claim',
+        contextBundleId: input.contextBundleId,
       });
       this.event(operationId, input.agent, 'task', input.taskId, 'lease_acquired', {
         expires_at: expiresAt,
@@ -1218,7 +1235,13 @@ export class CollaborationService {
     });
   }
 
-  requestReview(input: { taskId: string; agent: string; commit: string; dispatchId?: string }): Row {
+  requestReview(input: {
+    taskId: string;
+    agent: string;
+    commit: string;
+    dispatchId?: string;
+    contextBundleId?: string;
+  }): Row {
     return this.preparedTransaction(
       { name: 'review.request', actor: input.agent, subjectType: 'task', subjectId: input.taskId },
       () => {
@@ -1276,6 +1299,7 @@ export class CollaborationService {
           taskId: input.taskId,
           taskVersion: Number(task['version']),
           terminalOperation: 'review.request',
+          contextBundleId: input.contextBundleId,
         });
         this.event(operationId, input.agent, 'review', id, 'review_requested', {
           task_id: input.taskId,
@@ -1293,6 +1317,7 @@ export class CollaborationService {
     agent: string;
     verdict: 'approved' | 'needs_revision';
     dispatchId?: string;
+    contextBundleId?: string;
   }): Row {
     return this.transaction({ name: 'review.submit', actor: input.agent, subjectType: 'review', subjectId: input.reviewId }, (operationId) => {
       this.requireAgent(input.agent);
@@ -1336,6 +1361,7 @@ export class CollaborationService {
         taskId: String(review['task_id']),
         taskVersion: reviewedVersion,
         terminalOperation: 'review.submit',
+        contextBundleId: input.contextBundleId,
       });
       this.event(operationId, input.agent, 'review', input.reviewId, `review_${input.verdict}`, {
         task_id: review['task_id'],
@@ -1452,6 +1478,7 @@ export class CollaborationService {
           taskId: input.taskId,
           taskVersion: Number(task['version']),
           terminalOperation: 'verification.run',
+          contextBundleId: input.contextBundleId,
         });
         this.event(
           operationId,
@@ -1761,6 +1788,263 @@ export class CollaborationService {
    * what lets a replacement session receive the same obligation as a new, separately attributable
    * delivery instead of silently overwriting who was told what.
    */
+  /**
+   * The pinned required-check policy as the bundle carries it, or null if the task has none.
+   *
+   * `requireTaskCheckPolicy()` throws, which is right for authority and wrong here: an unpinned or
+   * corrupt policy is a fact about the task that the recipient should see, not a reason to fail the
+   * delivery of an action the service already derived.
+   */
+  private contextCheckPolicy(task: Row): ContextCheckPolicy | null {
+    if (!task['check_policy_identity'] || !task['check_policy_json']) return null;
+    const parsed = parseJsonOrNull(task['check_policy_json']);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const checks = (parsed as Row)['checks'];
+    if (!Array.isArray(checks)) return null;
+    return {
+      identity: String(task['check_policy_identity']),
+      checks: checks.map((check) => {
+        const entry = check as Row;
+        return { id: String(entry['id']), argv: (entry['argv'] as string[]) ?? [] };
+      }),
+    };
+  }
+
+  /**
+   * The deterministic projection of shared truth this agent receives alongside one issued action.
+   *
+   * Three literal predicates and a stated order, with no relevance scoring anywhere: task scope,
+   * participant visibility, and recency. Every value is read from a row already committed to SQLite —
+   * no clock comparison, no Git read, no file read, no subprocess — so two assemblies over identical
+   * state produce identical bytes, and issuing a bundle cannot change what the next one contains.
+   */
+  private assembleContextBundle(params: {
+    agentId: string;
+    role: DispatchRole;
+    roles: Partial<Record<DispatchRole, string>>;
+    task: Row;
+    action: DispatchActionDescriptor;
+  }): ContextBundle {
+    const taskId = String(params.task['id']);
+    const repositoryIdentity = String(params.task['repository_identity']);
+
+    // The lease the recipient itself holds: `requestReview()` refuses without a live one, so the
+    // deadline is required by the very action being dispatched. Stored raw, never evaluated against
+    // now — that comparison belongs to derivation, whose answer is already in the descriptor.
+    const leaseRow = this.db
+      .prepare('SELECT agent_id, expires_at FROM leases WHERE task_id = ? AND agent_id = ?')
+      .get(taskId, params.agentId) as Row | undefined;
+
+    const decisions = this.db
+      .prepare(
+        `SELECT id, task_id, statement, rationale, actor, created_at
+         FROM decisions
+         WHERE status = 'accepted' AND (task_id = ? OR task_id IS NULL)
+         ORDER BY created_at, id`,
+      )
+      .all(taskId) as Row[];
+
+    // Revealed only. A sealed proposal is not redacted here, it is absent: listing one would leak that
+    // its author has already proposed, which is the anchoring the seal exists to prevent.
+    const proposals = this.db
+      .prepare(
+        `SELECT id, agent_id, content, status, created_at
+         FROM proposals WHERE task_id = ? AND visibility = 'revealed'
+         ORDER BY created_at, id`,
+      )
+      .all(taskId) as Row[];
+
+    const blockers = this.db
+      .prepare(
+        `SELECT id, raised_by, description, created_at
+         FROM blockers WHERE task_id = ? AND status = 'open'
+         ORDER BY created_at, id`,
+      )
+      .all(taskId) as Row[];
+
+    // Full review history, not the current candidate alone: after `needs_revision` the candidate is
+    // NULL, and the verdict that sent the implementer back is the context it most needs.
+    const reviewRows = this.db
+      .prepare(
+        `SELECT id, requester, reviewer, commit_sha, verdict, created_at, submitted_at
+         FROM reviews WHERE task_id = ? ORDER BY created_at, id`,
+      )
+      .all(taskId) as Row[];
+    const findingsFor = this.db.prepare(
+      `SELECT id, raised_by, severity, location, description, status, created_at
+       FROM review_findings WHERE review_id = ? ORDER BY created_at, id`,
+    );
+    const reviews: ContextReview[] = reviewRows.map((review) => ({
+      id: String(review['id']),
+      requester: String(review['requester']),
+      reviewer: review['reviewer'] ? String(review['reviewer']) : null,
+      commit_sha: String(review['commit_sha']),
+      verdict: String(review['verdict']),
+      created_at: String(review['created_at']),
+      submitted_at: review['submitted_at'] ? String(review['submitted_at']) : null,
+      findings: (findingsFor.all(String(review['id'])) as Row[]).map((finding) => ({
+        id: String(finding['id']),
+        raised_by: String(finding['raised_by']),
+        severity: String(finding['severity']),
+        location: finding['location'] ? String(finding['location']) : null,
+        description: String(finding['description']),
+        status: String(finding['status']),
+        created_at: String(finding['created_at']),
+      })) as ContextFinding[],
+    }));
+
+    // Evidence is selected over the review commit set. The current candidate is always a member:
+    // `requestReview()` inserts the review at the commit and sets `candidate_commit` in one
+    // transaction, so the set needs no second clause.
+    const commitSet = [...new Set(reviewRows.map((review) => String(review['commit_sha'])))];
+    const placeholders = commitSet.map(() => '?').join(', ');
+    const verifications = commitSet.length
+      ? (this.db
+          .prepare(
+            `SELECT id, commit_sha, command_argv_json, check_id, check_policy_identity,
+                    exit_code, runner, created_at
+             FROM verifications
+             WHERE task_id = ? AND repository_identity = ? AND commit_sha IN (${placeholders})
+             ORDER BY created_at, id`,
+          )
+          .all(taskId, repositoryIdentity, ...commitSet) as Row[])
+      : [];
+    const overrides = commitSet.length
+      ? (this.db
+          .prepare(
+            `SELECT id, candidate_commit, check_policy_identity, actor, reason, created_at
+             FROM check_policy_overrides
+             WHERE task_id = ? AND repository_identity = ? AND candidate_commit IN (${placeholders})
+             ORDER BY created_at, id`,
+          )
+          .all(taskId, repositoryIdentity, ...commitSet) as Row[])
+      : [];
+
+    // Task-scoped, and only where this agent is a party. Messages between the other two participants
+    // are not addressed to it and must not appear merely because they share a task. Untargeted
+    // messages stay out entirely, so one unscoped remark cannot move every task's bundle at once.
+    const total = Number(
+      (
+        this.db
+          .prepare(
+            'SELECT count(*) AS count FROM messages WHERE task_id = ? AND (sender = ? OR recipient = ?)',
+          )
+          .get(taskId, params.agentId, params.agentId) as { count: number }
+      ).count,
+    );
+    const window = this.db
+      .prepare(
+        `SELECT id, sender, recipient, body, created_at
+         FROM messages WHERE task_id = ? AND (sender = ? OR recipient = ?)
+         ORDER BY created_at DESC, id DESC LIMIT ?`,
+      )
+      .all(taskId, params.agentId, params.agentId, CONTEXT_BUNDLE_MESSAGE_LIMIT) as Row[];
+    const messages: ContextMessage[] = window
+      .map((message) => ({
+        id: String(message['id']),
+        sender: String(message['sender']),
+        recipient: String(message['recipient']),
+        body: String(message['body']),
+        created_at: String(message['created_at']),
+      }))
+      .reverse();
+
+    return {
+      agent_id: params.agentId,
+      role: params.role,
+      action: params.action,
+      task: {
+        status: String(params.task['status']),
+        goal: String(params.task['goal']),
+        acceptance: parseJsonOrNull(params.task['acceptance_json']),
+        candidate_commit: params.task['candidate_commit'] ? String(params.task['candidate_commit']) : null,
+      },
+      roles: params.roles,
+      lease: leaseRow
+        ? { agent_id: String(leaseRow['agent_id']), expires_at: String(leaseRow['expires_at']) }
+        : null,
+      check_policy: this.contextCheckPolicy(params.task),
+      decisions: decisions.map((decision) => ({
+        id: String(decision['id']),
+        task_id: decision['task_id'] ? String(decision['task_id']) : null,
+        statement: String(decision['statement']),
+        rationale: String(decision['rationale']),
+        actor: String(decision['actor']),
+        created_at: String(decision['created_at']),
+      })),
+      proposals: proposals.map((proposal) => ({
+        id: String(proposal['id']),
+        agent_id: String(proposal['agent_id']),
+        content: String(proposal['content']),
+        status: String(proposal['status']),
+        created_at: String(proposal['created_at']),
+      })),
+      blockers: blockers.map((blocker) => ({
+        id: String(blocker['id']),
+        raised_by: String(blocker['raised_by']),
+        description: String(blocker['description']),
+        created_at: String(blocker['created_at']),
+      })),
+      reviews,
+      verifications: verifications.map((verification) => ({
+        id: String(verification['id']),
+        commit_sha: String(verification['commit_sha']),
+        command_argv: parseJsonOrNull(verification['command_argv_json']),
+        check_id: verification['check_id'] ? String(verification['check_id']) : null,
+        check_policy_identity: verification['check_policy_identity']
+          ? String(verification['check_policy_identity'])
+          : null,
+        exit_code: Number(verification['exit_code']),
+        runner: String(verification['runner']),
+        created_at: String(verification['created_at']),
+      })),
+      check_policy_overrides: overrides.map((override) => ({
+        id: String(override['id']),
+        candidate_commit: String(override['candidate_commit']),
+        check_policy_identity: override['check_policy_identity']
+          ? String(override['check_policy_identity'])
+          : null,
+        actor: String(override['actor']),
+        reason: String(override['reason']),
+        created_at: String(override['created_at']),
+      })),
+      conversation: {
+        limit: CONTEXT_BUNDLE_MESSAGE_LIMIT,
+        total,
+        truncated: total > messages.length,
+        messages,
+      },
+    };
+  }
+
+  /**
+   * Writes the content record, or returns the one already written for this exact content.
+   *
+   * Keyed on content rather than on delivery: the same context redelivered against the same dispatch is
+   * the row already there, while context that moves while the obligation stands still is a new row
+   * against the same dispatch. Each issuance is still recorded, by its own operation attempt and
+   * `dispatch_issued` event — this table counts distinct things said, not the times they were said.
+   */
+  private recordContextBundle(dispatchId: string, bundle: ContextBundle, createdAt: string): Row {
+    const digest = contextBundleDigest(bundle);
+    const existing = this.db
+      .prepare(
+        `SELECT * FROM context_bundles
+         WHERE dispatch_id = ? AND bundle_contract_version = ? AND bundle_digest = ?`,
+      )
+      .get(dispatchId, CONTEXT_BUNDLE_CONTRACT_VERSION, digest) as Row | undefined;
+    if (existing) return existing;
+    const id = makeId('bundle');
+    this.db
+      .prepare(
+        `INSERT INTO context_bundles
+         (id, dispatch_id, bundle_contract_version, bundle_json, bundle_digest, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(id, dispatchId, CONTEXT_BUNDLE_CONTRACT_VERSION, canonicalJson(bundle), digest, createdAt);
+    return this.db.prepare('SELECT * FROM context_bundles WHERE id = ?').get(id) as Row;
+  }
+
   private recordDispatch(params: {
     agentId: string;
     sessionId: string;
@@ -1824,7 +2108,7 @@ export class CollaborationService {
     taskId: string;
     session: SessionPrincipal;
     workInFlight: boolean;
-  }): { result: DispatchResult; dispatch: Row | null } {
+  }): { result: DispatchResult; dispatch: Row | null; context_bundle: Row | null } {
     const operationId = this.startOperation({
       name: 'dispatch.issue',
       actor: input.agent,
@@ -1854,11 +2138,11 @@ export class CollaborationService {
         const { result, basis } = this.deriveOne(input.agent, String(agent['status']), task, at);
         if (result.kind === 'indeterminate') {
           this.completeOperation(operationId, 'rejected', 'dispatch_indeterminate');
-          return { result, dispatch: null };
+          return { result, dispatch: null, context_bundle: null };
         }
         if (result.kind !== 'action') {
           this.completeOperation(operationId, 'accepted');
-          return { result, dispatch: null };
+          return { result, dispatch: null, context_bundle: null };
         }
         const dispatch = this.recordDispatch({
           agentId: input.agent,
@@ -1873,6 +2157,33 @@ export class CollaborationService {
           basis,
           issuedAt: new Date(at).toISOString(),
         });
+        // Assembled from the same transaction and the same captured instant as the derivation above,
+        // so the context and the obligation cannot describe two different moments. The bundle is a
+        // second record rather than a second dispatch: context that moves while the obligation stands
+        // still produces a new bundle against this same dispatch row.
+        const roleRows = this.db
+          .prepare('SELECT role, agent_id FROM task_roles WHERE task_id = ?')
+          .all(input.taskId) as Array<{ role: DispatchRole; agent_id: string }>;
+        const roles: Partial<Record<DispatchRole, string>> = {};
+        for (const row of roleRows) roles[row.role] = row.agent_id;
+        const role = roleRows.find((row) => row.agent_id === input.agent)?.role;
+        // Structurally unreachable: every dispatchable action is role-gated, so an action result for an
+        // agent holding no role would already be a derivation defect. Named rather than assumed away.
+        if (!role) {
+          throw new CollaborationError(`${input.agent} holds no role on ${input.taskId}`, 'role_required');
+        }
+        const bundle = this.assembleContextBundle({
+          agentId: input.agent,
+          role,
+          roles,
+          task,
+          action: result.action,
+        });
+        const contextBundle = this.recordContextBundle(
+          String(dispatch['id']),
+          bundle,
+          new Date(at).toISOString(),
+        );
         this.event(operationId, input.agent, 'dispatch', String(dispatch['id']), 'dispatch_issued', {
           task_id: input.taskId,
           action_kind: result.action.kind,
@@ -1880,9 +2191,14 @@ export class CollaborationService {
           session_id: input.session.sessionId,
           dispatch_contract_version: DISPATCH_CONTRACT_VERSION,
           basis_digest: result.action.basis_digest,
+          // Every issuance writes this event, including the one that reused both records, so the
+          // ledger carries each delivery occurrence while the tables carry distinct content.
+          context_bundle_id: String(contextBundle['id']),
+          context_bundle_contract_version: CONTEXT_BUNDLE_CONTRACT_VERSION,
+          context_bundle_digest: String(contextBundle['bundle_digest']),
         });
         this.completeOperation(operationId, 'accepted');
-        return { result, dispatch };
+        return { result, dispatch, context_bundle: contextBundle };
       });
     } catch (error) {
       this.recordOperationError(operationId, error);
@@ -1891,7 +2207,8 @@ export class CollaborationService {
   }
 
   /**
-   * Turns "told X to do Y" and "X did Y" into a hard causal edge, when the echoed id checks out.
+   * Turns "told X to do Y", "with this context", and "X did Y" into hard causal edges, when the echoed
+   * ids check out.
    *
    * Validated, never trusted: an id belonging to another task or agent would otherwise manufacture
    * false provenance in the very record the pilot reads for causality. Advisory in both directions —
@@ -1911,6 +2228,7 @@ export class CollaborationService {
     operationId: string,
     params: {
       dispatchId?: string;
+      contextBundleId?: string;
       agentId: string;
       taskId: string;
       /** The task version this operation observed, before the operation mutated it. */
@@ -1918,23 +2236,52 @@ export class CollaborationService {
       terminalOperation: TerminalOperation;
     },
   ): void {
-    if (!params.dispatchId) return;
+    if (params.dispatchId && this.dispatchMatches(params.dispatchId, params)) {
+      this.db
+        .prepare('UPDATE operation_attempts SET dispatch_id = ? WHERE id = ?')
+        .run(params.dispatchId, operationId);
+    }
+    if (!params.contextBundleId) return;
+    // Validated through the bundle's *own* dispatch, never through the separately echoed id. The two
+    // columns then stay independently truthful: one is the dispatch the caller claims to be executing,
+    // the other the context it claims to have worked from. Where they disagree the record says so
+    // rather than reconciling them, and neither is inferred from the other.
+    const bundle = this.db
+      .prepare('SELECT dispatch_id FROM context_bundles WHERE id = ?')
+      .get(params.contextBundleId) as Row | undefined;
+    if (!bundle || !this.dispatchMatches(String(bundle['dispatch_id']), params)) return;
+    this.db
+      .prepare('UPDATE operation_attempts SET context_bundle_id = ? WHERE id = ?')
+      .run(params.contextBundleId, operationId);
+  }
+
+  /**
+   * Whether one dispatch row can legitimately have caused this operation.
+   *
+   * Shared by both attachments so a bundle cannot reach the ledger through a weaker test than the
+   * dispatch it belongs to. An *older bundle from the same generation* passes deliberately: an agent
+   * that kept working from the context it was handed before a message arrived did exactly that, and
+   * rewriting the record to the latest bundle would erase the staleness the pilot exists to measure.
+   * A bundle from an earlier revision generation fails here for free, because its dispatch already
+   * fails the `task_version` clause.
+   */
+  private dispatchMatches(
+    dispatchId: string,
+    params: { agentId: string; taskId: string; taskVersion: number; terminalOperation: TerminalOperation },
+  ): boolean {
     const dispatch = this.db
       .prepare('SELECT agent_id, task_id, terminal_operation, basis_json FROM dispatches WHERE id = ?')
-      .get(params.dispatchId) as Row | undefined;
+      .get(dispatchId) as Row | undefined;
     if (
       !dispatch ||
       dispatch['agent_id'] !== params.agentId ||
       dispatch['task_id'] !== params.taskId ||
       dispatch['terminal_operation'] !== params.terminalOperation
     ) {
-      return;
+      return false;
     }
     const basis = parseJsonOrNull(dispatch['basis_json']);
-    if (!basis || typeof basis !== 'object' || Array.isArray(basis)) return;
-    if ((basis as Row)['task_version'] !== params.taskVersion) return;
-    this.db
-      .prepare('UPDATE operation_attempts SET dispatch_id = ? WHERE id = ?')
-      .run(params.dispatchId, operationId);
+    if (!basis || typeof basis !== 'object' || Array.isArray(basis)) return false;
+    return (basis as Row)['task_version'] === params.taskVersion;
   }
 }

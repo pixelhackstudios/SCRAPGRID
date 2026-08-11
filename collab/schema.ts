@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
@@ -208,9 +208,26 @@ CREATE TABLE IF NOT EXISTS dispatches (
   issued_at TEXT NOT NULL
 );
 
+-- What one agent was told alongside one dispatch, and the digest that identifies exactly that content.
+--
+-- A row is one distinct bundle content record for one dispatch, not one delivery: context that changes and
+-- later reverts lands back on the earlier row, while every issuance is recorded by its own operation
+-- attempt and dispatch_issued event. bundle_json is immutable historical evidence on the same terms as
+-- basis_json, and bundle_contract_version names the selection function that produced it, because the
+-- stored content only explains the delivery if the selection is known too.
+CREATE TABLE IF NOT EXISTS context_bundles (
+  id TEXT PRIMARY KEY,
+  dispatch_id TEXT NOT NULL REFERENCES dispatches(id) ON DELETE CASCADE,
+  bundle_contract_version INTEGER NOT NULL,
+  bundle_json TEXT NOT NULL CHECK (json_valid(bundle_json)),
+  bundle_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 -- Actor and subject identifiers are deliberately not foreign keys: rejected attempts may name unknown targets.
--- dispatch_id is the exception and does carry one, because it is attached only after the referenced
--- dispatch has been validated against the authenticated agent, the resolved task, and the operation.
+-- dispatch_id and context_bundle_id are the exceptions and do carry one, because each is attached only
+-- after the referenced row has been validated against the authenticated agent, the resolved task, the
+-- operation, and the workflow generation.
 CREATE TABLE IF NOT EXISTS operation_attempts (
   id TEXT PRIMARY KEY,
   operation TEXT NOT NULL,
@@ -221,6 +238,7 @@ CREATE TABLE IF NOT EXISTS operation_attempts (
   reason_code TEXT,
   error_class TEXT,
   dispatch_id TEXT REFERENCES dispatches(id),
+  context_bundle_id TEXT REFERENCES context_bundles(id),
   started_at TEXT NOT NULL,
   completed_at TEXT
 );
@@ -261,4 +279,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS dispatches_basis
   ON dispatches(session_id, task_id, dispatch_contract_version, basis_digest);
 CREATE INDEX IF NOT EXISTS dispatches_agent ON dispatches(agent_id, task_id, issued_at);
 CREATE INDEX IF NOT EXISTS operation_attempts_dispatch ON operation_attempts(dispatch_id);
+CREATE INDEX IF NOT EXISTS operation_attempts_bundle ON operation_attempts(context_bundle_id);
+
+-- Content identity, not delivery identity: the same context redelivered against the same dispatch is the
+-- row already written, while context that moves while the obligation stands still is a new row.
+CREATE UNIQUE INDEX IF NOT EXISTS context_bundles_content
+  ON context_bundles(dispatch_id, bundle_contract_version, bundle_digest);
+CREATE INDEX IF NOT EXISTS context_bundles_dispatch ON context_bundles(dispatch_id, created_at);
 `;
