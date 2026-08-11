@@ -11,6 +11,12 @@ wrong.
 
 Baseline scanned: `2ef4a7a`, schema version 9.
 
+**Revision 3 (review finding, literal).** The two conditional rows in §6.2 were labelled class `W` while
+the prose beneath them and §12 both said the branch decides, so the table contradicted its own reading. They
+are now `C or W`, the C-row claim is narrowed to the three *unconditional* C rows, and the finding row's
+gate is stated as what it actually is: a blocking finding behaves as `W` only where it reaches the gaps
+dispatch currently consumes, so a blocking finding on an earlier review is context-only.
+
 **Revision 2 (review finding, blocking).** The load-bearing property was scoped too broadly, and §12
 inherited the error as an impossible test obligation. Revision 1 asked every bundle-changing operation to
 leave `dispatches.id` unchanged, but roughly half of them — `task.claim`, `review.submit`,
@@ -406,9 +412,11 @@ axes**: does it change the bundle selection `S`, and does it change step 8's `Di
 those into one column is what produced revision 1's impossible test obligation. This is the step 9 analogue
 of Doc 05 §1's operation table, and it is the table §12 is written from.
 
-`MAY` means the answer depends on state the operation does not itself determine, and both branches are
-listed in the reason. `Class` is the header's three-way split: **C** context-only, **W** workflow, **N**
-neither.
+`Class` is the header's three-way split: **C** context-only, **W** workflow, **N** neither. `MAY` means the
+`DispatchFacts` answer depends on state the operation does not itself determine, and a row whose facts answer
+is `MAY` therefore carries a **conditional class**, written `C or W`: it lands in `W` on the branch where
+facts move and in `C` on the branch where they do not. Both branches are stated in the reason, and §12
+requires both to be tested.
 
 | Operation | Bundle `S` | `DispatchFacts` | Class | Why |
 |---|---|---|---|---|
@@ -432,14 +440,15 @@ neither.
 | `review.request` on T | yes | yes | W | candidate, pending review, status, version |
 | `review.submit` on T | yes | yes | W | verdict; on `needs_revision`, status, version, candidate, reservation |
 | `check_policy.override` on T | yes | yes | W | `override_id`, and the gates the override waives |
-| `finding.add` / `finding.resolve` on a review of T | yes | **MAY** | W | a *blocking* finding at the candidate changes `gaps`; a `non_blocking` one changes no fact, and neither reaches `gaps` unless the task is scoped (`collab/service.ts:1630`) |
-| `verification.run` at a commit in T's review set | yes | **MAY** | W | a passing required check at the current candidate closes a gap; a failing run, or any run at an earlier reviewed commit, changes no fact |
+| `finding.add` / `finding.resolve` on a review of T | yes | **MAY** | **C or W** | `W` only where the finding reaches the gaps dispatch currently consumes: blocking, open, on a review at the *current candidate*, with the task scoped (`collab/service.ts:1630`, `428-437`). A `non_blocking` finding, or a blocking one on an earlier review, changes no fact — the gap query joins on `review.commit_sha = candidate` — so it is `C` |
+| `verification.run` at a commit in T's review set | yes | **MAY** | **C or W** | `W` where a passing required check at the current candidate closes a gap. A failing run, or any run at an earlier reviewed commit, changes no fact and is `C` |
 | `task.accept` on T | n/a | yes | W | terminal; dispatch returns `none`, so no bundle is issued (§7.3) |
 
-**The C rows are the whole reason step 9 exists.** Three operations move what an agent should know while
-leaving its obligation identical, and step 8 has no way to express any of them. Everything else either moves
-both records — which is ordinary, and which the W class exists to stop anyone from testing as a defect — or
-moves neither.
+**The C class is the whole reason step 9 exists.** Three operations are *unconditionally* C — they move what
+an agent should know while leaving its obligation identical, and step 8 has no way to express any of them.
+The two conditional rows contribute further C branches, which is why they are the rows most likely to be
+implemented as though they were purely W. Everything else either moves both records — which is ordinary, and
+which the W class exists to stop anyone from testing as a defect — or moves neither.
 
 Four rows are the ones worth attacking in review. `sync` mutates on every call and must still be inert.
 `dispatch.issue` must be inert or §6.3 fails. And the two `MAY` rows are where a plausible implementation
@@ -705,9 +714,12 @@ bundle-changing operation is exactly what revision 1 got wrong.
    `dispatches.id` is unchanged — for most of these it must change, and requiring otherwise would assert
    step 8 is broken. The direction under test is only that step 9 never *causes* dispatch movement, which is
    why the assertion is on the step 8 basis rather than on the absence of a new row.
-   For the two **MAY** rows, test both branches and assert the class they actually land in: a blocking
-   finding at the candidate behaves as W, a `non_blocking` one as C; a passing required check at the
-   candidate behaves as W, a failing run at the same commit as C.
+   For the two conditional rows, test **both** branches and assert the class each actually lands in rather
+   than assuming the operation's usual one. For findings: a blocking finding on the review at the current
+   candidate is W; a `non_blocking` finding is C; and a blocking finding on an **earlier** review is also C —
+   the bundle carries it as revision history (§4.4) while `acceptanceGaps()` never sees it, because the gap
+   query joins on `review.commit_sha = candidate`. For verification: a passing required check at the current
+   candidate is W, a failing run at that same commit is C, and any run at an earlier reviewed commit is C.
 3. **Class N — neither (P2).** For each **N** row: apply the change and assert the digest is byte-identical,
    the same `context_bundles.id` is returned, and no new `dispatches` row appears. `sync` and
    `dispatch.issue` are the two that matter most — the first mutates on every call, the second must satisfy
