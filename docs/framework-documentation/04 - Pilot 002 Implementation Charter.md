@@ -32,9 +32,10 @@ while the collaboration service remains the authoritative truth and coordination
    - **COMPLETE** — `e0dd0d9b7afc81c35eda1e89b5cf2fbd5810bbd1` (implementation candidate),
      `9794626c0b449daa6d5b98ed79cb153aa53ac752` (accepted review fixes)
 9. **Deterministic context bundles + bundle identity**
-   - **NEXT**
+   - **COMPLETE** — `8413415f2326d5a793a659c3b32498ad13c8bc54` (implementation candidate),
+     `1f5671735624df8d8b83ca80b665db629f1a157d` (accepted migration fix)
 10. **Pilot 002**
-    - **PENDING**
+    - **NEXT**
 
 Implement these prerequisites in order. A step is complete only when its bounded implementation and validation
 are committed and pushed. Do not begin the next step while a blocking review finding remains open on the current

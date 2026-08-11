@@ -1,8 +1,8 @@
 # Collaboration Harness Current State
 
-**Status date:** 2026-08-10
+**Status date:** 2026-08-11
 
-**Repository baseline:** `9794626` (`main`, synchronized with `origin/main` when this document was written)
+**Repository baseline:** `1f56717` (`main`, synchronized with `origin/main` when this document was written)
 
 **Purpose:** Record what SCRAPGRID currently is, what has been demonstrated, and what remains unresolved.
 
@@ -62,9 +62,11 @@ create task (pins base commit + required-check policy)
 
 The frontend is a live, chronological view of that backend state. It is best understood as a **collaboration field terminal**, not a dashboard and not a general-purpose chat client. Messages, decisions, claims, Git candidates, reviews, findings, verification results, and human actions share one task-filterable activity channel.
 
-Canonical state now also derives what each agent is obliged to do next. The dispatcher is deterministic and deliberately narrow: it reads canonical rows and reports the single permitted action per (agent, task), or reports why there is not one. It ranks nothing, selects no task, and constructs no context.
+Canonical state now also derives what each agent is obliged to do next. The dispatcher is deterministic and deliberately narrow: it reads canonical rows and reports the single permitted action per (agent, task), or reports why there is not one. It ranks nothing and selects no task.
 
-The system is coherent, daemon-owned, session-authenticated, and deterministically dispatched, but it is still not the full architecture described in the original report. There is no context-bundle identity, no MCP adapter, no complete human control plane, and no agent launching or scheduling. Session liveness is deliberately not model-process liveness: a live session means an authenticated identity has communicated recently or currently has accepted work in flight, not that SCRAPGRID has proven a Claude Code, Codex, or Grok process is running.
+Alongside each issued action, the agent receives a deterministic context bundle: a literal projection of the shared coordination truth that is task-scoped and visible to it, identified by a digest and recorded. Bundles are assembled by selection, not by summarization, and their identity is deliberately separate from dispatch identity, so a message or an accepted decision can change what an agent knows without manufacturing a new obligation.
+
+The system is coherent, daemon-owned, session-authenticated, deterministically dispatched, and delivers identified context, but it is still not the full architecture described in the original report. There is no MCP adapter, no complete human control plane, and no agent launching or scheduling. Session liveness is deliberately not model-process liveness: a live session means an authenticated identity has communicated recently or currently has accepted work in flight, not that SCRAPGRID has proven a Claude Code, Codex, or Grok process is running.
 
 ## 3. What Exists in the Repository
 
@@ -291,7 +293,37 @@ The record stores the basis it was derived from, because `tasks.version` cannot 
 
 Design authority for all of the above is [05 — Step 8 Dispatch Contract](./05%20-%20Step%208%20Dispatch%20Contract.md), including revision 5, which moved the defensive claim guards inside the claim branch and into the order `claimTask()` actually rejects, and revision 6, which added the generation clause above.
 
-### 3.11 Collaboration field terminal
+### 3.11 Deterministic context bundles
+
+Step 8 stopped where an agent knows *what it must do*. Step 9 answers the separate question of what it should know to carry that out. A context bundle is delivered alongside an issued action, and it is a projection of canonical rows rather than a new memory system: there is no summarization, no embedding, no relevance scoring, and no model-specific prompt construction anywhere in it.
+
+Selection is three literal predicates and one stated total order:
+
+- **task scope** — the bundle concerns the task named in the dispatch, and nothing else. Messages carrying no task are excluded entirely, because one unscoped remark would otherwise move every bundle on every task the agent holds and destroy the per-task independence step 8 established;
+- **participant visibility** — task-scoped messages where this agent is the sender or the recipient. A message between the other two participants is not addressed to it and does not appear. Sealed proposals are absent rather than redacted, since listing one would leak that its author has already proposed;
+- **recency**, for conversation only — the most recent fifty visible messages, with the total and a truncation flag stated alongside. Durable truth is uncapped: withholding an accepted decision would be a worse failure than a long bundle, and the cap is what gives the original report's promotion rule its teeth.
+
+The contents are accepted decisions scoped to this task or to the project, revealed proposals, open blockers, the full review and finding history, verification evidence and overrides over the commits that history names, the pinned required-check policy, the role assignments, the agent's own lease deadline, and the action descriptor step 8 already produced. Evidence is selected over the reviewed commit set rather than the current candidate alone, because after `needs_revision` the candidate is cleared and the re-claiming implementer would otherwise receive the verdict that sent it back with none of the evidence about the commit it is revising.
+
+Nothing in a bundle is read from the clock, and nothing is read from Git or the filesystem. The commits it names are the reference to artifact truth, and each agent holds a real worktree to resolve them with. Values are stored literally rather than as source ids, because reviews, findings, blockers, decisions, and proposals all mutate afterwards, and a record that re-reads current state is not evidence of what was delivered.
+
+Content identity is separate from delivery identity, and that separation is the heart of the step:
+
+```text
+workflow state → one dispatch identity → zero, one, or several context bundles over time
+```
+
+A context-only change — a visible message, a revealed proposal, an accepted decision — produces a new bundle against the **same** dispatch row, because it moves nothing the dispatcher reads. A workflow change may legitimately move the dispatch as well. A replacement session receives a new dispatch row and a new bundle row carrying the **same** digest, which distinguishes who was told from what was said. Bundle rows are keyed on `(dispatch_id, bundle_contract_version, bundle_digest)`, so the table counts distinct things said while the operation ledger and the `dispatch_issued` event record every delivery occurrence, including the ones that reused both records.
+
+One structural rule keeps the bundle from growing into a mirror of the database: **nothing the act of issuing a bundle mutates may appear in a bundle.** Dispatches, operation attempts, events, and `context_bundles` itself are therefore excluded, because a bundle containing any of them would change on every issuance and no two consecutive deliveries could ever agree.
+
+`operation_attempts.context_bundle_id` closes the causal loop from `dispatch → bundle → operation`. The echoed id is validated through the bundle's own dispatch rather than through the separately echoed dispatch id, so the two columns stay independently truthful, and it must match the authenticated agent, the resolved task, the terminal operation, and the step 8 workflow generation. An older bundle from the *same* generation attaches deliberately: an agent that kept working from the context it was handed before a message arrived did exactly that, and rewriting the record to the latest bundle would erase the staleness Pilot 002 exists to measure. Attachment is advisory in both directions.
+
+`sync()` is deliberately unchanged. It remains the older, general, per-agent coordination recovery path with an event cursor; whether it becomes redundant is a Pilot 002 question rather than one to answer by redesign.
+
+Design authority is [06 — Step 9 Context Bundle Contract](./06%20-%20Step%209%20Context%20Bundle%20Contract.md) at revision 4, which fixed three review findings before implementation: the load-bearing property was narrowed to context-only changes rather than demanding that workflow mutations preserve dispatch identity, the conditional change rows were given a conditional class, and delivery identity was named as an axis orthogonal to both.
+
+### 3.12 Collaboration field terminal
 
 The React 19, Tailwind CSS 4, and shadcn-based frontend polls `/api/snapshot` every two seconds and renders backend state without implementing a client-side workflow engine.
 
@@ -314,7 +346,7 @@ The interface has been manually exercised at desktop and mobile sizes with both 
 
 ## 4. Automated Evidence at This Baseline
 
-At `9794626`, the repository test suite contains 61 passing Node tests. Beyond the original schema, identity, Git-truth, lease, proposal, review, and snapshot coverage, they now include:
+At `1f56717`, the repository test suite contains 69 passing Node tests. Beyond the original schema, identity, Git-truth, lease, proposal, review, and snapshot coverage, they now include:
 
 - operation-ledger preservation of accepted, rejected, and failed attempts with causal event linkage;
 - atomic commitment of operation outcomes alongside domain mutations, including the asynchronous verification path;
@@ -355,12 +387,22 @@ At `9794626`, the repository test suite contains 61 passing Node tests. Beyond t
 - causal attachment accepted only for a matching agent, resolved task, terminal operation, and workflow generation, including `review.submit` reaching its task through the review row;
 - a dispatch from an earlier revision cycle refused attachment to a later re-claim, proven against the pre-fix code to have otherwise recorded a false causal edge;
 - a derivation that fails to reduce returned intact and recorded as a rejected attempt rather than resolved by heuristic;
-- the derivation boundary itself: control may inspect any agent, a session only itself.
+- the derivation boundary itself: control may inspect any agent, a session only itself;
+- a context-only change delivering a new bundle against an unchanged dispatch row, with derivation proven identical across it, so conversation cannot manufacture an obligation;
+- inertness under everything invisible or irrelevant: `sync`, repeated issuance, a sealed proposal, a merely proposed decision, another task's accepted decision, a message between the other two participants, and an untargeted message all leave the digest byte-identical and return the same recorded bundle;
+- the fixpoint itself, asserted directly: a bundle names neither the dispatch it rides nor itself, and carries none of the tables issuance writes;
+- both branches of each conditional row — a failing verification and a non-blocking finding changing context alone, a passing required check moving the obligation away entirely, and a blocking finding on an *earlier* review carried as revision history without touching the acceptance gates;
+- the revision cycle from the bundle's side: after `needs_revision` the re-claiming implementer receives the cleared candidate together with the verdict, findings, and evidence of the commit it is about to revise;
+- session replacement producing a new dispatch row and a new bundle row at an equal digest, separating delivery identity from content identity;
+- the conversation bound, checked against an independently computed total order rather than against insertion order, since sixty sends inside one millisecond are ordered stably but arbitrarily;
+- bundle attachment through the bundle's own dispatch, including an older bundle from the same generation accepted, an earlier generation refused, another task's bundle refused, and an unknown id costing provenance but never work;
+- bundle assembly performing no repository call at all, proven by issuing against a repository whose every method throws;
+- a schema 9 database upgrading in place, proven against the pre-fix code to have otherwise failed initialization outright by indexing a column the upgrade had not yet added.
 
 The following commands passed while this document was prepared:
 
 ```bash
-npm test        # 61 tests, 61 pass, 0 fail
+npm test        # 69 tests, 69 pass, 0 fail
 npm run lint    # exit 0
 npm run build   # exit 0
 ```
@@ -486,12 +528,12 @@ Document 02's phase model has been superseded by the ten-step charter for Pilot 
 | Phase 0 — contract | Complete as the original task/status/authority baseline. |
 | Phase 1 — first usable slice | Implemented in the CLI-first service and SQLite schema. |
 | Phase 2 — Git truth | Implemented, and extended past the original slice with base-pinned required checks and daemon-executed verification. Live worktree truth and stale-candidate detection remain incomplete. |
-| Phase 3 — daemon and human controls | Daemon portion complete: `collabd` owns canonical mutation, the CLI is a pure client, and restart and concurrency behavior are covered by tests. Authenticated sessions, heartbeat, and deterministic session recovery were added in step 7, and deterministic dispatch of the next permitted action in step 8. The rest of the human control plane — pause/resume, lease revocation, reassignment, waivers — was deliberately not bundled into any of those steps and remains outstanding. |
+| Phase 3 — daemon and human controls | Daemon portion complete: `collabd` owns canonical mutation, the CLI is a pure client, and restart and concurrency behavior are covered by tests. Authenticated sessions, heartbeat, and deterministic session recovery were added in step 7, deterministic dispatch of the next permitted action in step 8, and identified context delivery in step 9. The rest of the human control plane — pause/resume, lease revocation, reassignment, waivers — was deliberately not bundled into any of those steps and remains outstanding. |
 | Phase 4 — three-terminal pilot | Pilot 001 was completed and is reconstructable, but the formal gate remains partial because no blocking revision cycle or recovery path was exercised in a real run. Pilot 002 is charter step 10. |
 | Phase 5 — MCP adapters | Not started, and explicitly deferred by the charter. |
 | Phase 6 — game application | Still blocked on a more complete and trustworthy harness. |
 
-Charter status at this baseline: steps 1 through 8 are **COMPLETE**, step 9 is **NEXT**, and step 10 is **PENDING**. See document 04 for the authoritative sequence and the recorded commit for each step.
+Charter status at this baseline: steps 1 through 9 are **COMPLETE**, and step 10 — Pilot 002 — is **NEXT**. See document 04 for the authoritative sequence and the recorded commit for each step.
 
 ## 8. Current Boundaries
 
@@ -502,13 +544,14 @@ The following are not implemented:
 - dispatch of an action to the human, or of the two obligations canonical state cannot uniquely address — resolving a blocking finding and clearing a blocker both remain human-mediated;
 - READY/WORKING or any other status machine over sessions;
 - session state in the field terminal, which still presents enabled-or-paused agent status only;
+- any presentation of context bundles in the field terminal, and any use of them by the frontend;
+- semantic routing, summarization, relevance scoring, or long-term memory of any kind: a context bundle is a literal projection of canonical rows and nothing else;
 - pause/resume for the project or agents;
 - human lease revocation or reassignment;
 - blocker waiver records;
 - lease renewal and abandoned-worktree recovery;
 - coupling between task leases and managed worktree state;
 - stale-candidate detection after review or verification;
-- deterministic context bundles and bundle identity;
 - accepted-candidate Git integration;
 - MCP adapters;
 - agent process launching, terminal management, or scheduling;
@@ -520,16 +563,17 @@ These are deliberate boundaries of the current implementation, not functions hid
 
 ## 9. Next Gate
 
-The next gate is **charter step 9 — deterministic context bundles and bundle identity**. Document 04 governs its scope; this document does not propose a competing roadmap.
+The next gate is **charter step 10 — Pilot 002**. Document 04 governs its scope, its pre-registered hard failures, and its evidence signals; this document does not propose a competing roadmap.
 
-Step 8 deliberately stopped at the boundary step 9 begins from. A dispatched action carries identifiers, versions, and commits, and nothing else — no prose, no instruction, no assembled context. What an agent should *know* to carry out an action it has been told to perform is a separate question with its own identity requirements, and the dispatch record is explicitly not the place to park it. The recorded boundary is that `basis_json` holds discriminating coordination facts only; the moment bundles land, that field is the obvious place someone will try to store them, and it must refuse.
+Every prerequisite the charter names is now in place. The reconstruction criterion Pilot 002 will be judged against — that a completed task can be rebuilt from the operation ledger, domain events, role and dispatch records, verification evidence, context-bundle identity, and Git artifacts — has a record behind each of its clauses. No further subsystem is scheduled before the pilot, and the stopping rule applies with full force: the next requirements should come from what the pilot actually does, not from another round of design.
 
-Four items are recorded as deferred rather than forgotten:
+Five items are recorded as deferred rather than forgotten:
 
 - **Blocker and finding resolution remain human-mediated.** Neither `resolveBlocker()` nor `resolveReviewFinding()` has a unique authorized actor, so canonical state cannot address either obligation and the dispatcher reports the gap instead of inventing a rule. Blocker frequency and human-intervention count are both listed Pilot 002 evidence signals, so this is a measurement the pilot exists to take rather than a defect it should hide.
 - **Row 7a can strand a verifier.** After a check-policy override, the independent-verification requirement survives while the pinned policy no longer supplies a command for it, so the verifier is blocked with a determined action kind and an underdetermined argument vector. That is an honest representation of a real hole, and another signal worth counting.
 - **Replacement requires staleness.** Recovering a terminal that was lost seconds ago means waiting out the fifteen-minute threshold or configuring it. A forced replacement would weaken the invariant that prevents competing authority, so it was not added. Revisit only if Pilot 002 shows the latency actually costs something.
 - **Monotonic operation outcomes**, the item parked in the charter, remains deferred pending real evidence that the extra defense is needed.
+- **Sub-millisecond message order is not recoverable.** `messages` has no monotonic column, so the conversation window is ordered by `(created_at, id)` and messages written inside one millisecond are ordered stably but arbitrarily. Adding a monotonic column is the clean fix and is a schema change to an existing table for a marginal gain; it is parked until a pilot burst shows the ordering actually matters.
 
 Frontend refinement can remain narrow and opportunistic: collapse long artifacts, present the session projection now that presence has a real meaning, and keep actions synchronized literally with canonical task state. The field terminal does not yet surface dispatch records or derived obligations, which is a presentation gap rather than a missing capability.
 
@@ -574,13 +618,13 @@ npm run collab -- dispatch issue --agent codex --task TASK-ID
 
 `dispatch derive` accepts either credential — the human may inspect any agent from the main worktree, while a session may inspect only itself. `dispatch issue` requires a model session and refuses the control credential with `session_required`, because a delivery has to be attributable to the session that received it.
 
-Issuing returns the durable dispatch record. Echoing its id on the terminal operation records the causal edge from the delivery to the work:
+Issuing returns the durable dispatch record and the context bundle delivered with it. Echoing their ids on the terminal operation records the causal edge from the delivery, and from the context it was carried out with, to the work:
 
 ```bash
-npm run collab -- task claim TASK-ID --agent codex --expected-version 1 --dispatch DISPATCH-ID
+npm run collab -- task claim TASK-ID --agent codex --expected-version 1 --dispatch DISPATCH-ID --bundle BUNDLE-ID
 ```
 
-The echo is advisory: a mismatched or absent id costs provenance, never work. Re-issuing against unchanged state returns the record already written rather than a second delivery.
+Both echoes are advisory: a mismatched or absent id costs provenance, never work. Re-issuing against unchanged state returns the records already written rather than a second delivery, while re-issuing after the visible context has moved returns the same dispatch with a new bundle.
 
 For the built local terminal:
 
@@ -603,6 +647,7 @@ npm run dev:api
 - Current public overview: [README.md](../../README.md)
 - Pilot 002 sequence: [04 — Pilot 002 Implementation Charter](./04%20-%20Pilot%20002%20Implementation%20Charter.md)
 - Dispatch design authority: [05 — Step 8 Dispatch Contract](./05%20-%20Step%208%20Dispatch%20Contract.md)
+- Context bundle design authority: [06 — Step 9 Context Bundle Contract](./06%20-%20Step%209%20Context%20Bundle%20Contract.md)
 - Schema: [`collab/schema.ts`](../../collab/schema.ts)
 - Workflow authority: [`collab/service.ts`](../../collab/service.ts)
 - Git and verification boundary: [`collab/git.ts`](../../collab/git.ts)
@@ -610,6 +655,7 @@ npm run dev:api
 - Singleton lock, daemon discovery, and session descriptors: [`collab/runtime.ts`](../../collab/runtime.ts)
 - Operation registry and the session identity boundary: [`collab/operations.ts`](../../collab/operations.ts)
 - Dispatch state table, result contract, and basis digest: [`collab/dispatch.ts`](../../collab/dispatch.ts)
+- Context bundle contract version, shape, and content digest: [`collab/context.ts`](../../collab/context.ts)
 - CLI: [`collab/cli.ts`](../../collab/cli.ts)
 - Daemon client: [`collab/client.ts`](../../collab/client.ts)
 - HTTP surface, credentials, and per-session activity: [`collab/http.ts`](../../collab/http.ts)

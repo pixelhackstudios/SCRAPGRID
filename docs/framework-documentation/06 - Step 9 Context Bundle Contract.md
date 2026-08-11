@@ -435,7 +435,7 @@ requires both to be tested.
 | Operation | Bundle `S` | `DispatchFacts` | Class | Why |
 |---|---|---|---|---|
 | `sync` | no | no | N | writes `agents.last_seen_at` only (`collab/service.ts:859`); presence is excluded (§3) |
-| `session.open` / `close` / `replace` / `heartbeat` | no | no | N* | neither axis moves, but delivery identity does: a replacement session is a new dispatch row and a new bundle row at the *same* digest (§7.1). Liveness gates issuance, not derivation |
+| `session.open` / `close` / `replace` / `heartbeat` | no | no | N* | lifecycle operations where delivery identity *may* move independently of both axes; `session.replace` is the load-bearing case, producing a new dispatch row and a new bundle row at the *same* digest (§7.1), while a heartbeat moves nothing at all. Liveness gates issuance, not derivation |
 | `worktree.bootstrap` | no | no | N | `managed_worktrees` excluded (§3) |
 | `task.create` | no | no | N | another task; per-task independence (§4.1) |
 | `proposal.submit` on T | no | no | N | sealed proposals are invisible (§4.3) |
