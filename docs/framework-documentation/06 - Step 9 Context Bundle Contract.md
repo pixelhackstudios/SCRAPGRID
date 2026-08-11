@@ -11,6 +11,13 @@ wrong.
 
 Baseline scanned: `2ef4a7a`, schema version 9.
 
+**Revision 4 (review finding, exposed by implementation).** C/W/N classify two axes — the bundle selection
+and `DispatchFacts` — and delivery identity is a third, owned by step 7 and step 8. Revision 3 left the
+`Neither` class asserting that the dispatch row is unchanged too, which §7.1 contradicts in the one case
+that matters: a replacement session receives a new dispatch row and a new bundle row carrying the same
+digest, and it must. The N rule and the §12 obligation now carry the session qualifier the third axis
+requires; the implementation was already right about this and does not change.
+
 **Revision 3 (review finding, literal).** The two conditional rows in §6.2 were labelled class `W` while
 the prose beneath them and §12 both said the branch decides, so the table contradicted its own reading. They
 are now `C or W`, the C-row claim is narrowed to the three *unconditional* C rows, and the finding row's
@@ -45,8 +52,14 @@ all three:
 > action, or no action at all; step 9 must never be the *cause* of that movement, and where an action is
 > still delivered its bundle reflects the new state.
 >
-> **Neither** — a change that is irrelevant or invisible to this agent leaves the bundle digest and the
-> dispatch alike unchanged.
+> **Neither** — a change that is irrelevant or invisible to this agent leaves the bundle digest unchanged,
+> and leaves the dispatch unchanged *provided the step 8 delivery identity is unchanged too*.
+
+The classes range over content and workflow. **Delivery identity is a third, orthogonal axis**, and it
+belongs to steps 7 and 8 rather than to this contract: replacing a session moves neither `S` nor
+`DispatchFacts`, yet it correctly produces a new dispatch row and a new bundle row carrying the same digest
+(§7.1). That is why the `Neither` clause is qualified rather than absolute — an unqualified reading would
+make step 7 recovery look like a step 9 defect.
 
 The first class is the one step 9 exists for and the one nothing in step 8 can express. Sections 4, 6, and
 6.2 exist to make all three checkable rather than aspirational.
@@ -412,7 +425,8 @@ axes**: does it change the bundle selection `S`, and does it change step 8's `Di
 those into one column is what produced revision 1's impossible test obligation. This is the step 9 analogue
 of Doc 05 §1's operation table, and it is the table §12 is written from.
 
-`Class` is the header's three-way split: **C** context-only, **W** workflow, **N** neither. `MAY` means the
+`Class` is the header's three-way split: **C** context-only, **W** workflow, **N** neither. `N*` marks a row
+that moves neither axis while moving delivery identity, which §7.1 governs rather than this table. `MAY` means the
 `DispatchFacts` answer depends on state the operation does not itself determine, and a row whose facts answer
 is `MAY` therefore carries a **conditional class**, written `C or W`: it lands in `W` on the branch where
 facts move and in `C` on the branch where they do not. Both branches are stated in the reason, and §12
@@ -421,7 +435,7 @@ requires both to be tested.
 | Operation | Bundle `S` | `DispatchFacts` | Class | Why |
 |---|---|---|---|---|
 | `sync` | no | no | N | writes `agents.last_seen_at` only (`collab/service.ts:859`); presence is excluded (§3) |
-| `session.open` / `close` / `replace` / `heartbeat` | no | no | N | delivery identity, not content (§7.1); liveness gates *issuance*, not derivation |
+| `session.open` / `close` / `replace` / `heartbeat` | no | no | N* | neither axis moves, but delivery identity does: a replacement session is a new dispatch row and a new bundle row at the *same* digest (§7.1). Liveness gates issuance, not derivation |
 | `worktree.bootstrap` | no | no | N | `managed_worktrees` excluded (§3) |
 | `task.create` | no | no | N | another task; per-task independence (§4.1) |
 | `proposal.submit` on T | no | no | N | sealed proposals are invisible (§4.3) |
@@ -448,7 +462,8 @@ requires both to be tested.
 an agent should know while leaving its obligation identical, and step 8 has no way to express any of them.
 The two conditional rows contribute further C branches, which is why they are the rows most likely to be
 implemented as though they were purely W. Everything else either moves both records — which is ordinary, and
-which the W class exists to stop anyone from testing as a defect — or moves neither.
+which the W class exists to stop anyone from testing as a defect — or moves neither, with the single `N*`
+row moving delivery identity alone.
 
 Four rows are the ones worth attacking in review. `sync` mutates on every call and must still be inert.
 `dispatch.issue` must be inert or §6.3 fails. And the two `MAY` rows are where a plausible implementation
@@ -720,10 +735,11 @@ bundle-changing operation is exactly what revision 1 got wrong.
    the bundle carries it as revision history (§4.4) while `acceptanceGaps()` never sees it, because the gap
    query joins on `review.commit_sha = candidate`. For verification: a passing required check at the current
    candidate is W, a failing run at that same commit is C, and any run at an earlier reviewed commit is C.
-3. **Class N — neither (P2).** For each **N** row: apply the change and assert the digest is byte-identical,
-   the same `context_bundles.id` is returned, and no new `dispatches` row appears. `sync` and
-   `dispatch.issue` are the two that matter most — the first mutates on every call, the second must satisfy
-   §6.3.
+3. **Class N — neither (P2).** For each **N** row: apply the change **from the same session** and assert the
+   digest is byte-identical, the same `context_bundles.id` is returned, and no new `dispatches` row appears.
+   `sync` and `dispatch.issue` are the two that matter most — the first mutates on every call, the second
+   must satisfy §6.3. The `N*` row is the exception the qualifier exists for: session replacement is
+   governed by obligation 6 below, which asserts new rows at an unchanged digest rather than no new rows.
 4. **Visibility.** A Claude→Grok message on `T` does not change Codex's digest. A sealed proposal does not.
    A decision accepted against another task does not. An untargeted message does not.
 5. **Determinism.** Assemble twice over unchanged state and assert byte-identical `bundle_json`, not merely

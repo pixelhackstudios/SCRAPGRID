@@ -225,6 +225,9 @@ CREATE TABLE IF NOT EXISTS context_bundles (
 );
 
 -- Actor and subject identifiers are deliberately not foreign keys: rejected attempts may name unknown targets.
+-- context_bundle_id is added by migration rather than indexed here: this file runs in full against
+-- databases whose operation_attempts predates the column, and CREATE TABLE IF NOT EXISTS will not add
+-- it to them, so an index over it belongs after the ALTER in initializeDatabase().
 -- dispatch_id and context_bundle_id are the exceptions and do carry one, because each is attached only
 -- after the referenced row has been validated against the authenticated agent, the resolved task, the
 -- operation, and the workflow generation.
@@ -279,7 +282,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS dispatches_basis
   ON dispatches(session_id, task_id, dispatch_contract_version, basis_digest);
 CREATE INDEX IF NOT EXISTS dispatches_agent ON dispatches(agent_id, task_id, issued_at);
 CREATE INDEX IF NOT EXISTS operation_attempts_dispatch ON operation_attempts(dispatch_id);
-CREATE INDEX IF NOT EXISTS operation_attempts_bundle ON operation_attempts(context_bundle_id);
 
 -- Content identity, not delivery identity: the same context redelivered against the same dispatch is the
 -- row already written, while context that moves while the obligation stands still is a new row.

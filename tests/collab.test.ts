@@ -2989,6 +2989,57 @@ test('a dispatch from an earlier cycle cannot claim credit for a later operation
 
 // --- Step 9: deterministic context bundles ---------------------------------
 
+test('a schema 9 database upgrades in place, index and column in the order SQLite requires', () => {
+  const fixture = createRepository();
+  const db = openDatabase(':memory:');
+  try {
+    initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
+    // Wind the real schema back to 9 rather than hand-copying it, so this regression cannot drift
+    // away from the shape it claims to be testing.
+    db.exec(`
+      INSERT INTO operation_attempts (id, operation, actor, outcome, started_at)
+        VALUES ('op-legacy', 'task.create', 'human', 'accepted', '2026-01-01T00:00:00.000Z');
+      DROP INDEX operation_attempts_bundle;
+      ALTER TABLE operation_attempts DROP COLUMN context_bundle_id;
+      DROP TABLE context_bundles;
+      PRAGMA user_version = 9;
+    `);
+    assert.ok(
+      !(db.prepare('PRAGMA table_info(operation_attempts)').all() as Array<{ name: string }>).some(
+        (column) => column.name === 'context_bundle_id',
+      ),
+      'the fixture must actually be a schema 9 database',
+    );
+
+    // The upgrade a real deployment performs: schema 10 code opening the database step 8 left behind.
+    initializeDatabase(db, fixture.repository.binding, fixture.repository.headCommit());
+
+    const version = db.prepare('PRAGMA user_version').get() as { user_version: number };
+    const attemptColumns = db.prepare('PRAGMA table_info(operation_attempts)').all() as Array<{ name: string }>;
+    const bundleIndex = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'operation_attempts_bundle'")
+      .get() as { name: string } | undefined;
+    const bundlesTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'context_bundles'")
+      .get() as { name: string } | undefined;
+    assert.equal(version.user_version, 10);
+    assert.ok(attemptColumns.some((column) => column.name === 'dispatch_id'));
+    assert.ok(attemptColumns.some((column) => column.name === 'context_bundle_id'));
+    assert.equal(bundleIndex?.name, 'operation_attempts_bundle');
+    assert.equal(bundlesTable?.name, 'context_bundles');
+
+    const preserved = db
+      .prepare('SELECT operation, outcome, context_bundle_id FROM operation_attempts WHERE id = ?')
+      .get('op-legacy') as Record<string, unknown>;
+    assert.equal(preserved['operation'], 'task.create');
+    assert.equal(preserved['outcome'], 'accepted');
+    assert.equal(preserved['context_bundle_id'], null, 'attempts recorded before step 9 carry no bundle');
+  } finally {
+    db.close();
+    fixture.close();
+  }
+});
+
 interface TestSession {
   sessionId: string;
   agentId: string;

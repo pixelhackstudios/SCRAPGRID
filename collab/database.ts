@@ -108,6 +108,10 @@ export function initializeDatabase(db: DatabaseSync, repository: RepositoryBindi
     if (!attemptColumns.some((column) => column.name === 'context_bundle_id')) {
       db.exec('ALTER TABLE operation_attempts ADD COLUMN context_bundle_id TEXT REFERENCES context_bundles(id)');
     }
+    // After the column exists, never alongside it in SCHEMA_SQL: an upgrading database reaches that
+    // file with the pre-step-9 table still in place, and an index over a column it does not yet have
+    // fails the whole transaction before this migration can run.
+    db.exec('CREATE INDEX IF NOT EXISTS operation_attempts_bundle ON operation_attempts(context_bundle_id)');
     const eventColumns = db.prepare('PRAGMA table_info(events)').all() as Array<{ name: string }>;
     if (!eventColumns.some((column) => column.name === 'operation_id')) {
       db.exec('ALTER TABLE events ADD COLUMN operation_id TEXT REFERENCES operation_attempts(id)');
