@@ -98,8 +98,8 @@ export interface DaemonRuntimePaths {
 /**
  * Runtime files live beside the collaboration database, so `COLLAB_DB` keeps them together.
  */
-export function daemonRuntimePaths(repositoryRoot: string): DaemonRuntimePaths {
-  const directory = dirname(defaultDatabasePath(repositoryRoot));
+export function daemonRuntimePaths(repositoryRoot: string, databasePath = defaultDatabasePath(repositoryRoot)): DaemonRuntimePaths {
+  const directory = dirname(databasePath);
   return {
     directory,
     lockPath: resolve(directory, 'collabd.lock'),

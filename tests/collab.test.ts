@@ -26,6 +26,27 @@ const CLI_ENTRY = join(DIST_ROOT, 'collab', 'cli.js');
 const AGENT_TOKEN = 'test-agent-credential';
 const BROWSER_TOKEN = 'test-browser-credential';
 
+function testDatabasePath(repositoryPath: string): string {
+  const mainWorktree = git(repositoryPath, ['worktree', 'list', '--porcelain'])
+    .split('\n')
+    .find((line) => line.startsWith('worktree '));
+  assert.ok(mainWorktree, `${repositoryPath} has no main worktree`);
+  return join(mainWorktree.slice('worktree '.length), '.collab', 'collab.db');
+}
+
+function testRuntimePaths(repositoryPath: string): ReturnType<typeof daemonRuntimePaths> {
+  return daemonRuntimePaths(repositoryPath, testDatabasePath(repositoryPath));
+}
+
+/** Never let a developer or Pilot daemon's ambient runtime configuration enter a test subprocess. */
+function testEnvironment(repositoryPath: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const environment = { ...process.env };
+  for (const name of Object.keys(environment)) {
+    if (name.startsWith('COLLAB_')) delete environment[name];
+  }
+  return { ...environment, PORT: '0', ...extra, COLLAB_DB: testDatabasePath(repositoryPath) };
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((done) => setTimeout(done, ms));
 }
@@ -74,7 +95,7 @@ async function waitFor(description: string, condition: () => boolean, timeoutMs 
 async function startDaemon(repositoryPath: string, env: NodeJS.ProcessEnv = {}): Promise<RunningDaemon> {
   const child = spawn(process.execPath, [COLLABD_ENTRY], {
     cwd: repositoryPath,
-    env: { ...process.env, PORT: '0', ...env },
+    env: testEnvironment(repositoryPath, env),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -85,7 +106,7 @@ async function startDaemon(repositoryPath: string, env: NodeJS.ProcessEnv = {}):
   child.stderr.on('data', (chunk: string) => { stderr += chunk; });
   const exited = new Promise<void>((done) => child.on('exit', () => done()));
 
-  const { descriptorPath } = daemonRuntimePaths(repositoryPath);
+  const { descriptorPath } = testRuntimePaths(repositoryPath);
   const deadline = Date.now() + 20_000;
   while (!(existsSync(descriptorPath) && stdout.includes('#t='))) {
     if (child.exitCode !== null) throw new Error(`collabd exited early: ${stderr || stdout}`);
@@ -113,15 +134,15 @@ interface CliResult {
 }
 
 /** `session` names the session descriptor this invocation authenticates with, if any. */
-function cliEnvironment(session?: string): NodeJS.ProcessEnv {
-  return session === undefined ? process.env : { ...process.env, COLLAB_SESSION: session };
+function cliEnvironment(repositoryPath: string, session?: string): NodeJS.ProcessEnv {
+  return testEnvironment(repositoryPath, session === undefined ? {} : { COLLAB_SESSION: session });
 }
 
 function runCli(repositoryPath: string, args: string[], session?: string): CliResult {
   const result = spawnSync(process.execPath, [CLI_ENTRY, ...args], {
     cwd: repositoryPath,
     encoding: 'utf8',
-    env: cliEnvironment(session),
+    env: cliEnvironment(repositoryPath, session),
   });
   return { status: result.status ?? 1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
 }
@@ -131,7 +152,7 @@ function runCliAsync(repositoryPath: string, args: string[], session?: string): 
     const child = spawn(process.execPath, [CLI_ENTRY, ...args], {
       cwd: repositoryPath,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: cliEnvironment(session),
+      env: cliEnvironment(repositoryPath, session),
     });
     let stdout = '';
     let stderr = '';
@@ -462,6 +483,55 @@ test('asynchronous verification events carry the operation that caused them', as
   }
 });
 
+test('verification commands replace inherited collaboration runtime state with an isolated database', async () => {
+  const fixture = createRepository();
+  const outputDirectory = mkdtempSync(join(tmpdir(), 'scrapgrid-verification-environment-'));
+  const outputPath = join(outputDirectory, 'environment.json');
+  const isolatedNames = [
+    'COLLAB_DB',
+    'COLLAB_SESSION',
+    'COLLAB_REPO',
+    'COLLAB_SESSION_STALE_MS',
+    'COLLAB_FUTURE_SETTING',
+  ];
+  const previous = new Map<string, string | undefined>();
+  for (const name of isolatedNames) {
+    previous.set(name, process.env[name]);
+    process.env[name] = `/live-runtime/${name}`;
+  }
+  previous.set('SCRAPGRID_VERIFICATION_SENTINEL', process.env['SCRAPGRID_VERIFICATION_SENTINEL']);
+  process.env['SCRAPGRID_VERIFICATION_SENTINEL'] = 'preserved';
+
+  try {
+    const execution = await fixture.repository.runAtCommit(
+      fixture.repository.headCommit(),
+      [
+        'node',
+        '-e',
+        `require('node:fs').writeFileSync(process.argv[1], JSON.stringify({
+          collab: Object.fromEntries(Object.entries(process.env).filter(([name]) => name.startsWith('COLLAB_'))),
+          sentinel: process.env.SCRAPGRID_VERIFICATION_SENTINEL,
+        }))`,
+        outputPath,
+      ],
+    );
+    assert.equal(execution.exitCode, 0);
+    const observed = JSON.parse(readFileSync(outputPath, 'utf8')) as Record<string, unknown>;
+    assert.equal(observed['sentinel'], 'preserved');
+    const collaboration = observed['collab'] as Record<string, unknown>;
+    assert.deepEqual(Object.keys(collaboration), ['COLLAB_DB']);
+    assert.notEqual(collaboration['COLLAB_DB'], '/live-runtime/COLLAB_DB');
+    assert.match(String(collaboration['COLLAB_DB']), /scrapgrid-verify-[^/]+\/runtime\/collab\.db$/);
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    rmSync(outputDirectory, { recursive: true, force: true });
+    fixture.close();
+  }
+});
+
 test('accepted verification completion commits atomically with verification evidence and its event', async () => {
   const { service, db, repository, close } = harness();
   try {
@@ -590,8 +660,8 @@ test('review candidate must descend from the immutable task base', () => {
   }
 });
 
-test('worktree bootstrap creates stable isolated branches and is idempotent', () => {
-  const { service, repository, repositoryPath, close } = harness();
+test('worktree bootstrap is idempotent and projections report each current Git HEAD', () => {
+  const { service, db, repository, repositoryPath, close } = harness();
   try {
     const rootPath = join(repositoryPath, 'worktrees');
     const first = service.bootstrapWorktrees({ rootPath, baseCommit: repository.headCommit() });
@@ -606,6 +676,20 @@ test('worktree bootstrap creates stable isolated branches and is idempotent', ()
     }
     const second = service.bootstrapWorktrees({ rootPath, baseCommit: repository.headCommit() });
     assert.deepEqual(second.map((item) => item['worktree_path']), first.map((item) => item['worktree_path']));
+
+    const codexPath = join(rootPath, 'codex');
+    const candidate = commitArtifact(codexPath, 'codex candidate\n');
+    const stored = db
+      .prepare('SELECT head_commit FROM managed_worktrees WHERE agent_id = ?')
+      .get('codex') as Record<string, unknown>;
+    assert.notEqual(stored['head_commit'], candidate, 'the durable row remains bootstrap metadata');
+    for (const projection of [service.status(), service.snapshot()]) {
+      const worktrees = projection['worktrees'] as Array<Record<string, unknown>>;
+      assert.equal(
+        worktrees.find((worktree) => worktree['agent_id'] === 'codex')?.['head_commit'],
+        candidate,
+      );
+    }
   } finally {
     close();
   }
@@ -1432,12 +1516,12 @@ test('HTTP bridge exposes snapshots and delegates human mutations to the service
 
 test('collabd owns the repository as a singleton and takes over only a stale lock', async () => {
   const fixture = createRepository();
-  const { lockPath, descriptorPath } = daemonRuntimePaths(fixture.path);
+  const { lockPath, descriptorPath } = testRuntimePaths(fixture.path);
   const daemon = await startDaemon(fixture.path);
   try {
     const competitor = spawnSync(process.execPath, [COLLABD_ENTRY], {
       cwd: fixture.path,
-      env: { ...process.env, PORT: '0' },
+      env: testEnvironment(fixture.path),
       encoding: 'utf8',
     });
     assert.notEqual(competitor.status, 0);
@@ -1518,10 +1602,10 @@ test('a client rejects a daemon bound elsewhere and a credential that does not m
   const home = createRepository();
   const other = createRepository();
   const daemon = await startDaemon(home.path);
-  const homeDescriptor = daemonRuntimePaths(home.path).descriptorPath;
+  const homeDescriptor = testRuntimePaths(home.path).descriptorPath;
   const published = readFileSync(homeDescriptor, 'utf8');
   try {
-    const foreignDescriptor = daemonRuntimePaths(other.path).descriptorPath;
+    const foreignDescriptor = testRuntimePaths(other.path).descriptorPath;
     mkdirSync(dirname(foreignDescriptor), { recursive: true });
     writeFileSync(foreignDescriptor, published);
     const mismatch = runCli(other.path, ['status']);
@@ -1723,7 +1807,7 @@ test('the agent and field-terminal credentials are scoped to their own surfaces'
 test('a replacement daemon cannot start while the outgoing one is still draining an operation', async () => {
   const fixture = createRepository();
   const sentinel = join(mkdtempSync(join(tmpdir(), 'scrapgrid-drain-')), 'verification-started');
-  const { lockPath } = daemonRuntimePaths(fixture.path);
+  const { lockPath } = testRuntimePaths(fixture.path);
   const daemon = await startDaemon(fixture.path);
   try {
     const sessions = openSessions(fixture.path, ['grok']);
@@ -1746,7 +1830,7 @@ test('a replacement daemon cannot start while the outgoing one is still draining
     assert.ok(existsSync(lockPath), 'ownership is retained while work is in flight');
     const replacement = spawnSync(process.execPath, [COLLABD_ENTRY], {
       cwd: fixture.path,
-      env: { ...process.env, PORT: '0' },
+      env: testEnvironment(fixture.path),
       encoding: 'utf8',
     });
     assert.notEqual(replacement.status, 0, 'a second writer must not start during the drain');
@@ -1783,13 +1867,13 @@ test('a replacement daemon cannot start while the outgoing one is still draining
 
 test('a startup failure after listening surrenders the server, database, and ownership', () => {
   const fixture = createRepository();
-  const { lockPath, descriptorPath } = daemonRuntimePaths(fixture.path);
+  const { lockPath, descriptorPath } = testRuntimePaths(fixture.path);
   try {
     // Make publishing the descriptor fail after the server is already listening.
     mkdirSync(descriptorPath, { recursive: true });
     const failed = spawnSync(process.execPath, [COLLABD_ENTRY], {
       cwd: fixture.path,
-      env: { ...process.env, PORT: '0' },
+      env: testEnvironment(fixture.path),
       encoding: 'utf8',
       timeout: 20_000,
     });

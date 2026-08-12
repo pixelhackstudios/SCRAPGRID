@@ -119,8 +119,9 @@ choosing among its own obligations is not a scheduler; a harness choosing for it
 ### 2.1 Why `implement` is folded, and `claim` is not
 
 `review.request` requires a candidate commit that descends from the task base and that the implementer
-judges complete. Canonical state cannot know completeness: `managed_worktrees.head_commit` is written only
-at bootstrap, and "differs from base" is not "done". So `implement` and `review.request` **must be one
+judges complete. Canonical state cannot know completeness: the durable `managed_worktrees.head_commit` is
+written only at bootstrap, while status and snapshot merely project the current Git HEAD; in either case,
+"differs from base" is not "done". So `implement` and `review.request` **must be one
 action** — an action whose terminal operation is `review.request`. Splitting them would produce a dispatch
 the harness cannot know is due.
 

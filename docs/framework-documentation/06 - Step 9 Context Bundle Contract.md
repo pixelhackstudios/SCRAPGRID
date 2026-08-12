@@ -167,7 +167,7 @@ something that already has an authority elsewhere.
 | `agent_sessions` | **no** | delivery metadata; the bundle must survive session replacement with an unchanged digest (§7.1) |
 | `project_state` | **no** | project-scoped condition; the dispatch envelope reports it (Doc 05 §4) |
 | `claim_reservations` | **no** | binds claim authority to the same agent role gating already binds it to |
-| `managed_worktrees` | **no** | `head_commit` is written only at bootstrap and is known-stale (Doc 03 §6.1); hashing a known-false fact is worse than omitting it |
+| `managed_worktrees` | **no** | the durable row is bootstrap metadata and the live `status`/`snapshot` head is a Git projection (Doc 03 §6.1); neither is task authority, and hashing a moving filesystem observation would make bundle identity unstable |
 | `dispatches` | **no** | issuing a bundle would change the next bundle (§6.3) |
 | `operation_attempts` | **no** | same fixpoint problem, plus it is the causal record *of* delivery |
 | `events` | **no** | `events.id` advances on nearly every write project-wide (§6.3); this is the single largest churn source and the clearest line between a bundle and `sync` |

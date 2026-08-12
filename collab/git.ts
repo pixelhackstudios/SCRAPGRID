@@ -85,10 +85,21 @@ function runCommand(
   executable: string,
   args: string[],
   cwd: string,
+  collaborationDatabasePath: string,
   onOutput?: (stream: 'stdout' | 'stderr', data: string) => void,
 ): Promise<number> {
+  const environment = { ...process.env };
+  for (const name of Object.keys(environment)) {
+    if (name.startsWith('COLLAB_')) delete environment[name];
+  }
+  environment['COLLAB_DB'] = collaborationDatabasePath;
   return new Promise((resolveExit) => {
-    const child = spawn(executable, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+    const child = spawn(executable, args, {
+      cwd,
+      env: environment,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: false,
+    });
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => onOutput?.('stdout', chunk));
@@ -129,6 +140,15 @@ export class GitRepository {
 
   headCommit(): string {
     return this.resolveCommit(git(this.binding.rootPath, ['rev-parse', 'HEAD']));
+  }
+
+  /** Reads current Git artifact truth for a registered worktree without mutating coordination state. */
+  worktreeHead(path: string): string | null {
+    try {
+      return git(path, ['rev-parse', 'HEAD']).toLowerCase();
+    } catch {
+      return null;
+    }
   }
 
   resolveCommit(claim: string): string {
@@ -275,7 +295,13 @@ export class GitRepository {
       return {
         commit,
         commandArgv: [...command],
-        exitCode: await runCommand(executable, command.slice(1), worktreePath, onOutput),
+        exitCode: await runCommand(
+          executable,
+          command.slice(1),
+          worktreePath,
+          join(temporaryRoot, 'runtime', 'collab.db'),
+          onOutput,
+        ),
       };
     } finally {
       if (added) {

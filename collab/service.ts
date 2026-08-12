@@ -548,6 +548,15 @@ export class CollaborationService {
     return worktree ? String(worktree['worktree_path']) : undefined;
   }
 
+  /** Projects registered worktree metadata with the current Git HEAD instead of bootstrap-time state. */
+  private managedWorktrees(): Row[] {
+    const registered = this.db.prepare('SELECT * FROM managed_worktrees ORDER BY agent_id').all() as Row[];
+    return registered.map((worktree) => ({
+      ...worktree,
+      head_commit: this.repository.worktreeHead(String(worktree['worktree_path'])),
+    }));
+  }
+
   listAgents(): Row[] {
     return this.db.prepare('SELECT id, name, kind, status, last_seen_at FROM agents ORDER BY kind, id').all() as Row[];
   }
@@ -784,7 +793,7 @@ export class CollaborationService {
          FROM claim_reservations WHERE expires_at > ? ORDER BY task_id`,
       )
       .all(now()) as Row[];
-    const worktrees = this.db.prepare('SELECT * FROM managed_worktrees ORDER BY agent_id').all() as Row[];
+    const worktrees = this.managedWorktrees();
     return {
       project,
       repository,
@@ -841,7 +850,7 @@ export class CollaborationService {
       leases: this.db.prepare('SELECT * FROM leases ORDER BY acquired_at').all() as Row[],
       claim_reservations: this.db.prepare('SELECT * FROM claim_reservations ORDER BY created_at').all() as Row[],
       task_roles: this.db.prepare('SELECT * FROM task_roles ORDER BY task_id, role').all() as Row[],
-      worktrees: this.db.prepare('SELECT * FROM managed_worktrees ORDER BY agent_id').all() as Row[],
+      worktrees: this.managedWorktrees(),
       messages: this.db.prepare('SELECT * FROM messages ORDER BY created_at').all() as Row[],
       proposals,
       decisions: this.db.prepare('SELECT * FROM decisions ORDER BY created_at').all() as Row[],

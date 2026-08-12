@@ -495,7 +495,7 @@ Some of those gaps have since been closed **in the harness** — a required-chec
 
 All three Pilot 001 `managed_worktrees.head_commit` values remained at the base commit after Codex produced the candidate commit. The candidate itself was correctly recorded on the task and review, but the worktree panel displayed the older registered head.
 
-The current table is effectively bootstrap metadata, not a live Git status projection. The system needs either explicit refresh/update behavior or a clearer semantic name and presentation. **Still open.**
+**Addressed after Pilot 002 task 001.** The durable table remains registration/bootstrap metadata, but `status()` and `snapshot()` now replace its stored `head_commit` with the worktree's current Git HEAD when projecting state. This preserves side-effect-free reads and the distinction between SQLite coordination truth and Git artifact truth while making the field-terminal worktree panel current. A missing or unreadable registered worktree projects a null head rather than presenting a known-stale commit.
 
 ### 6.2 Agent `active` status is not live presence
 
@@ -513,11 +513,19 @@ Real model proposals are substantially larger than ordinary messages. In Pilot 0
 
 The verifier intentionally checks out only committed state. That is correct for Git truth, but commands that depend on untracked or locally installed dependencies may fail in the detached worktree.
 
-**Partly addressed.** The required-check policy gives this an explicit, pinned answer per repository: this repository's own `.scrapgrid/checks.json` provisions dependencies inside the detached worktree as part of its check. That makes the policy a deliberate, auditable choice rather than an accident, but it does not by itself guarantee reproducibility, and a long provisioning step makes each check correspondingly slow.
+**Partly addressed.** The required-check policy gives dependency provisioning an explicit, pinned answer per repository: this repository's own `.scrapgrid/checks.json` provisions dependencies inside the detached worktree as part of its check. Verification commands no longer inherit `COLLAB_*` runtime state from `collabd`; they receive only a fresh `COLLAB_DB` path inside the disposable verification directory. Daemon-lifecycle tests separately bind subprocesses to fixture-local runtime paths. This prevents a verification run from discovering or mutating the live daemon's database, lock, descriptor, or session state. The policy still does not guarantee general dependency reproducibility, and a long provisioning step makes each check correspondingly slow.
 
 ### 6.5 Acceptance is not integration
 
 `acceptTask()` records that the human accepted a candidate after service gates passed. It does not merge, fast-forward, cherry-pick, publish, or delete worktrees. This separation is safe, but an operator needs an explicit later integration workflow rather than assuming `accepted` means the repository's main branch changed. **Still open.**
+
+### 6.6 Daemon restarts rotate the field-terminal credential
+
+Restarting `collabd` intentionally mints new control and browser credentials. The browser credential is printed only in the operator terminal and is deliberately absent from the descriptor file and canonical database, so an already-open browser cannot discover the replacement credential after a restart. Preserving that browser session would require a new persistent credential or authenticated handoff mechanism, not a lifecycle bug fix. **Deferred as an authentication design decision; do not weaken credential rotation as an ergonomic shortcut.**
+
+### 6.7 Pilot startup remains operator-driven
+
+Pilot startup still requires the operator to keep the daemon terminal available, enter each managed worktree through the existing native model runtime, and reopen the field-terminal URL after a daemon restart. The repair above removes the need for verification and tests to inherit the Pilot database path, but it does not add a generalized launcher or model-runtime supervisor. **Deferred until another pilot establishes which remaining startup steps are stable enough to automate.**
 
 ## 7. Reconciliation with the Implementation Plan and Charter
 
@@ -527,7 +535,7 @@ Document 02's phase model has been superseded by the ten-step charter for Pilot 
 |---|---|
 | Phase 0 — contract | Complete as the original task/status/authority baseline. |
 | Phase 1 — first usable slice | Implemented in the CLI-first service and SQLite schema. |
-| Phase 2 — Git truth | Implemented, and extended past the original slice with base-pinned required checks and daemon-executed verification. Live worktree truth and stale-candidate detection remain incomplete. |
+| Phase 2 — Git truth | Implemented, and extended past the original slice with base-pinned required checks and daemon-executed verification. Status and snapshot now project each registered worktree's live HEAD; stale-candidate detection remains incomplete. |
 | Phase 3 — daemon and human controls | Daemon portion complete: `collabd` owns canonical mutation, the CLI is a pure client, and restart and concurrency behavior are covered by tests. Authenticated sessions, heartbeat, and deterministic session recovery were added in step 7, deterministic dispatch of the next permitted action in step 8, and identified context delivery in step 9. The rest of the human control plane — pause/resume, lease revocation, reassignment, waivers — was deliberately not bundled into any of those steps and remains outstanding. |
 | Phase 4 — three-terminal pilot | Pilot 001 was completed and is reconstructable, but the formal gate remains partial because no blocking revision cycle or recovery path was exercised in a real run. Pilot 002 is charter step 10. |
 | Phase 5 — MCP adapters | Not started, and explicitly deferred by the charter. |
