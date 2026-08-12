@@ -17,5 +17,5 @@
     "declaration": true,
     "skipLibCheck": true
   },
-  "include": ["collab/**/*.ts", "tests/**/*.ts"]
+  "include": ["collab/**/*.ts", "game/**/*.ts", "tests/**/*.ts"]
 }
