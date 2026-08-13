@@ -2,6 +2,7 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
+@import "@fontsource/bungee";
 
 @source "../node_modules/streamdown/dist/*.js";
 @source "../node_modules/@streamdown/code/dist/*.js";
@@ -10,51 +11,69 @@
 
 :root {
   color-scheme: dark;
-  --background: oklch(0.155 0.008 115);
-  --foreground: oklch(0.91 0.012 95);
-  --card: oklch(0.19 0.009 110);
-  --card-foreground: var(--foreground);
-  --popover: oklch(0.205 0.009 110);
-  --popover-foreground: var(--foreground);
-  --primary: oklch(0.72 0.12 75);
-  --primary-foreground: oklch(0.16 0.02 75);
-  --secondary: oklch(0.245 0.012 110);
-  --secondary-foreground: var(--foreground);
-  --muted: oklch(0.22 0.01 110);
-  --muted-foreground: oklch(0.65 0.018 100);
-  --accent: oklch(0.27 0.025 75);
-  --accent-foreground: var(--foreground);
-  --destructive: oklch(0.67 0.18 32);
-  --border: oklch(0.29 0.014 105);
-  --border-strong: oklch(0.39 0.018 100);
-  --input: oklch(0.31 0.014 105);
-  --ring: oklch(0.72 0.12 75);
-  --signal: oklch(0.77 0.14 80);
-  --signal-soft: oklch(0.79 0.08 82);
-  --success: oklch(0.71 0.11 145);
-  --agent-grok: oklch(0.75 0.11 145);
-  --agent-claude: oklch(0.75 0.11 55);
-  --agent-codex: oklch(0.72 0.09 240);
-  --grid-line: oklch(0.3 0.01 105 / 20%);
-  --radius: 0.15rem;
-  --sidebar: var(--card);
-  --sidebar-foreground: var(--foreground);
-  --sidebar-primary: var(--primary);
-  --sidebar-primary-foreground: var(--primary-foreground);
-  --sidebar-accent: var(--accent);
-  --sidebar-accent-foreground: var(--accent-foreground);
-  --sidebar-border: var(--border);
-  --sidebar-ring: var(--ring);
-  --chart-1: var(--agent-grok);
-  --chart-2: var(--agent-claude);
-  --chart-3: var(--agent-codex);
-  --chart-4: var(--signal);
-  --chart-5: var(--success);
+  --brand-orange: #d35500;
+  --brand-green: #6cc43d;
+  --brand-yellow: #ffff00;
+  --action-orange: #c45a20;
+  --action-green: #315e2c;
+  --action-green-text: #ddf7cc;
+  --ink-950: #070c0e;
+  --ink-900: #0b1114;
+  --ink-800: #121b1f;
+  --ink-700: #19262a;
+  --ink-600: #223136;
+  --ink-500: #2b3b3f;
+  --ink-400: #53656a;
+  --ink-300: #71817d;
+  --ink-200: #98a6a1;
+  --ink-100: #c9d1cc;
+  --ink-50: #e3e7e0;
+  --background: var(--ink-900);
+  --foreground: var(--ink-100);
+  --card: var(--ink-800);
+  --card-foreground: var(--ink-100);
+  --popover: var(--ink-700);
+  --popover-foreground: var(--ink-50);
+  --primary: var(--action-orange);
+  --primary-foreground: #f0e9df;
+  --secondary: var(--action-green);
+  --secondary-foreground: var(--action-green-text);
+  --muted: var(--ink-700);
+  --muted-foreground: var(--ink-200);
+  --accent: var(--ink-600);
+  --accent-foreground: var(--ink-50);
+  --destructive: #d93838;
+  --border: var(--ink-400);
+  --border-strong: var(--ink-400);
+  --input: var(--ink-500);
+  --ring: #ffff00;
+  --signal: var(--brand-yellow);
+  --signal-soft: #ffff45;
+  --success: var(--brand-green);
+  --agent-grok: var(--brand-green);
+  --agent-claude: var(--brand-orange);
+  --agent-codex: #95d964;
+  --grid-line: rgb(43 59 63 / 35%);
+  --radius: 0.375rem;
+  --sidebar: var(--ink-800);
+  --sidebar-foreground: var(--ink-50);
+  --sidebar-primary: var(--action-orange);
+  --sidebar-primary-foreground: #f0e9df;
+  --sidebar-accent: var(--ink-700);
+  --sidebar-accent-foreground: var(--ink-50);
+  --sidebar-border: var(--ink-500);
+  --sidebar-ring: #ffff00;
+  --chart-1: var(--brand-orange);
+  --chart-2: var(--brand-green);
+  --chart-3: var(--brand-yellow);
+  --chart-4: var(--ink-300);
+  --chart-5: var(--ink-500);
+  --font-display: "Bungee", system-ui, sans-serif;
   --font-mono: "Geist Mono", "SFMono-Regular", Consolas, monospace;
 }
 
 @theme inline {
-  --font-heading: var(--font-sans);
+  --font-heading: "Bungee", system-ui, sans-serif;
   --font-sans: "Geist Variable", sans-serif;
   --font-mono: var(--font-mono);
   --color-background: var(--background);
@@ -99,8 +118,10 @@
 
 @layer base {
   * { @apply border-border outline-ring/50; }
-  html { @apply font-sans; background: var(--background); }
-  body { @apply bg-background text-foreground; min-width: 320px; margin: 0; }
+  html { @apply font-sans; background: var(--ink-950); }
+  body { @apply text-foreground antialiased; min-width: 320px; margin: 0; background: var(--ink-950); }
+  h1, h2 { font-family: var(--font-heading); font-weight: 400; letter-spacing: -0.025em; color: #dde2da; }
+  ::selection { background: var(--brand-orange); color: #160d06; }
   button:not(:disabled), [role="button"]:not(:disabled) { cursor: pointer; }
   code { font-family: var(--font-mono); }
 }
