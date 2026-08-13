@@ -233,6 +233,113 @@ function asRuntimeStreamEvent(row: RuntimeEventRow): Row {
     timestamp: row.timestamp,
   }
 }
+function isChatEvent(event: Row): boolean {
+  const action = text(event['action'])
+  if (action === 'runtime_activity') {
+    return text((event['payload'] as RuntimeEventRow | undefined)?.kind) === 'output'
+  }
+  if (action.startsWith('dispatch') || action.includes('bundle') || action.includes('session')) return false
+  return true
+}
+function polishActivity(activity: string | null | undefined, summary: string): string {
+  if (activity === 'writing') return 'Writing response…'
+  if (activity === 'waiting') return 'Waiting…'
+  if (activity === 'thinking') return 'Thinking…'
+  if (activity === 'verifying') return 'Running tests…'
+  if (activity === 'reviewing') return 'Reviewing the candidate…'
+  if (activity === 'running_command') return 'Running a command…'
+  const cleaned = summary.replace(/\.$/, '').trim()
+  if (!cleaned || /idle|not connected|disconnected/i.test(cleaned)) {
+    if (activity === 'reading') return 'Reading project files…'
+    return 'Working…'
+  }
+  return /[…]$/.test(cleaned) ? cleaned : `${cleaned}…`
+}
+function liveActivityText(snapshot: Snapshot, agentId: string): string | null {
+  const runtime = runtimeOf(snapshot, agentId)
+  if (!runtime) return null
+  if (runtime.presence === 'working' || (runtime.activity && runtime.activity !== 'idle')) {
+    return polishActivity(runtime.activity, runtime.summary ?? '')
+  }
+  return null
+}
+
+const ACTIVITY_HOLD_MS = 1_600
+
+function useActivityStrip(snapshot: Snapshot | null, filter: Target) {
+  const [held, setHeld] = useState<Partial<Record<string, { text: string; hideAt: number }>>>({})
+  const signature = snapshot
+    ? WORKERS.map((id) => `${id}:${liveActivityText(snapshot, id) ?? ''}`).join('|')
+    : ''
+
+  useEffect(() => {
+    if (!snapshot) return
+    const now = Date.now()
+    setHeld((prev) => {
+      let changed = false
+      const next = { ...prev }
+      for (const id of WORKERS) {
+        const live = liveActivityText(snapshot, id)
+        if (live) {
+          if (prev[id]?.text !== live || prev[id]?.hideAt !== 0) {
+            next[id] = { text: live, hideAt: 0 }
+            changed = true
+          }
+        } else if (prev[id] && prev[id].hideAt === 0) {
+          next[id] = { text: prev[id].text, hideAt: now + ACTIVITY_HOLD_MS }
+          changed = true
+        }
+      }
+      return changed ? next : prev
+    })
+  }, [signature, snapshot])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = Date.now()
+      setHeld((prev) => {
+        let changed = false
+        const next = { ...prev }
+        for (const id of WORKERS) {
+          if (next[id] && next[id].hideAt > 0 && next[id].hideAt <= now) {
+            delete next[id]
+            changed = true
+          }
+        }
+        return changed ? next : prev
+      })
+    }, 200)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  const ids = filter === 'global' ? [...WORKERS] : [filter]
+  return ids.flatMap((id) => {
+    const row = held[id]
+    return row ? [{ id, text: row.text, fading: row.hideAt > 0 }] : []
+  })
+}
+
+function ActivityStrip({ rows }: { rows: Array<{ id: string; text: string; fading: boolean }> }) {
+  if (rows.length === 0) return null
+  return (
+    <div className="activity-strip" aria-live="polite" aria-relevant="additions text">
+      {rows.map((row) => (
+        <div
+          key={row.id}
+          className="activity-row"
+          data-worker={row.id}
+          data-fading={row.fading || undefined}
+        >
+          <span className="activity-who">
+            <i className="activity-dot" />
+            {workerLabel(row.id)}
+          </span>
+          <span className="activity-what">{row.text}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
 
 async function readTextFiles(list: FileList | null): Promise<Array<{ filename: string; content: string }>> {
   if (!list || list.length === 0) return []
@@ -373,46 +480,19 @@ function StreamEvent({
 
   if (action === 'runtime_activity') {
     const payload = (event['payload'] ?? {}) as RuntimeEventRow
-    const kind = text(payload.kind)
-    if (kind === 'output') {
-      return (
-        <Message align="start" data-actor={actor}>
-          <MessageContent>
-            <MessageHeader>
-              <span>{workerLabel(actor)}</span>
-              <span className="message-route">live</span>
-            </MessageHeader>
-            <Bubble variant="outline" align="start">
-              <BubbleContent><MarkdownBody>{text(payload.body)}</MarkdownBody></BubbleContent>
-            </Bubble>
-            <MessageFooter>{time}</MessageFooter>
-          </MessageContent>
-        </Message>
-      )
-    }
-    if (kind === 'thought') {
-      return (
-        <Message align="start" data-actor={actor} data-kind="thought">
-          <MessageContent>
-            <MessageHeader>
-              <span>{workerLabel(actor)}</span>
-              <span className="message-route">thinking</span>
-            </MessageHeader>
-            <Bubble variant="outline" align="start">
-              <BubbleContent><p className="thought-body">{text(payload.body) || 'Thinking.'}</p></BubbleContent>
-            </Bubble>
-            <MessageFooter>{time}</MessageFooter>
-          </MessageContent>
-        </Message>
-      )
-    }
+    if (text(payload.kind) !== 'output') return null
     return (
-      <Marker variant="separator">
-        <MarkerIcon><CircleDotIcon /></MarkerIcon>
-        <MarkerContent>
-          {workerLabel(actor)} · {text(payload.title) || kind}{time ? ` · ${time}` : ''}
-        </MarkerContent>
-      </Marker>
+      <Message align="start" data-actor={actor}>
+        <MessageContent>
+          <MessageHeader>
+            <span>{workerLabel(actor)}</span>
+          </MessageHeader>
+          <Bubble variant="muted" align="start">
+            <BubbleContent><MarkdownBody>{text(payload.body)}</MarkdownBody></BubbleContent>
+          </Bubble>
+          <MessageFooter>{time}</MessageFooter>
+        </MessageContent>
+      </Message>
     )
   }
 
@@ -428,7 +508,7 @@ function StreamEvent({
               <span className="message-route">to {workerLabel(text(message['recipient']))}</span>
             )}
           </MessageHeader>
-          <Bubble variant={actor === 'human' ? 'tinted' : 'outline'} align={actor === 'human' ? 'end' : 'start'}>
+          <Bubble variant={actor === 'human' ? 'default' : 'muted'} align={actor === 'human' ? 'end' : 'start'}>
             <BubbleContent><MarkdownBody>{text(message['body'])}</MarkdownBody></BubbleContent>
           </Bubble>
           <MessageFooter>{time}</MessageFooter>
@@ -541,8 +621,10 @@ function App() {
   const filesRef = useRef<HTMLInputElement>(null)
   const contextRef = useRef<HTMLInputElement>(null)
   const streamRef = useRef<VirtuosoHandle>(null)
+  const streamWrapRef = useRef<HTMLDivElement>(null)
   const booted = useRef(false)
   const promoteLock = useRef(false)
+  const activityRows = useActivityStrip(snapshot, filter)
 
   const chooseTask = useCallback((taskId: string | null) => {
     setSelectedTaskId(taskId)
@@ -589,7 +671,7 @@ function App() {
     const live = (snapshot.runtime_events ?? [])
       .map(asRuntimeStreamEvent)
       .filter((event) => filter === 'global' || text(event['actor']) === filter)
-    return [...coordination, ...live].sort((left, right) => {
+    return [...coordination, ...live].filter(isChatEvent).sort((left, right) => {
       const leftTime = Date.parse(text(left['timestamp']))
       const rightTime = Date.parse(text(right['timestamp']))
       if (leftTime !== rightTime) return leftTime - rightTime
@@ -652,6 +734,18 @@ function App() {
       })
       .catch((err: unknown) => setActionError(err instanceof Error ? err.message : 'Could not open file'))
   }, [])
+
+  useEffect(() => {
+    const el = streamWrapRef.current
+    if (!el) return
+    const apply = () => {
+      el.style.setProperty('--stream-pane-height', `${Math.max(160, el.clientHeight - 8)}px`)
+    }
+    apply()
+    const observer = new ResizeObserver(apply)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [stream.length])
 
   useEffect(() => {
     if (!snapshot || promoteLock.current || pending !== null) return
@@ -852,12 +946,13 @@ function App() {
                   ))}
                 </TabsList>
               </Tabs>
+              <ActivityStrip rows={activityRows} />
               {showHistory && snapshot && (
                 <p className="quiet">History is the live stream below. Filter with the tabs.</p>
               )}
             </div>
             <div className="stream-well chat-measure">
-              <div className="stream-wrap">
+              <div className="stream-wrap" ref={streamWrapRef}>
                 {!snapshot ? (
                   <div className="empty-live">
                     <h3>Loading the room…</h3>
@@ -879,15 +974,15 @@ function App() {
                     initialTopMostItemIndex={{ index: stream.length - 1, align: 'end' }}
                     followOutput="auto"
                     atBottomStateChange={setAtBottom}
-                    itemContent={(_index, event) => (
-                      <div className="stream-item">
+                    itemContent={(index, event) => (
+                      <div className={index === stream.length - 1 ? 'stream-item stream-item-latest' : 'stream-item'}>
                         <StreamEvent event={event} snapshot={snapshot} pending={pending} runMutation={runMutation} />
                       </div>
                     )}
                   />
                 )}
                 {!atBottom && stream.length > 0 && (
-                  <Button className="stream-latest" size="icon-sm" variant="secondary" onClick={() => streamRef.current?.scrollToIndex({ index: stream.length - 1, align: 'end' })}>
+                  <Button className="stream-latest" size="icon-sm" variant="secondary" onClick={() => streamRef.current?.scrollToIndex({ index: stream.length - 1, align: 'start' })}>
                     <ArrowDownIcon />
                     <span className="sr-only">Jump to latest</span>
                   </Button>
@@ -1088,9 +1183,15 @@ function App() {
               <details className="tech">
                 <summary>Technical details</summary>
                 <pre>
-{selectedTask
-  ? `status ${text(selectedTask['status'])}\nbase ${shortSha(selectedTask['base_commit'])}\ncandidate ${shortSha(selectedTask['candidate_commit'])}`
-  : 'No work selected'}
+{[
+  selectedTask
+    ? `status ${text(selectedTask['status'])}\nbase ${shortSha(selectedTask['base_commit'])}\ncandidate ${shortSha(selectedTask['candidate_commit'])}`
+    : 'No work selected',
+  ...(snapshot?.runtime_events ?? [])
+    .filter((event) => event.kind === 'tool' && (filter === 'global' || event.agent_id === filter))
+    .slice(-24)
+    .map((event) => `${formatTime(event.timestamp)} ${workerLabel(event.agent_id)} ${event.title}`),
+].filter(Boolean).join('\n')}
                 </pre>
               </details>
             </div>
