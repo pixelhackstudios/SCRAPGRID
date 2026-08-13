@@ -17,6 +17,7 @@ import type { GitRepository } from './git.js';
 import { AttachmentError, parseAttachmentInputs, ATTACHMENT_MAX_REQUEST_BYTES } from './attachments.js';
 import type { CollaborationService } from './service.js';
 import { CollaborationError } from './service.js';
+import { emptyRuntimeView, type RuntimeObserver } from './observe.js';
 
 const HUMAN_OPERATIONS = new Set([
   'task.create',
@@ -115,6 +116,7 @@ export interface CollaborationHttpOptions {
   daemon: DaemonSummary;
   activity?: ActivityGate;
   sessionActivity?: SessionActivity;
+  observer?: RuntimeObserver;
   staticRoot?: string;
 }
 
@@ -441,7 +443,11 @@ async function streamOperation(
 }
 
 export function createCollaborationHttpServer(options: CollaborationHttpOptions) {
-  const { service, repository, credentials, daemon, activity, sessionActivity, staticRoot } = options;
+  const { service, repository, credentials, daemon, activity, sessionActivity, observer, staticRoot } = options;
+  const fieldSnapshot = () => {
+    const view = observer?.tick() ?? emptyRuntimeView();
+    return { ...service.snapshot(), runtimes: view.runtimes, runtime_events: view.events };
+  };
   return createServer(async (request, response) => {
     activity?.begin();
     try {
@@ -449,7 +455,15 @@ export function createCollaborationHttpServer(options: CollaborationHttpOptions)
 
       if (request.method === 'GET' && url.pathname === '/api/snapshot') {
         requireCredential(request, credentials.browser, 'field terminal');
-        return json(response, 200, service.snapshot());
+        return json(response, 200, fieldSnapshot());
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/runtime') {
+        requireCredential(request, credentials.browser, 'field terminal');
+        const view = observer?.tick() ?? emptyRuntimeView();
+        const after = Number(url.searchParams.get('after') ?? '0');
+        const events = Number.isInteger(after) && after > 0 ? observer?.eventsAfter(after) ?? view.events : view.events;
+        return json(response, 200, { runtimes: view.runtimes, events, cursor: view.cursor });
       }
 
       const attachmentMatch = url.pathname.match(/^\/api\/attachments\/([^/]+)$/);
@@ -480,7 +494,7 @@ export function createCollaborationHttpServer(options: CollaborationHttpOptions)
             }
             throw error;
           }
-          return json(response, 200, service.snapshot());
+          return json(response, 200, fieldSnapshot());
         }
 
         if (url.pathname === '/api/operations') {
@@ -509,11 +523,11 @@ export function createCollaborationHttpServer(options: CollaborationHttpOptions)
         }
         if (revealMatch) {
           service.revealProposals(decodeURIComponent(revealMatch[1] ?? ''), 'human');
-          return json(response, 200, service.snapshot());
+          return json(response, 200, fieldSnapshot());
         }
         if (decisionMatch) {
           service.acceptDecision(decodeURIComponent(decisionMatch[1] ?? ''), 'human');
-          return json(response, 200, service.snapshot());
+          return json(response, 200, fieldSnapshot());
         }
         if (taskMatch) {
           const body = await readJson(request);
@@ -526,7 +540,7 @@ export function createCollaborationHttpServer(options: CollaborationHttpOptions)
             actor: 'human',
             expectedVersion: Number(expectedVersion),
           });
-          return json(response, 200, service.snapshot());
+          return json(response, 200, fieldSnapshot());
         }
       }
 

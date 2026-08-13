@@ -24,6 +24,7 @@ import {
 } from './runtime.js';
 import { SCHEMA_VERSION } from './schema.js';
 import { CollaborationService, SESSION_STALE_AFTER_MS } from './service.js';
+import { createFsObserveHost, RuntimeObserver } from './observe.js';
 
 const HOST = '127.0.0.1';
 
@@ -82,6 +83,20 @@ async function start(): Promise<void> {
     started_at: startedAt,
   };
 
+  const observer = new RuntimeObserver(
+    createFsObserveHost({
+      repoRoot: repository.binding.rootPath,
+      worktrees: () => {
+        const status = service.status() as { worktrees?: Array<Record<string, unknown>> };
+        return (status.worktrees ?? []).map((worktree) => ({
+          agent_id: String(worktree['agent_id'] ?? ''),
+          path: String(worktree['worktree_path'] ?? ''),
+        }));
+      },
+    }),
+  );
+  observer.start();
+
   const server = createCollaborationHttpServer({
     service,
     repository,
@@ -89,6 +104,7 @@ async function start(): Promise<void> {
     daemon,
     activity,
     sessionActivity,
+    observer,
     staticRoot: resolve(repository.binding.rootPath, 'dist'),
   });
 
@@ -104,6 +120,7 @@ async function start(): Promise<void> {
   const teardown = async (): Promise<void> => {
     if (tearingDown) return;
     tearingDown = true;
+    observer.stop();
     const closed = new Promise<void>((done) => server.close(() => done()));
     server.closeIdleConnections();
     await activity.whenIdle();

@@ -70,6 +70,24 @@ interface DerivedWorker {
   session?: { liveness?: string; work_in_flight?: boolean }
   tasks?: DerivedTaskResult[]
 }
+interface RuntimeAgent {
+  agent_id: string
+  presence: 'not_connected' | 'connected' | 'working' | 'disconnected'
+  activity?: string | null
+  summary?: string
+  pid?: number | null
+  cwd?: string | null
+  native_session_id?: string | null
+  last_observed_at?: string | null
+}
+interface RuntimeEventRow {
+  id: number
+  agent_id: string
+  kind: string
+  title: string
+  body: string
+  timestamp: string
+}
 interface Snapshot {
   project: Row
   agents: Row[]
@@ -87,6 +105,8 @@ interface Snapshot {
   message_attachments: Row[]
   task_attachments: Row[]
   derived_actions: Record<string, DerivedWorker>
+  runtimes?: RuntimeAgent[]
+  runtime_events?: RuntimeEventRow[]
 }
 
 const StreamList = forwardRef<HTMLDivElement, React.ComponentPropsWithoutRef<'div'>>(
@@ -157,30 +177,61 @@ function defaultRoles(): { implementer: string; reviewer: string; verifier: stri
 function workerLabel(id: string): string {
   return actorNames[id] ?? id
 }
-function workerIsBusy(snapshot: Snapshot, agentId: string): boolean {
-  return Boolean(snapshot.derived_actions?.[agentId]?.session?.work_in_flight)
+function runtimeOf(snapshot: Snapshot, agentId: string): RuntimeAgent | undefined {
+  return snapshot.runtimes?.find((row) => row.agent_id === agentId)
 }
-function whatTheyAreDoing(snapshot: Snapshot, taskId: string, agentId: string): string {
+function workerPresence(snapshot: Snapshot, agentId: string): RuntimeAgent['presence'] {
+  return runtimeOf(snapshot, agentId)?.presence ?? 'not_connected'
+}
+function workerIsBusy(snapshot: Snapshot, agentId: string): boolean {
+  return workerPresence(snapshot, agentId) === 'working' || Boolean(snapshot.derived_actions?.[agentId]?.session?.work_in_flight)
+}
+function presenceLabel(presence: RuntimeAgent['presence'], busy: boolean): string {
+  if (busy || presence === 'working') return 'Working'
+  if (presence === 'connected') return 'Idle'
+  if (presence === 'disconnected') return 'Disconnected'
+  return 'Offline'
+}
+function dispatchStatus(snapshot: Snapshot, taskId: string, agentId: string): string | null {
   const derived = snapshot.derived_actions?.[agentId]?.tasks?.find((row) => row.task_id === taskId)
-  if (snapshot.derived_actions?.[agentId]?.session?.work_in_flight) return 'Working right now.'
-  if (!derived) return 'Waiting their turn.'
+  if (snapshot.derived_actions?.[agentId]?.session?.work_in_flight) return 'Harness mutation in flight.'
+  if (!derived) return null
   if (derived.kind === 'action') {
     switch (derived.action?.['kind'] ?? derived.action_kind) {
       case 'claim':
-        return 'About to start.'
+        return 'Next harness action: claim.'
       case 'implement':
-        return 'Building it now.'
+        return 'Next harness action: implement.'
       case 'review':
-        return 'Reviewing the work.'
+        return 'Next harness action: review.'
       case 'verify':
-        return 'Checking the work.'
+        return 'Next harness action: verify.'
       default:
-        return 'Working.'
+        return 'Has a harness action.'
     }
   }
   if (derived.kind === 'waiting' && derived.actor === 'human') return 'Waiting on you.'
-  if (derived.kind === 'waiting') return 'Waiting their turn.'
-  return 'Waiting their turn.'
+  return null
+}
+function whatTheyAreDoing(snapshot: Snapshot, taskId: string, agentId: string): string {
+  const runtime = runtimeOf(snapshot, agentId)
+  const presence = runtime?.presence ?? 'not_connected'
+  if (presence === 'working') return runtime?.summary || 'Working right now.'
+  if (presence === 'disconnected') return 'Disconnected.'
+  if (presence === 'not_connected') return 'Not connected.'
+  const next = dispatchStatus(snapshot, taskId, agentId)
+  return next ? `Connected. Idle. ${next}` : 'Connected. Idle.'
+}
+function asRuntimeStreamEvent(row: RuntimeEventRow): Row {
+  return {
+    id: `rt-${row.id}`,
+    actor: row.agent_id,
+    entity_type: 'runtime',
+    entity_id: String(row.id),
+    action: 'runtime_activity',
+    payload: row,
+    timestamp: row.timestamp,
+  }
 }
 
 async function readTextFiles(list: FileList | null): Promise<Array<{ filename: string; content: string }>> {
@@ -248,6 +299,24 @@ function useSnapshot() {
     const timer = window.setInterval(() => void refresh(controller.signal), 2_000)
     return () => { controller.abort(); window.clearInterval(timer) }
   }, [refresh])
+  useEffect(() => {
+    const controller = new AbortController()
+    const pull = async () => {
+      try {
+        const response = await apiFetch('/api/runtime', { signal: controller.signal })
+        if (!response.ok) return
+        const body = await readApiResponse<{ runtimes: RuntimeAgent[]; events: RuntimeEventRow[] }>(response, 'Runtime')
+        setSnapshot((current) => (
+          current ? { ...current, runtimes: body.runtimes, runtime_events: body.events } : current
+        ))
+      } catch (requestError) {
+        if ((requestError as Error).name === 'AbortError') return
+      }
+    }
+    void pull()
+    const timer = window.setInterval(() => void pull(), 500)
+    return () => { controller.abort(); window.clearInterval(timer) }
+  }, [])
   return { snapshot, setSnapshot, error, unauthorized, refresh }
 }
 
@@ -301,6 +370,51 @@ function StreamEvent({
   const action = text(event['action'])
   const actor = text(event['actor'])
   const time = formatTime(event['timestamp'])
+
+  if (action === 'runtime_activity') {
+    const payload = (event['payload'] ?? {}) as RuntimeEventRow
+    const kind = text(payload.kind)
+    if (kind === 'output') {
+      return (
+        <Message align="start" data-actor={actor}>
+          <MessageContent>
+            <MessageHeader>
+              <span>{workerLabel(actor)}</span>
+              <span className="message-route">live</span>
+            </MessageHeader>
+            <Bubble variant="outline" align="start">
+              <BubbleContent><MarkdownBody>{text(payload.body)}</MarkdownBody></BubbleContent>
+            </Bubble>
+            <MessageFooter>{time}</MessageFooter>
+          </MessageContent>
+        </Message>
+      )
+    }
+    if (kind === 'thought') {
+      return (
+        <Message align="start" data-actor={actor} data-kind="thought">
+          <MessageContent>
+            <MessageHeader>
+              <span>{workerLabel(actor)}</span>
+              <span className="message-route">thinking</span>
+            </MessageHeader>
+            <Bubble variant="outline" align="start">
+              <BubbleContent><p className="thought-body">{text(payload.body) || 'Thinking.'}</p></BubbleContent>
+            </Bubble>
+            <MessageFooter>{time}</MessageFooter>
+          </MessageContent>
+        </Message>
+      )
+    }
+    return (
+      <Marker variant="separator">
+        <MarkerIcon><CircleDotIcon /></MarkerIcon>
+        <MarkerContent>
+          {workerLabel(actor)} · {text(payload.title) || kind}{time ? ` · ${time}` : ''}
+        </MarkerContent>
+      </Marker>
+    )
+  }
 
   if (action === 'message_sent') {
     const message = snapshot.messages.find((item) => item['id'] === id)
@@ -467,10 +581,19 @@ function App() {
   const sealed = snapshot?.proposals.filter((item) => item['task_id'] === selectedTaskId && item['visibility'] === 'sealed') ?? []
   const stream = useMemo(() => {
     if (!snapshot) return []
-    return snapshot.events.filter((event) => {
+    const coordination = snapshot.events.filter((event) => {
       if (selectedTaskId && eventTaskId(event, snapshot) !== selectedTaskId) return false
       if (filter === 'global') return true
       return text(event['actor']) === filter
+    })
+    const live = (snapshot.runtime_events ?? [])
+      .map(asRuntimeStreamEvent)
+      .filter((event) => filter === 'global' || text(event['actor']) === filter)
+    return [...coordination, ...live].sort((left, right) => {
+      const leftTime = Date.parse(text(left['timestamp']))
+      const rightTime = Date.parse(text(right['timestamp']))
+      if (leftTime !== rightTime) return leftTime - rightTime
+      return String(left['id']).localeCompare(String(right['id']), undefined, { numeric: true })
     })
   }, [filter, selectedTaskId, snapshot])
 
@@ -670,15 +793,28 @@ function App() {
                 <div className="worker-grid">
                   {WORKERS.map((id) => {
                     const busy = workerIsBusy(snapshot, id)
+                    const presence = workerPresence(snapshot, id)
                     const status = selectedTaskId
                       ? whatTheyAreDoing(snapshot, selectedTaskId, id)
-                      : 'Waiting for a job.'
+                      : presence === 'not_connected'
+                        ? 'Not connected.'
+                        : presence === 'working'
+                          ? (runtimeOf(snapshot, id)?.summary ?? 'Working.')
+                          : presence === 'disconnected'
+                            ? 'Disconnected.'
+                            : 'Connected. Idle.'
                     return (
-                      <Card key={id} className="worker-card" data-worker={id} data-busy={busy || undefined}>
+                      <Card
+                        key={id}
+                        className="worker-card"
+                        data-worker={id}
+                        data-busy={busy || undefined}
+                        data-presence={presence}
+                      >
                         <CardHeader>
                           <div className="worker-name">
                             <strong>{workerLabel(id)}</strong>
-                            <Badge variant={busy ? 'secondary' : 'outline'}>{busy ? 'Working' : 'Waiting'}</Badge>
+                            <Badge variant={busy ? 'secondary' : 'outline'}>{presenceLabel(presence, busy)}</Badge>
                           </div>
                         </CardHeader>
                         <CardContent>

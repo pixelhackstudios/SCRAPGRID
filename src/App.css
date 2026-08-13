@@ -239,6 +239,21 @@ html, body, #root { height: 100%; overflow: hidden; }
 .worker-card[data-worker="claude"] { box-shadow: inset 4px 0 0 var(--agent-claude); }
 .worker-card[data-worker="codex"] { box-shadow: inset 4px 0 0 var(--agent-codex); }
 .worker-card[data-worker="grok"] { box-shadow: inset 4px 0 0 var(--agent-grok); }
+.worker-card[data-presence="not_connected"],
+.worker-card[data-presence="disconnected"] { opacity: .68; }
+.worker-card[data-presence="working"] {
+  background: color-mix(in srgb, var(--ink-800) 82%, var(--brand-yellow) 18%);
+}
+.worker-card[data-presence="working"] .worker-name strong::after {
+  content: "";
+  display: inline-block;
+  width: .45rem;
+  height: .45rem;
+  margin-left: .45rem;
+  border-radius: 99px;
+  background: var(--brand-green);
+  vertical-align: middle;
+}
 .worker-name {
   display: flex;
   align-items: center;
@@ -247,6 +262,13 @@ html, body, #root { height: 100%; overflow: hidden; }
 }
 .worker-name strong { font-size: 1.15rem; line-height: 1.2; color: var(--ink-50); }
 .worker-status { margin: 0; color: var(--ink-200); font-size: .9rem; line-height: 1.4; }
+.thought-body {
+  margin: 0;
+  color: var(--ink-200);
+  font-style: italic;
+  font-size: .9rem;
+  line-height: 1.45;
+}
 
 .stream-well {
   min-height: 0;
