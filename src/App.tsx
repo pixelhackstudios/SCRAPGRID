@@ -5,6 +5,7 @@ import {
   CircleDotIcon,
   ArrowUpIcon,
   PlusIcon,
+  Trash2Icon,
   ShieldCheckIcon,
   TriangleAlertIcon,
 } from 'lucide-react'
@@ -20,7 +21,6 @@ import {
   CardHeader,
 } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
@@ -96,6 +96,30 @@ const StreamList = forwardRef<HTMLDivElement, React.ComponentPropsWithoutRef<'di
 )
 StreamList.displayName = 'StreamList'
 const virtuosoComponents = { List: StreamList }
+
+function VirtualList<T>({
+  data,
+  itemKey,
+  empty,
+  className,
+  itemContent,
+}: {
+  data: T[]
+  itemKey: (item: T) => string
+  empty: string
+  className?: string
+  itemContent: (index: number, item: T) => React.ReactNode
+}) {
+  if (data.length === 0) return <p className="quiet">{empty}</p>
+  return (
+    <Virtuoso
+      className={['virtual-list', className].filter(Boolean).join(' ')}
+      data={data}
+      computeItemKey={(_index, item) => itemKey(item)}
+      itemContent={itemContent}
+    />
+  )
+}
 const markdownPlugins = { code: createCodePlugin({ themes: ['github-dark', 'github-dark'] }) }
 const markdownComponents: Components = { h1: 'h3', h2: 'h4', h3: 'h5', h4: 'h6', h5: 'h6', h6: 'h6' }
 const actorNames: Record<string, string> = { claude: 'Claude', codex: 'Codex', grok: 'Grok', human: 'You' }
@@ -492,6 +516,20 @@ function App() {
     setQueue((items) => [...items, { id: newId('queue'), title }])
   }, [])
 
+  const removeJob = useCallback((id: string) => {
+    setQueue((items) => items.filter((row) => row.id !== id))
+  }, [])
+
+  const openFile = useCallback((file: Row) => {
+    void apiFetch(`/api/attachments/${encodeURIComponent(text(file['id']))}`)
+      .then((response) => readApiResponse<Row>(response, 'File'))
+      .then((body) => {
+        const blob = new Blob([text(body['body'])], { type: text(body['media_type'], 'text/plain') })
+        window.open(URL.createObjectURL(blob), '_blank', 'noopener')
+      })
+      .catch((err: unknown) => setActionError(err instanceof Error ? err.message : 'Could not open file'))
+  }, [])
+
   useEffect(() => {
     if (!snapshot || promoteLock.current || pending !== null) return
     if (snapshot.tasks.some((task) => isVisibleWork(task))) return
@@ -530,9 +568,8 @@ function App() {
       <header className="board-header">
         <div className="board-brand">
           <h1>SCRAPGRID</h1>
-          <p>3 AI models working together</p>
         </div>
-        <div className="board-title">
+        <div className="board-title chat-measure">
           <span className="building-now">Building now</span>
           <strong>{selectedTask ? taskTitle(selectedTask) : 'Nothing yet — add a job on the left'}</strong>
         </div>
@@ -548,72 +585,86 @@ function App() {
 
       <div className="board-body">
         <aside className="col col-work">
-          <ScrollArea className="h-full">
-            <div className="col-stack">
-              <h2 className="col-heading">Build queue</h2>
-              <section className="queue-group">
-                <p className="section-kicker">Now</p>
-                <ul className="work-list">
-                  {currentWork.map((task) => (
-                    <li key={text(task['id'])}>
-                      <button type="button" className="work-item" data-current={task['id'] === selectedTaskId || undefined} onClick={() => chooseTask(text(task['id']))}>
-                        <span className={task['id'] === selectedTaskId ? 'dot dot-live' : 'dot'} />
-                        <strong>{taskTitle(task)}</strong>
-                        {task['id'] === selectedTaskId && <Badge>Now</Badge>}
-                      </button>
-                    </li>
-                  ))}
-                  {currentWork.length === 0 && <li className="quiet">Nothing yet. Add a job below.</li>}
-                </ul>
-              </section>
-              <section className="queue-group">
-                <p className="section-kicker">Up next</p>
-                {queue.length === 0 ? (
-                  <p className="quiet">Queue is empty.</p>
-                ) : (
-                  <ol className="work-list numbered">
-                    {queue.map((item) => (
-                      <li key={item.id} className="work-item work-item-queued">
-                        <strong>{item.title}</strong>
-                      </li>
-                    ))}
-                  </ol>
-                )}
-                <form
-                  className="queue-form"
-                  onSubmit={(event) => {
-                    event.preventDefault()
-                    const title = queueDraft.trim()
-                    if (!title) return
-                    addJob(title)
-                    setQueueDraft('')
-                  }}
-                >
-                  <Input value={queueDraft} onChange={(event) => setQueueDraft(event.target.value)} placeholder="Player movement" aria-label="Add next job" />
-                  <Button type="submit" size="sm">Add next job</Button>
-                </form>
-              </section>
-              <section className="queue-group">
-                <p className="section-kicker">Done</p>
-                <ul className="work-list">
-                  {completedWork.map((task) => (
-                    <li key={text(task['id'])}>
-                      <button type="button" className="work-item work-item-done" onClick={() => chooseTask(text(task['id']))}>
-                        <CheckIcon />
-                        <strong>{taskTitle(task)}</strong>
-                      </button>
-                    </li>
-                  ))}
-                  {completedWork.length === 0 && <li className="quiet">None yet.</li>}
-                </ul>
-              </section>
-            </div>
-          </ScrollArea>
+          <div className="col-stack">
+            <h2 className="col-heading">Build queue</h2>
+            <section className="queue-group">
+              <p className="section-kicker">Now</p>
+              <div className="queue-lane">
+                <VirtualList
+                  data={currentWork}
+                  itemKey={(task) => text(task['id'])}
+                  empty="Nothing yet. Add a job below."
+                  itemContent={(_index, task) => (
+                    <button type="button" className="work-item" data-current={task['id'] === selectedTaskId || undefined} onClick={() => chooseTask(text(task['id']))}>
+                      <span className={task['id'] === selectedTaskId ? 'dot dot-live' : 'dot'} />
+                      <strong>{taskTitle(task)}</strong>
+                      {task['id'] === selectedTaskId && <Badge>Now</Badge>}
+                    </button>
+                  )}
+                />
+              </div>
+            </section>
+            <section className="queue-group">
+              <p className="section-kicker">Up next</p>
+              <div className="queue-lane">
+                <VirtualList
+                  data={queue}
+                  itemKey={(item) => item.id}
+                  empty="Queue is empty."
+                  itemContent={(index, item) => (
+                    <div className="work-item work-item-queued">
+                      <span className="queue-index">{index + 1}.</span>
+                      <strong>{item.title}</strong>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        className="queue-remove"
+                        aria-label={`Remove ${item.title} from the queue`}
+                        onClick={() => removeJob(item.id)}
+                      >
+                        <Trash2Icon />
+                      </Button>
+                    </div>
+                  )}
+                />
+              </div>
+            </section>
+            <section className="queue-group">
+              <p className="section-kicker">Done</p>
+              <div className="queue-lane">
+                <VirtualList
+                  data={completedWork}
+                  itemKey={(task) => text(task['id'])}
+                  empty="None yet."
+                  itemContent={(_index, task) => (
+                    <button type="button" className="work-item work-item-done" onClick={() => chooseTask(text(task['id']))}>
+                      <CheckIcon />
+                      <strong>{taskTitle(task)}</strong>
+                    </button>
+                  )}
+                />
+              </div>
+            </section>
+            <form
+              className="queue-form"
+              onSubmit={(event) => {
+                event.preventDefault()
+                const title = queueDraft.trim()
+                if (!title) return
+                addJob(title)
+                setQueueDraft('')
+              }}
+            >
+              <Input value={queueDraft} onChange={(event) => setQueueDraft(event.target.value)} placeholder="i.e. Player Movement" aria-label="Add next job" />
+              <Button type="submit" size="sm">Add next job</Button>
+            </form>
+          </div>
         </aside>
 
         <section className="col col-live" aria-label="Live collaboration">
           <div className="live-stage">
-            <div className="live-head">
+            <div className="live-head chat-measure">
               <h2 className="col-heading">The team</h2>
               {snapshot && (
                 <div className="worker-grid">
@@ -669,7 +720,7 @@ function App() {
                 <p className="quiet">History is the live stream below. Filter with the tabs.</p>
               )}
             </div>
-            <div className="stream-well">
+            <div className="stream-well chat-measure">
               <div className="stream-wrap">
                 {!snapshot ? (
                   <div className="empty-live">
@@ -707,39 +758,128 @@ function App() {
                 )}
               </div>
             </div>
+            <form
+              className="composer chat-measure"
+              onSubmit={(event) => {
+                event.preventDefault()
+                const body = messageDraft.trim()
+                if (!body) return
+                void (async () => {
+                  let taskId = selectedTaskId ?? (text(currentWork[0]?.['id'] ?? '', '') || null)
+                  if (!taskId) {
+                    await startWork(body.slice(0, 120))
+                    taskId = window.localStorage.getItem(TASK_KEY)
+                  }
+                  if (!taskId) return
+                  const files = await readTextFiles(filesRef.current?.files ?? null)
+                  const targets = composerTarget === 'global' ? [...WORKERS] : [composerTarget]
+                  for (const to of targets) {
+                    await runHuman('message', 'message.send', { to, taskId, body, files })
+                  }
+                  setMessageDraft('')
+                  setPendingFiles([])
+                  if (filesRef.current) filesRef.current.value = ''
+                })().catch(() => undefined)
+              }}
+            >
+              {pendingFiles.length > 0 && (
+                <p className="composer-files">With this message: {pendingFiles.join(', ')}</p>
+              )}
+              <div className="composer-row">
+                <Select
+                  value={composerTarget}
+                  onValueChange={(value) => setComposerTarget(value as Target)}
+                >
+                  <SelectTrigger
+                    id="message-to"
+                    size="sm"
+                    className="shrink-0"
+                    aria-label="Send to"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent position="popper" align="start">
+                    <SelectGroup>
+                      <SelectItem value="global">Everyone</SelectItem>
+                      {WORKERS.map((id) => (
+                        <SelectItem key={id} value={id}>{workerLabel(id)}</SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      aria-label="Attach a file to this message"
+                      onClick={() => filesRef.current?.click()}
+                    >
+                      <PlusIcon />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Attach a file</TooltipContent>
+                </Tooltip>
+                <input
+                  ref={filesRef}
+                  className="sr-only"
+                  type="file"
+                  multiple
+                  accept=".md,.txt,.json,.yaml,.yml,.toml,.csv,.tsv,.xml"
+                  onChange={(event) => setPendingFiles(Array.from(event.target.files ?? []).map((file) => file.name))}
+                />
+                <label className="sr-only" htmlFor="team-message">Message</label>
+                <Textarea
+                  id="team-message"
+                  value={messageDraft}
+                  rows={1}
+                  onChange={(event) => setMessageDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault()
+                      event.currentTarget.form?.requestSubmit()
+                    }
+                  }}
+                  placeholder="Tell the team what you need…"
+                  required
+                  className="min-h-11 max-h-40"
+                />
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="submit"
+                      size="icon"
+                      disabled={pending !== null || messageDraft.trim().length === 0}
+                      aria-label="Send"
+                    >
+                      <ArrowUpIcon />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Send</TooltipContent>
+                </Tooltip>
+              </div>
+            </form>
           </div>
         </section>
 
         <aside className="col col-side">
-          <ScrollArea className="h-full">
             <div className="col-stack">
-              <Card>
+              <Card className="files-card">
                 <CardHeader>
                   <h2 className="col-heading">Project files</h2>
                 </CardHeader>
-                <CardContent>
-                  {taskFiles.length === 0 ? <p className="quiet">Docs the team should keep.</p> : (
-                    <ul className="file-list">
-                      {taskFiles.map((file) => (
-                        <li key={text(file['id'])}>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              void apiFetch(`/api/attachments/${encodeURIComponent(text(file['id']))}`)
-                                .then((response) => readApiResponse<Row>(response, 'File'))
-                                .then((body) => {
-                                  const blob = new Blob([text(body['body'])], { type: text(body['media_type'], 'text/plain') })
-                                  window.open(URL.createObjectURL(blob), '_blank', 'noopener')
-                                })
-                                .catch((err: unknown) => setActionError(err instanceof Error ? err.message : 'Could not open file'))
-                            }}
-                          >
-                            {text(file['filename'])}
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
+                <CardContent className="files-card-body">
+                  <VirtualList
+                    data={taskFiles}
+                    itemKey={(file) => text(file['id'])}
+                    empty="Docs the team should keep."
+                    itemContent={(_index, file) => (
+                      <button type="button" className="file-row" onClick={() => openFile(file)}>
+                        {text(file['filename'])}
+                      </button>
+                    )}
+                  />
                 </CardContent>
                 <CardFooter>
                   <label className="attach">
@@ -767,7 +907,7 @@ function App() {
               </Card>
               <Card className="needs-card" data-alert={needsYou ? true : undefined}>
                 <CardHeader>
-                  <h2 className="col-heading">Needs you</h2>
+                  <h2 className="col-heading">Needs Your Attention</h2>
                 </CardHeader>
                 <CardContent>
                   {!needsYou ? (
@@ -818,116 +958,8 @@ function App() {
                 </pre>
               </details>
             </div>
-          </ScrollArea>
         </aside>
       </div>
-
-      <form
-        className="composer"
-        onSubmit={(event) => {
-          event.preventDefault()
-          const body = messageDraft.trim()
-          if (!body) return
-          void (async () => {
-            let taskId = selectedTaskId ?? (text(currentWork[0]?.['id'] ?? '', '') || null)
-            if (!taskId) {
-              await startWork(body.slice(0, 120))
-              taskId = window.localStorage.getItem(TASK_KEY)
-            }
-            if (!taskId) return
-            const files = await readTextFiles(filesRef.current?.files ?? null)
-            const targets = composerTarget === 'global' ? [...WORKERS] : [composerTarget]
-            for (const to of targets) {
-              await runHuman('message', 'message.send', { to, taskId, body, files })
-            }
-            setMessageDraft('')
-            setPendingFiles([])
-            if (filesRef.current) filesRef.current.value = ''
-          })().catch(() => undefined)
-        }}
-      >
-        <div className="composer-inner">
-          <div className="composer-meta">
-            <Select
-              value={composerTarget}
-              onValueChange={(value) => setComposerTarget(value as Target)}
-            >
-              <SelectTrigger
-                id="message-to"
-                size="sm"
-                className="shrink-0"
-                aria-label="Send to"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent position="popper" align="start">
-                <SelectGroup>
-                  <SelectItem value="global">Everyone</SelectItem>
-                  {WORKERS.map((id) => (
-                    <SelectItem key={id} value={id}>{workerLabel(id)}</SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-            {pendingFiles.length > 0 && (
-              <p className="composer-files">With this message: {pendingFiles.join(', ')}</p>
-            )}
-          </div>
-          <div className="composer-row">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  aria-label="Attach a file to this message"
-                  onClick={() => filesRef.current?.click()}
-                >
-                  <PlusIcon />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Attach a file</TooltipContent>
-            </Tooltip>
-            <input
-              ref={filesRef}
-              className="sr-only"
-              type="file"
-              multiple
-              accept=".md,.txt,.json,.yaml,.yml,.toml,.csv,.tsv,.xml"
-              onChange={(event) => setPendingFiles(Array.from(event.target.files ?? []).map((file) => file.name))}
-            />
-            <label className="sr-only" htmlFor="team-message">Message</label>
-            <Textarea
-              id="team-message"
-              value={messageDraft}
-              rows={1}
-              onChange={(event) => setMessageDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey) {
-                  event.preventDefault()
-                  event.currentTarget.form?.requestSubmit()
-                }
-              }}
-              placeholder="Tell the team what you need…"
-              required
-              className="min-h-11 max-h-40"
-            />
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  type="submit"
-                  size="icon"
-                  disabled={pending !== null || messageDraft.trim().length === 0}
-                  aria-label="Send"
-                >
-                  <ArrowUpIcon />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Send</TooltipContent>
-            </Tooltip>
-          </div>
-        </div>
-      </form>
     </main>
   )
 }
