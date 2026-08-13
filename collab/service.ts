@@ -17,9 +17,16 @@ import {
   type TerminalOperation,
 } from './dispatch.js';
 import {
+  AttachmentError,
+  prepareAttachments,
+  type AttachmentDraft,
+  type AttachmentInput,
+} from './attachments.js';
+import {
   contextBundleDigest,
   CONTEXT_BUNDLE_CONTRACT_VERSION,
   CONTEXT_BUNDLE_MESSAGE_LIMIT,
+  type ContextAttachment,
   type ContextBundle,
   type ContextCheckPolicy,
   type ContextFinding,
@@ -114,6 +121,15 @@ function parseJsonOrNull(value: unknown): unknown {
     return parseJson(value);
   } catch {
     return null;
+  }
+}
+
+function preparedAttachments(files?: AttachmentInput[]): AttachmentDraft[] {
+  try {
+    return prepareAttachments(files ?? []);
+  } catch (error) {
+    if (error instanceof AttachmentError) throw new CollaborationError(error.message, error.code);
+    throw error;
   }
 }
 
@@ -561,6 +577,58 @@ export class CollaborationService {
     return this.db.prepare('SELECT id, name, kind, status, last_seen_at FROM agents ORDER BY kind, id').all() as Row[];
   }
 
+  private attachmentMetadata(): Row[] {
+    return this.db
+      .prepare(
+        `SELECT id, filename, media_type, byte_size, sha256, created_by, created_at
+         FROM attachments ORDER BY created_at, id`,
+      )
+      .all() as Row[];
+  }
+
+  private derivedActionsProjection(): Record<string, unknown> {
+    const projection: Record<string, unknown> = {};
+    for (const agent of this.listAgents()) {
+      if (agent['kind'] !== 'model') continue;
+      const envelope = this.deriveDispatch({ agent: String(agent['id']) });
+      projection[String(agent['id'])] = {
+        session: envelope.session,
+        deliverable: envelope.deliverable,
+        tasks: envelope.tasks,
+      };
+    }
+    return projection;
+  }
+
+  private insertAttachment(draft: AttachmentDraft, createdBy: string, createdAt: string): string {
+    const id = makeId('file');
+    this.db
+      .prepare(
+        `INSERT INTO attachments
+         (id, filename, media_type, body, byte_size, sha256, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(id, draft.filename, draft.media_type, draft.body, draft.byte_size, draft.sha256, createdBy, createdAt);
+    return id;
+  }
+
+  private contextAttachmentFromRow(row: Row): ContextAttachment {
+    return {
+      id: String(row['id']),
+      filename: String(row['filename']),
+      media_type: String(row['media_type']),
+      sha256: String(row['sha256']),
+      byte_size: Number(row['byte_size']),
+      body: String(row['body']),
+    };
+  }
+
+  getAttachment(id: string): Row {
+    const row = this.db.prepare('SELECT * FROM attachments WHERE id = ?').get(id) as Row | undefined;
+    if (!row) throw new CollaborationError(`unknown attachment: ${id}`, 'unknown_attachment');
+    return row;
+  }
+
   private requireModelAgent(agentId: string): Row {
     const agent = this.requireAgent(agentId);
     if (agent['kind'] !== 'model') {
@@ -867,6 +935,14 @@ export class CollaborationService {
         .all() as Row[],
       operations: this.db.prepare('SELECT * FROM operation_attempts ORDER BY started_at, id').all() as Row[],
       events,
+      attachments: this.attachmentMetadata(),
+      message_attachments: this.db
+        .prepare('SELECT message_id, attachment_id, display_order FROM message_attachments ORDER BY message_id, display_order')
+        .all() as Row[],
+      task_attachments: this.db
+        .prepare('SELECT task_id, attachment_id, pinned_by, created_at FROM task_attachments ORDER BY task_id, created_at, attachment_id')
+        .all() as Row[],
+      derived_actions: this.derivedActionsProjection(),
     };
   }
 
@@ -1047,6 +1123,29 @@ export class CollaborationService {
     );
   }
 
+  cancelTask(input: { taskId: string; actor: string }): Row {
+    return this.transaction(
+      { name: 'task.cancel', actor: input.actor, subjectType: 'task', subjectId: input.taskId },
+      (operationId) => {
+        const actor = this.requireAgent(input.actor);
+        if (actor['kind'] !== 'human') {
+          throw new CollaborationError('only a human can cancel a task', 'human_required');
+        }
+        const task = this.requireTask(input.taskId);
+        if (['accepted', 'cancelled'].includes(String(task['status']))) {
+          throw new CollaborationError(`task cannot be cancelled from ${String(task['status'])}`, 'invalid_transition');
+        }
+        const timestamp = now();
+        this.db.prepare("UPDATE tasks SET status = 'cancelled', version = version + 1, updated_at = ? WHERE id = ?").run(
+          timestamp,
+          input.taskId,
+        );
+        this.event(operationId, input.actor, 'task', input.taskId, 'task_cancelled', {});
+        return this.requireTask(input.taskId);
+      },
+    );
+  }
+
   claimTask(input: {
     taskId: string;
     agent: string;
@@ -1184,21 +1283,115 @@ export class CollaborationService {
     });
   }
 
-  sendMessage(input: { from: string; to: string; taskId?: string; body: string }): Row {
+  sendMessage(input: {
+    from: string;
+    to: string;
+    taskId?: string;
+    body: string;
+    files?: AttachmentInput[];
+  }): Row {
     return this.transaction({ name: 'message.send', actor: input.from, subjectType: input.taskId ? 'task' : 'agent', subjectId: input.taskId ?? input.to }, (operationId) => {
       this.requireAgent(input.from);
       this.requireAgent(input.to);
       if (input.taskId) this.requireTask(input.taskId);
+      const drafts = preparedAttachments(input.files);
       const id = makeId('message');
+      const timestamp = now();
       this.db
         .prepare('INSERT INTO messages (id, sender, recipient, task_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(id, input.from, input.to, input.taskId ?? null, input.body, now());
+        .run(id, input.from, input.to, input.taskId ?? null, input.body, timestamp);
+      const link = this.db.prepare(
+        'INSERT INTO message_attachments (message_id, attachment_id, display_order) VALUES (?, ?, ?)',
+      );
+      const attachmentIds: string[] = [];
+      drafts.forEach((draft, index) => {
+        const attachmentId = this.insertAttachment(draft, input.from, timestamp);
+        link.run(id, attachmentId, index);
+        attachmentIds.push(attachmentId);
+      });
       this.event(operationId, input.from, 'message', id, 'message_sent', {
         recipient: input.to,
         task_id: input.taskId ?? null,
+        attachment_ids: attachmentIds,
       });
       return this.db.prepare('SELECT * FROM messages WHERE id = ?').get(id) as Row;
     });
+  }
+
+  addTaskFiles(input: { taskId: string; actor: string; files: AttachmentInput[] }): Row[] {
+    return this.transaction(
+      { name: 'task.file.add', actor: input.actor, subjectType: 'task', subjectId: input.taskId },
+      (operationId) => {
+        const actor = this.requireAgent(input.actor);
+        if (actor['kind'] !== 'human') {
+          throw new CollaborationError('only a human can pin task briefing files', 'human_required');
+        }
+        this.requireTask(input.taskId);
+        const drafts = preparedAttachments(input.files);
+        if (drafts.length === 0) throw new CollaborationError('task.file.add requires at least one file', 'invalid_attachment');
+        const timestamp = now();
+        const pinned: Row[] = [];
+        for (const draft of drafts) {
+          const existing = this.db
+            .prepare(
+              `SELECT ta.attachment_id
+               FROM task_attachments ta
+               JOIN attachments a ON a.id = ta.attachment_id
+               WHERE ta.task_id = ? AND a.filename = ?`,
+            )
+            .get(input.taskId, draft.filename) as Row | undefined;
+          if (existing) {
+            this.db
+              .prepare(
+                `UPDATE attachments
+                 SET media_type = ?, body = ?, byte_size = ?, sha256 = ?, created_by = ?, created_at = ?
+                 WHERE id = ?`,
+              )
+              .run(
+                draft.media_type,
+                draft.body,
+                draft.byte_size,
+                draft.sha256,
+                input.actor,
+                timestamp,
+                String(existing['attachment_id']),
+              );
+            this.db
+              .prepare('UPDATE task_attachments SET pinned_by = ?, created_at = ? WHERE task_id = ? AND attachment_id = ?')
+              .run(input.actor, timestamp, input.taskId, String(existing['attachment_id']));
+            this.event(operationId, input.actor, 'attachment', String(existing['attachment_id']), 'task_file_replaced', {
+              task_id: input.taskId,
+              filename: draft.filename,
+              sha256: draft.sha256,
+            });
+          } else {
+            const attachmentId = this.insertAttachment(draft, input.actor, timestamp);
+            this.db
+              .prepare(
+                'INSERT INTO task_attachments (task_id, attachment_id, pinned_by, created_at) VALUES (?, ?, ?, ?)',
+              )
+              .run(input.taskId, attachmentId, input.actor, timestamp);
+            this.event(operationId, input.actor, 'attachment', attachmentId, 'task_file_added', {
+              task_id: input.taskId,
+              filename: draft.filename,
+              sha256: draft.sha256,
+            });
+          }
+          pinned.push(
+            this.db
+              .prepare(
+                `SELECT a.id, a.filename, a.media_type, a.byte_size, a.sha256, a.created_by, a.created_at,
+                        ta.task_id, ta.pinned_by
+                 FROM attachments a
+                 JOIN task_attachments ta ON ta.attachment_id = a.id
+                 WHERE ta.task_id = ? AND a.filename = ?`,
+              )
+              .get(input.taskId, draft.filename) as Row,
+          );
+        }
+        return pinned;
+      },
+    );
   }
 
   addBlocker(input: { taskId: string; agent: string; description: string }): Row {
@@ -1948,6 +2141,26 @@ export class CollaborationService {
          ORDER BY created_at DESC, id DESC LIMIT ?`,
       )
       .all(taskId, params.agentId, params.agentId, CONTEXT_BUNDLE_MESSAGE_LIMIT) as Row[];
+    const messageIds = window.map((message) => String(message['id']));
+    const attachmentsByMessage = new Map<string, ContextAttachment[]>();
+    if (messageIds.length > 0) {
+      const placeholders = messageIds.map(() => '?').join(', ');
+      const linked = this.db
+        .prepare(
+          `SELECT ma.message_id, a.id, a.filename, a.media_type, a.sha256, a.byte_size, a.body
+           FROM message_attachments ma
+           JOIN attachments a ON a.id = ma.attachment_id
+           WHERE ma.message_id IN (${placeholders})
+           ORDER BY ma.message_id, ma.display_order, a.id`,
+        )
+        .all(...messageIds) as Row[];
+      for (const row of linked) {
+        const messageId = String(row['message_id']);
+        const list = attachmentsByMessage.get(messageId) ?? [];
+        list.push(this.contextAttachmentFromRow(row));
+        attachmentsByMessage.set(messageId, list);
+      }
+    }
     const messages: ContextMessage[] = window
       .map((message) => ({
         id: String(message['id']),
@@ -1955,8 +2168,21 @@ export class CollaborationService {
         recipient: String(message['recipient']),
         body: String(message['body']),
         created_at: String(message['created_at']),
+        attachments: attachmentsByMessage.get(String(message['id'])) ?? [],
       }))
       .reverse();
+
+    const taskFiles = (
+      this.db
+        .prepare(
+          `SELECT a.id, a.filename, a.media_type, a.sha256, a.byte_size, a.body
+           FROM task_attachments ta
+           JOIN attachments a ON a.id = ta.attachment_id
+           WHERE ta.task_id = ?
+           ORDER BY a.filename, a.id`,
+        )
+        .all(taskId) as Row[]
+    ).map((row) => this.contextAttachmentFromRow(row));
 
     return {
       agent_id: params.agentId,
@@ -2023,6 +2249,7 @@ export class CollaborationService {
         truncated: total > messages.length,
         messages,
       },
+      task_files: taskFiles,
     };
   }
 

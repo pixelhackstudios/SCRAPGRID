@@ -9,7 +9,7 @@ import { canonicalJson, type DispatchActionDescriptor, type DispatchRole } from 
  * whenever the included tables, the visibility predicates, the ordering, the message cap, or the shape
  * changes — a formatting change that could not alter the digest is not a change.
  */
-export const CONTEXT_BUNDLE_CONTRACT_VERSION = 1;
+export const CONTEXT_BUNDLE_CONTRACT_VERSION = 2;
 
 /**
  * The one cap in the contract, and it applies to one class.
@@ -104,12 +104,22 @@ export interface ContextOverride {
   created_at: string;
 }
 
+export interface ContextAttachment {
+  id: string;
+  filename: string;
+  media_type: string;
+  sha256: string;
+  byte_size: number;
+  body: string;
+}
+
 export interface ContextMessage {
   id: string;
   sender: string;
   recipient: string;
   body: string;
   created_at: string;
+  attachments: ContextAttachment[];
 }
 
 export interface ContextConversation {
@@ -146,6 +156,7 @@ export interface ContextBundle {
   verifications: ContextVerification[];
   check_policy_overrides: ContextOverride[];
   conversation: ContextConversation;
+  task_files: ContextAttachment[];
 }
 
 /**

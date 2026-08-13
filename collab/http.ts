@@ -14,8 +14,23 @@ import {
   type SessionActivity,
 } from './operations.js';
 import type { GitRepository } from './git.js';
+import { AttachmentError, parseAttachmentInputs, ATTACHMENT_MAX_REQUEST_BYTES } from './attachments.js';
 import type { CollaborationService } from './service.js';
 import { CollaborationError } from './service.js';
+
+const HUMAN_OPERATIONS = new Set([
+  'task.create',
+  'task.assign_roles',
+  'message.send',
+  'task.file.add',
+  'check_policy.override',
+  'proposal.reveal',
+  'decision.accept',
+  'task.accept',
+  'task.cancel',
+]);
+
+const HUMAN_BODY_LIMIT = ATTACHMENT_MAX_REQUEST_BYTES + 32_768;
 
 const MIME_TYPES: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
@@ -191,13 +206,13 @@ function requirePrincipal(
   throw new HttpError('a collabd session or control credential is required', 401, 'unauthorized');
 }
 
-async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
+async function readJson(request: IncomingMessage, limit = 16_384): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let length = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     length += buffer.length;
-    if (length > 16_384) throw new HttpError('request body is too large', 413, 'body_too_large');
+    if (length > limit) throw new HttpError('request body is too large', 413, 'body_too_large');
     chunks.push(buffer);
   }
   if (chunks.length === 0) return {};
@@ -205,12 +220,110 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
     const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('body must be an object');
     return value as Record<string, unknown>;
-  } catch {
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
     throw new HttpError('request body must be a JSON object', 400, 'invalid_json');
   }
 }
 
-function errorStatus(error: CollaborationError | GitError): number {
+function rejectSpoofedHumanIdentity(input: Record<string, unknown>): void {
+  if (Object.hasOwn(input, 'actor') || Object.hasOwn(input, 'from')) {
+    throw new HttpError('the field terminal cannot supply actor identity', 403, 'actor_spoof_rejected');
+  }
+}
+
+function invokeHumanOperation(service: CollaborationService, operation: string, input: Record<string, unknown>): unknown {
+  switch (operation) {
+    case 'task.create':
+      return service.createTask({
+        id: requiredHumanString(input, 'id'),
+        goal: requiredHumanString(input, 'goal'),
+        acceptance: stringList(input, 'acceptance'),
+        actor: 'human',
+      });
+    case 'task.assign_roles':
+      return service.assignTaskRoles({
+        taskId: requiredHumanString(input, 'taskId'),
+        actor: 'human',
+        implementer: requiredHumanString(input, 'implementer'),
+        reviewer: requiredHumanString(input, 'reviewer'),
+        verifier: requiredHumanString(input, 'verifier'),
+      });
+    case 'message.send':
+      return service.sendMessage({
+        from: 'human',
+        to: requiredHumanString(input, 'to'),
+        taskId: optionalHumanString(input, 'taskId'),
+        body: requiredHumanString(input, 'body'),
+        files: parseAttachmentInputs(input['files']),
+      });
+    case 'task.file.add':
+      return service.addTaskFiles({
+        taskId: requiredHumanString(input, 'taskId'),
+        actor: 'human',
+        files: parseAttachmentInputs(input['files']),
+      });
+    case 'check_policy.override':
+      return service.overrideCheckPolicy({
+        taskId: requiredHumanString(input, 'taskId'),
+        actor: 'human',
+        reason: requiredHumanString(input, 'reason'),
+      });
+    case 'proposal.reveal':
+      return service.revealProposals(requiredHumanString(input, 'taskId'), 'human');
+    case 'decision.accept':
+      return service.acceptDecision(requiredHumanString(input, 'decisionId'), 'human');
+    case 'task.accept':
+      return service.acceptTask({
+        taskId: requiredHumanString(input, 'taskId'),
+        actor: 'human',
+        expectedVersion: requiredHumanInteger(input, 'expectedVersion'),
+      });
+    case 'task.cancel':
+      return service.cancelTask({
+        taskId: requiredHumanString(input, 'taskId'),
+        actor: 'human',
+      });
+    default:
+      throw new HttpError('operation is not allowed on the field terminal', 403, 'operation_not_allowed');
+  }
+}
+
+function requiredHumanString(input: Record<string, unknown>, key: string): string {
+  const value = input[key];
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new HttpError(`${key} must be a non-empty string`, 400, 'invalid_operation_input');
+  }
+  return value;
+}
+
+function optionalHumanString(input: Record<string, unknown>, key: string): string | undefined {
+  const value = input[key];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new HttpError(`${key} must be a non-empty string`, 400, 'invalid_operation_input');
+  }
+  return value;
+}
+
+function stringList(input: Record<string, unknown>, key: string): string[] {
+  const value = input[key];
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+    throw new HttpError(`${key} must be an array of strings`, 400, 'invalid_operation_input');
+  }
+  return value as string[];
+}
+
+function requiredHumanInteger(input: Record<string, unknown>, key: string): number {
+  const value = input[key];
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new HttpError(`${key} must be a non-negative integer`, 400, 'invalid_operation_input');
+  }
+  return value;
+}
+
+function errorStatus(error: { code: string }): number {
   if (error.code.startsWith('unknown_')) return 404;
   if (error.code === 'identity_mismatch') return 403;
   if (error.code.includes('required') || error.code.includes('forbidden')) return 403;
@@ -339,7 +452,37 @@ export function createCollaborationHttpServer(options: CollaborationHttpOptions)
         return json(response, 200, service.snapshot());
       }
 
+      const attachmentMatch = url.pathname.match(/^\/api\/attachments\/([^/]+)$/);
+      if (request.method === 'GET' && attachmentMatch) {
+        requireCredential(request, credentials.browser, 'field terminal');
+        return json(response, 200, service.getAttachment(decodeURIComponent(attachmentMatch[1] ?? '')));
+      }
+
       if (request.method === 'POST') {
+        if (url.pathname === '/api/human') {
+          requireCredential(request, credentials.browser, 'field terminal');
+          requireSameOrigin(request);
+          const body = await readJson(request, HUMAN_BODY_LIMIT);
+          const operation = body['operation'];
+          if (typeof operation !== 'string' || operation.length === 0) {
+            throw new HttpError('operation must be a non-empty string', 400, 'invalid_operation');
+          }
+          if (!HUMAN_OPERATIONS.has(operation)) {
+            throw new HttpError('operation is not allowed on the field terminal', 403, 'operation_not_allowed');
+          }
+          const input = operationInput(body['input']);
+          rejectSpoofedHumanIdentity(input);
+          try {
+            invokeHumanOperation(service, operation, input);
+          } catch (error) {
+            if (error instanceof AttachmentError) {
+              throw new CollaborationError(error.message, error.code);
+            }
+            throw error;
+          }
+          return json(response, 200, service.snapshot());
+        }
+
         if (url.pathname === '/api/operations') {
           const authenticate = (): OperationPrincipal => requirePrincipal(request, service, credentials);
           // Fail fast on a credential that is already worthless, so an unauthenticated caller is
@@ -399,7 +542,7 @@ export function createCollaborationHttpServer(options: CollaborationHttpOptions)
         return response.end();
       }
       if (error instanceof HttpError) return json(response, error.status, { error: error.message, code: error.code });
-      if (error instanceof CollaborationError || error instanceof GitError) {
+      if (error instanceof CollaborationError || error instanceof GitError || error instanceof AttachmentError) {
         return json(response, errorStatus(error), { error: error.message, code: error.code });
       }
       console.error(error);

@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
@@ -91,6 +91,32 @@ CREATE TABLE IF NOT EXISTS messages (
   task_id TEXT REFERENCES tasks(id),
   body TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS attachments (
+  id TEXT PRIMARY KEY,
+  filename TEXT NOT NULL,
+  media_type TEXT NOT NULL,
+  body TEXT NOT NULL,
+  byte_size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  created_by TEXT NOT NULL REFERENCES agents(id),
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS message_attachments (
+  message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  attachment_id TEXT NOT NULL REFERENCES attachments(id) ON DELETE CASCADE,
+  display_order INTEGER NOT NULL,
+  PRIMARY KEY (message_id, attachment_id)
+);
+
+CREATE TABLE IF NOT EXISTS task_attachments (
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  attachment_id TEXT NOT NULL REFERENCES attachments(id) ON DELETE CASCADE,
+  pinned_by TEXT NOT NULL REFERENCES agents(id),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (task_id, attachment_id)
 );
 
 CREATE TABLE IF NOT EXISTS proposals (
@@ -267,6 +293,8 @@ CREATE INDEX IF NOT EXISTS operation_attempts_subject ON operation_attempts(subj
 CREATE INDEX IF NOT EXISTS claim_reservations_expires ON claim_reservations(expires_at);
 CREATE INDEX IF NOT EXISTS task_roles_agent ON task_roles(agent_id, role, task_id);
 CREATE INDEX IF NOT EXISTS messages_recipient_cursor ON messages(recipient, created_at);
+CREATE INDEX IF NOT EXISTS message_attachments_attachment ON message_attachments(attachment_id);
+CREATE INDEX IF NOT EXISTS task_attachments_attachment ON task_attachments(attachment_id);
 CREATE INDEX IF NOT EXISTS proposals_task ON proposals(task_id);
 CREATE UNIQUE INDEX IF NOT EXISTS proposals_task_agent_unique ON proposals(task_id, agent_id);
 CREATE INDEX IF NOT EXISTS reviews_task_commit ON reviews(task_id, commit_sha);

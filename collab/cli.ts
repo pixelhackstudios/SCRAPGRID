@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { readFileSync } from 'node:fs';
+import { basename } from 'node:path';
 import { connectToDaemon, invokeOperation, resolveCredential } from './client.js';
 import { GitError, GitRepository } from './git.js';
 import { DaemonRuntimeError } from './runtime.js';
@@ -50,6 +52,13 @@ function repeated(options: Options, key: string): string[] {
   return Array.isArray(value) ? value : [value];
 }
 
+function readFiles(options: Options): Array<{ filename: string; content: string }> {
+  return repeated(options, 'file').map((path) => ({
+    filename: basename(path),
+    content: readFileSync(path, 'utf8'),
+  }));
+}
+
 function integer(options: Options, key: string, fallback?: number): number {
   const raw = optional(options, key);
   if (raw === undefined && fallback !== undefined) return fallback;
@@ -87,13 +96,15 @@ Commands:
   worktree bootstrap [--root PATH] [--base SHA]
   task create ID --goal TEXT [--acceptance TEXT ...] [--actor human]
   task assign-roles ID --actor human --implementer ID --reviewer ID --verifier ID
+  task attach ID --file PATH [--file PATH ...] --actor human
   task claim ID --agent ID --expected-version N [--ttl 900] [--dispatch ID] [--bundle ID]
   task accept ID --actor human --expected-version N
+  task cancel ID --actor human
   proposal submit TASK --agent ID --content TEXT
   proposal reveal TASK [--actor human]
   decision propose [--task TASK] --actor ID --statement TEXT --rationale TEXT
   decision accept DECISION --actor human
-  message send --from ID --to ID [--task TASK] --body TEXT
+  message send --from ID --to ID [--task TASK] --body TEXT [--file PATH ...]
   blocker add TASK --agent ID --description TEXT
   blocker resolve BLOCKER --agent ID
   review request TASK --agent ID --commit SHA [--dispatch ID] [--bundle ID]
@@ -147,6 +158,22 @@ function resolveInvocation(parsed: ReturnType<typeof parseArguments>): Invocatio
         acceptance: repeated(options, 'acceptance'),
         actor: optional(options, 'actor') ?? 'human',
       },
+    };
+  }
+  if (area === 'task' && action === 'attach' && id) {
+    return {
+      operation: 'task.file.add',
+      input: {
+        taskId: id,
+        actor: optional(options, 'actor') ?? 'human',
+        files: readFiles(options),
+      },
+    };
+  }
+  if (area === 'task' && action === 'cancel' && id) {
+    return {
+      operation: 'task.cancel',
+      input: { taskId: id, actor: optional(options, 'actor') ?? 'human' },
     };
   }
   if (area === 'task' && action === 'assign-roles' && id) {
@@ -215,6 +242,7 @@ function resolveInvocation(parsed: ReturnType<typeof parseArguments>): Invocatio
         to: required(options, 'to'),
         taskId: optional(options, 'task'),
         body: required(options, 'body'),
+        files: readFiles(options),
       },
     };
   }

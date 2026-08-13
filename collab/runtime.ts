@@ -15,8 +15,8 @@ export class DaemonRuntimeError extends Error {
 }
 
 /**
- * Written by `collabd` so clients can find it. The browser token is deliberately absent: it is
- * printed on the daemon's own stdout and never touches the filesystem.
+ * Written by `collabd` so clients can find it. The browser token is deliberately absent here:
+ * it lives only in the owner-only field-terminal sidecar and the daemon's own stdout.
  */
 export interface DaemonDescriptor {
   url: string;
@@ -89,10 +89,19 @@ export interface DaemonLock {
   release(): void;
 }
 
+export interface FieldTerminalSidecar {
+  url: string;
+  token: string;
+  pid: number;
+  repository_identity: string;
+  started_at: string;
+}
+
 export interface DaemonRuntimePaths {
   directory: string;
   lockPath: string;
   descriptorPath: string;
+  fieldTerminalPath: string;
 }
 
 /**
@@ -104,6 +113,7 @@ export function daemonRuntimePaths(repositoryRoot: string, databasePath = defaul
     directory,
     lockPath: resolve(directory, 'collabd.lock'),
     descriptorPath: resolve(directory, 'collabd.json'),
+    fieldTerminalPath: resolve(directory, 'field-terminal.json'),
   };
 }
 
@@ -192,6 +202,56 @@ export function writeDaemonDescriptor(descriptorPath: string, descriptor: Daemon
 
 export function removeDaemonDescriptor(descriptorPath: string): void {
   rmSync(descriptorPath, { force: true });
+}
+
+function writeOwnerOnlyJson(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
+  rmSync(path, { force: true });
+  const handle = openSync(path, 'wx', 0o600);
+  try {
+    writeSync(handle, `${JSON.stringify(value, null, 2)}\n`);
+  } finally {
+    closeSync(handle);
+  }
+}
+
+export function writeFieldTerminalSidecar(path: string, sidecar: FieldTerminalSidecar): void {
+  writeOwnerOnlyJson(path, sidecar);
+}
+
+export function removeFieldTerminalSidecar(path: string): void {
+  rmSync(path, { force: true });
+}
+
+export function readFieldTerminalSidecar(path: string): FieldTerminalSidecar {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    throw new DaemonRuntimeError(
+      `${path} is not a readable field-terminal sidecar`,
+      'invalid_field_terminal_sidecar',
+    );
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new DaemonRuntimeError(`${path} must contain an object`, 'invalid_field_terminal_sidecar');
+  }
+  const candidate = parsed as Record<string, unknown>;
+  const url = candidate['url'];
+  const token = candidate['token'];
+  const pid = candidate['pid'];
+  const repositoryIdentity = candidate['repository_identity'];
+  const startedAt = candidate['started_at'];
+  if (
+    typeof url !== 'string' ||
+    typeof token !== 'string' ||
+    typeof repositoryIdentity !== 'string' ||
+    typeof startedAt !== 'string' ||
+    typeof pid !== 'number'
+  ) {
+    throw new DaemonRuntimeError(`${path} is missing required field-terminal fields`, 'invalid_field_terminal_sidecar');
+  }
+  return { url, token, pid, repository_identity: repositoryIdentity, started_at: startedAt };
 }
 
 function descriptorField(value: Record<string, unknown>, key: keyof DaemonDescriptor): unknown {

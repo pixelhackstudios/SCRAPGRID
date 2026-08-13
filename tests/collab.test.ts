@@ -13,7 +13,13 @@ import { CollaborationError, CollaborationService } from '../collab/service.js';
 import { createCollaborationHttpServer, createSessionActivity } from '../collab/http.js';
 import { authorizeOperation, type SessionActivity } from '../collab/operations.js';
 import { canonicalJson, DISPATCH_CONTRACT_VERSION, type DispatchResult } from '../collab/dispatch.js';
-import { daemonRuntimePaths, readDaemonDescriptor, type DaemonDescriptor } from '../collab/runtime.js';
+import {
+  daemonRuntimePaths,
+  readDaemonDescriptor,
+  readFieldTerminalSidecar,
+  writeFieldTerminalSidecar,
+  type DaemonDescriptor,
+} from '../collab/runtime.js';
 import { SCHEMA_VERSION } from '../collab/schema.js';
 
 function git(path: string, args: string[]): string {
@@ -350,7 +356,7 @@ test('schema version 1 upgrades roles, reservations, operation linkage, findings
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'context_bundles_content'")
       .get() as { name: string } | undefined;
     const attemptColumns = db.prepare('PRAGMA table_info(operation_attempts)').all() as Array<{ name: string }>;
-    assert.equal(version.user_version, 10);
+    assert.equal(version.user_version, 11);
     assert.equal(dispatchesTable?.name, 'dispatches');
     assert.equal(dispatchBasisIndex?.name, 'dispatches_basis');
     assert.equal(bundlesTable?.name, 'context_bundles');
@@ -365,6 +371,10 @@ test('schema version 1 upgrades roles, reservations, operation linkage, findings
     assert.ok(verificationColumns.some((column) => column.name === 'command_argv_json'));
     assert.ok(verificationColumns.some((column) => column.name === 'check_id'));
     assert.ok(verificationColumns.some((column) => column.name === 'check_policy_identity'));
+    const attachmentsTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'attachments'")
+      .get() as { name: string } | undefined;
+    assert.equal(attachmentsTable?.name, 'attachments');
     assert.ok(eventColumns.some((column) => column.name === 'operation_id'));
     assert.equal(operationsTable?.name, 'operation_attempts');
     assert.equal(reservationsTable?.name, 'claim_reservations');
@@ -3106,7 +3116,7 @@ test('a schema 9 database upgrades in place, index and column in the order SQLit
     const bundlesTable = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'context_bundles'")
       .get() as { name: string } | undefined;
-    assert.equal(version.user_version, 10);
+    assert.equal(version.user_version, 11);
     assert.ok(attemptColumns.some((column) => column.name === 'dispatch_id'));
     assert.ok(attemptColumns.some((column) => column.name === 'context_bundle_id'));
     assert.equal(bundleIndex?.name, 'operation_attempts_bundle');
@@ -3675,8 +3685,344 @@ test('bundle assembly reads canonical rows and never the repository', () => {
     assert.ok(issued.context_bundle);
     const bundle = JSON.parse(String(issued.context_bundle?.['bundle_json'])) as Record<string, unknown>;
     assert.equal((bundle['action'] as Record<string, unknown>)['base_commit'], fixture.repository.headCommit());
+    assert.ok(Array.isArray(bundle['task_files']));
   } finally {
     db.close();
+    fixture.close();
+  }
+});
+
+// --- Operator experience: attachments, human API, projection, sidecar ------
+
+test('schema 10 upgrades to 11 with attachment tables and a fresh database already has them', () => {
+  const fixture = createRepository();
+  const upgraded = openDatabase(':memory:');
+  const fresh = openDatabase(':memory:');
+  try {
+    initializeDatabase(upgraded, fixture.repository.binding, fixture.repository.headCommit());
+    upgraded.exec(`
+      DROP TABLE IF EXISTS message_attachments;
+      DROP TABLE IF EXISTS task_attachments;
+      DROP TABLE IF EXISTS attachments;
+      PRAGMA user_version = 10;
+    `);
+    assert.equal(
+      (upgraded.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      10,
+    );
+    initializeDatabase(upgraded, fixture.repository.binding, fixture.repository.headCommit());
+    initializeDatabase(fresh, fixture.repository.binding, fixture.repository.headCommit());
+    for (const db of [upgraded, fresh]) {
+      assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 11);
+      for (const name of ['attachments', 'message_attachments', 'task_attachments']) {
+        assert.equal(
+          (db.prepare('SELECT name FROM sqlite_master WHERE type = ? AND name = ?').get('table', name) as { name: string } | undefined)?.name,
+          name,
+        );
+      }
+    }
+  } finally {
+    upgraded.close();
+    fresh.close();
+    fixture.close();
+  }
+});
+
+test('message and task files are atomic, windowed vs pinned, and reject bad payloads', () => {
+  const { service, db, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-FILES', goal: 'Carry files', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-FILES');
+    const pinned = service.addTaskFiles({
+      taskId: 'TASK-FILES',
+      actor: 'human',
+      files: [{ filename: 'scrap-yard-concept.md', content: '# Scrap Yard\n' }],
+    });
+    assert.equal(pinned.length, 1);
+    assert.equal(pinned[0]?.['filename'], 'scrap-yard-concept.md');
+
+    const replaced = service.addTaskFiles({
+      taskId: 'TASK-FILES',
+      actor: 'human',
+      files: [{ filename: 'scrap-yard-concept.md', content: '# Scrap Yard v2\n' }],
+    });
+    assert.equal(replaced[0]?.['sha256'] !== pinned[0]?.['sha256'], true);
+    assert.equal(
+      (db.prepare('SELECT count(*) AS count FROM attachments').get() as { count: number }).count,
+      1,
+      'same filename replaces in place',
+    );
+
+    service.sendMessage({
+      from: 'human',
+      to: 'codex',
+      taskId: 'TASK-FILES',
+      body: 'Private note',
+      files: [{ filename: 'for-codex.md', content: 'only Codex' }],
+    });
+
+    assert.throws(
+      () => service.addTaskFiles({ taskId: 'TASK-FILES', actor: 'codex', files: [{ filename: 'no.md', content: 'x' }] }),
+      /only a human/,
+    );
+    assert.throws(
+      () => service.sendMessage({
+        from: 'human',
+        to: 'codex',
+        taskId: 'TASK-FILES',
+        body: 'bad',
+        files: [{ filename: 'notes.exe', content: 'nope' }],
+      }),
+      /not an allowed text type/,
+    );
+    assert.throws(
+      () => service.sendMessage({
+        from: 'human',
+        to: 'codex',
+        taskId: 'TASK-FILES',
+        body: 'nul',
+        files: [{ filename: 'bad.md', content: 'ok\0no' }],
+      }),
+      /NUL/,
+    );
+    assert.throws(
+      () => service.sendMessage({
+        from: 'human',
+        to: 'codex',
+        taskId: 'TASK-FILES',
+        body: 'huge',
+        files: [{ filename: 'huge.md', content: 'x'.repeat(256 * 1024 + 1) }],
+      }),
+      /exceeds/,
+    );
+
+    const codex = sessionFor(service, 'codex');
+    const forCodex = delivered(service, 'codex', 'TASK-FILES', codex);
+    const claude = sessionFor(service, 'claude');
+    // Claude is the reviewer: no action yet, but a later claim/review cycle is unnecessary
+    // to prove visibility. Issue after making Claude the implementer on a second task.
+    service.createTask({ id: 'TASK-CLAUDE', goal: 'Other implementer', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-CLAUDE', { implementer: 'claude', reviewer: 'codex', verifier: 'grok' });
+    service.addTaskFiles({
+      taskId: 'TASK-CLAUDE',
+      actor: 'human',
+      files: [{ filename: 'scrap-yard-concept.md', content: '# Scrap Yard v2\n' }],
+    });
+    const forClaude = delivered(service, 'claude', 'TASK-CLAUDE', claude);
+    const codexFiles = forCodex.bundle['task_files'] as Array<Record<string, unknown>>;
+    const claudeFiles = forClaude.bundle['task_files'] as Array<Record<string, unknown>>;
+    assert.equal(codexFiles[0]?.['body'], '# Scrap Yard v2\n');
+    assert.equal(claudeFiles[0]?.['body'], '# Scrap Yard v2\n');
+    const conversation = forCodex.bundle['conversation'] as { messages: Array<Record<string, unknown>> };
+    const attached = conversation.messages.at(-1)?.['attachments'] as Array<Record<string, unknown>>;
+    assert.equal(attached?.[0]?.['filename'], 'for-codex.md');
+    const claudeConversation = forClaude.bundle['conversation'] as { messages: Array<Record<string, unknown>> };
+    assert.equal(claudeConversation.messages.length, 0, 'a private worker file is not broadcast');
+
+    for (let index = 0; index < 51; index += 1) {
+      service.sendMessage({ from: 'human', to: 'codex', taskId: 'TASK-FILES', body: `note ${index}` });
+    }
+    const afterWindow = delivered(service, 'codex', 'TASK-FILES', codex);
+    const afterMessages = (afterWindow.bundle['conversation'] as { messages: Array<Record<string, unknown>> }).messages;
+    assert.equal(afterMessages.length, 50);
+    assert.ok(
+      afterMessages.every((message) => (message['attachments'] as unknown[]).length === 0),
+      'message attachments leave with the 50-message window',
+    );
+    assert.equal(
+      ((afterWindow.bundle['task_files'] as Array<Record<string, unknown>>)[0]?.['body']),
+      '# Scrap Yard v2\n',
+      'pinned briefings survive the conversation window',
+    );
+    assert.notEqual(afterWindow.digest, forCodex.digest);
+    assert.equal(afterWindow.dispatchId, forCodex.dispatchId);
+  } finally {
+    close();
+  }
+});
+
+test('snapshot derived_actions preserve dispatcher vocabulary per selected task', () => {
+  const { service, close } = harness();
+  try {
+    service.createTask({ id: 'TASK-A', goal: 'A', acceptance: [], actor: 'human' });
+    service.createTask({ id: 'TASK-B', goal: 'B', acceptance: [], actor: 'human' });
+    assignRoles(service, 'TASK-A');
+    const snapshot = service.snapshot();
+    const derived = snapshot['derived_actions'] as Record<string, { session: Record<string, unknown>; deliverable: boolean; tasks: DerivedLike[] }>;
+    assert.ok(derived['codex'] && derived['claude'] && derived['grok']);
+    const a = derived['codex']?.tasks.find((row) => row.task_id === 'TASK-A');
+    const b = derived['codex']?.tasks.find((row) => row.task_id === 'TASK-B');
+    assert.equal(a?.kind, 'action');
+    assert.equal(b?.kind, 'waiting');
+    assert.equal(b?.actor, 'human');
+    assert.equal(b?.reason, 'awaiting_roles');
+    assert.equal(typeof derived['codex']?.deliverable, 'boolean');
+    assert.ok(['live', 'stale', 'none'].includes(String(derived['codex']?.session['liveness'])));
+    assert.equal((snapshot['attachments'] as Array<Record<string, unknown>>).length, 0);
+  } finally {
+    close();
+  }
+});
+
+interface DerivedLike {
+  kind: string;
+  task_id: string;
+  actor?: string | null;
+  reason?: string;
+}
+
+test('the field-terminal human route allowlists operations and rejects spoofed actors', async () => {
+  const { service, repository, close } = harness();
+  const server = httpServer(service, repository);
+  try {
+    await new Promise<void>((listening) => server.listen(0, '127.0.0.1', listening));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const origin = `http://127.0.0.1:${address.port}`;
+    const human = (operation: string, input: Record<string, unknown>, extra: RequestInit = {}) =>
+      fetch(`${origin}/api/human`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${BROWSER_TOKEN}`,
+          origin,
+          ...((extra.headers as Record<string, string> | undefined) ?? {}),
+        },
+        body: JSON.stringify({ operation, input }),
+      });
+
+    const anonymous = await fetch(`${origin}/api/human`, { method: 'POST', headers: { origin } });
+    assert.equal(anonymous.status, 401);
+
+    const agent = await fetch(`${origin}/api/human`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${AGENT_TOKEN}`, origin },
+      body: JSON.stringify({ operation: 'task.create', input: { id: 'X', goal: 'no' } }),
+    });
+    assert.equal(agent.status, 401);
+
+    const foreign = await human('task.create', { id: 'TASK-HUMAN', goal: 'from the page' }, {
+      headers: { origin: 'http://127.0.0.1:9' },
+    });
+    assert.equal(foreign.status, 403);
+
+    const spoof = await human('task.create', { id: 'TASK-HUMAN', goal: 'from the page', actor: 'codex' });
+    assert.equal(spoof.status, 403);
+    const spoofBody = await spoof.json() as { code?: string };
+    assert.equal(spoofBody.code, 'actor_spoof_rejected');
+
+    const forbidden = await human('dispatch.issue', { agent: 'codex', task: 'TASK-HUMAN' });
+    assert.equal(forbidden.status, 403);
+
+    const created = await human('task.create', { id: 'TASK-HUMAN', goal: 'from the page', acceptance: ['done'] });
+    assert.equal(created.status, 200);
+    const createdSnapshot = await created.json() as { tasks: Array<{ id: string }> };
+    assert.ok(createdSnapshot.tasks.some((task) => task.id === 'TASK-HUMAN'));
+
+    const assigned = await human('task.assign_roles', {
+      taskId: 'TASK-HUMAN',
+      implementer: 'codex',
+      reviewer: 'claude',
+      verifier: 'grok',
+    });
+    assert.equal(assigned.status, 200);
+
+    const briefed = await human('task.file.add', {
+      taskId: 'TASK-HUMAN',
+      files: [{ filename: 'world-notes.md', content: 'notes' }],
+    });
+    assert.equal(briefed.status, 200);
+    const briefedSnapshot = await briefed.json() as {
+      attachments: Array<{ id: string; filename: string; body?: string }>;
+      task_attachments: Array<{ task_id: string }>;
+    };
+    assert.equal(briefedSnapshot.attachments[0]?.filename, 'world-notes.md');
+    assert.equal(briefedSnapshot.attachments[0]?.body, undefined);
+    const attachmentId = briefedSnapshot.attachments[0]?.id ?? '';
+    const downloaded = await fetch(`${origin}/api/attachments/${attachmentId}`, {
+      headers: { authorization: `Bearer ${BROWSER_TOKEN}` },
+    });
+    assert.equal(downloaded.status, 200);
+    assert.equal(((await downloaded.json()) as { body: string }).body, 'notes');
+
+    const messaged = await human('message.send', {
+      to: 'codex',
+      taskId: 'TASK-HUMAN',
+      body: 'hello',
+      files: [{ filename: 'private.md', content: 'hi' }],
+    });
+    assert.equal(messaged.status, 200);
+
+    const tooBig = await fetch(`${origin}/api/operations`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${AGENT_TOKEN}` },
+      body: JSON.stringify({ operation: 'status', pad: 'x'.repeat(20_000) }),
+    });
+    assert.equal(tooBig.status, 413);
+  } finally {
+    await new Promise<void>((closed) => server.close(() => closed()));
+    close();
+  }
+});
+
+test('the field-terminal sidecar is owner-only and omitted from the agent descriptor', async () => {
+  const fixture = createRepository();
+  const daemon = await startDaemon(fixture.path);
+  try {
+    const paths = testRuntimePaths(fixture.path);
+    const sidecar = readFieldTerminalSidecar(paths.fieldTerminalPath);
+    assert.equal(sidecar.pid, daemon.descriptor.pid);
+    assert.ok(sidecar.url.includes(`#t=${daemon.browserToken}`));
+    assert.equal(statSync(paths.fieldTerminalPath).mode & 0o777, 0o600);
+    const descriptor = JSON.parse(readFileSync(paths.descriptorPath, 'utf8')) as Record<string, unknown>;
+    assert.equal(descriptor['agent_token'], daemon.descriptor.agent_token);
+    assert.equal(descriptor['token'], undefined);
+    assert.ok(!JSON.stringify(descriptor).includes(daemon.browserToken));
+    writeFieldTerminalSidecar(join(fixture.path, 'stale-sidecar.json'), {
+      url: 'http://127.0.0.1:1/#t=nope',
+      token: 'nope',
+      pid: 1,
+      repository_identity: 'other',
+      started_at: new Date().toISOString(),
+    });
+    assert.equal(statSync(join(fixture.path, 'stale-sidecar.json')).mode & 0o777, 0o600);
+  } finally {
+    await daemon.stop();
+    assert.equal(existsSync(testRuntimePaths(fixture.path).fieldTerminalPath), false);
+    fixture.close();
+  }
+});
+
+test('the harness launcher starts once, then attaches to the live daemon', async () => {
+  const fixture = createRepository();
+  const launchEntry = join(DIST_ROOT, 'collab', 'launch.js');
+  const first = spawn(process.execPath, [launchEntry, '--repo', fixture.path], {
+    cwd: fixture.path,
+    env: testEnvironment(fixture.path),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  first.stdout.setEncoding('utf8');
+  first.stdout.on('data', (chunk: string) => { stdout += chunk; });
+  const firstExited = new Promise<number | null>((done) => first.on('exit', (code) => done(code)));
+  try {
+    const { fieldTerminalPath, descriptorPath } = testRuntimePaths(fixture.path);
+    await waitFor('launcher sidecar', () => existsSync(fieldTerminalPath) && existsSync(descriptorPath));
+    const sidecar = readFieldTerminalSidecar(fieldTerminalPath);
+    assert.match(sidecar.url, /#t=/);
+    await waitFor('launcher banner', () => stdout.includes('field terminal'));
+
+    const second = spawnSync(process.execPath, [launchEntry, '--repo', fixture.path], {
+      cwd: fixture.path,
+      encoding: 'utf8',
+      env: testEnvironment(fixture.path),
+    });
+    assert.equal(second.status, 0, second.stderr);
+    assert.match(second.stdout, /field terminal/);
+    assert.equal(readDaemonDescriptor(descriptorPath).pid, sidecar.pid);
+  } finally {
+    if (first.exitCode === null) first.kill('SIGTERM');
+    await firstExited;
     fixture.close();
   }
 });

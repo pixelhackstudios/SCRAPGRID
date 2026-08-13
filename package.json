@@ -13,7 +13,8 @@
     "lint": "oxlint",
     "test": "npm run build:collab --silent && node --test dist-collab/tests/*.test.js",
     "preview": "vite preview",
-    "start": "node --enable-source-maps dist-collab/collab/collabd.js"
+    "start": "node --enable-source-maps dist-collab/collab/collabd.js",
+    "harness": "./scrapgrid"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.3.0",

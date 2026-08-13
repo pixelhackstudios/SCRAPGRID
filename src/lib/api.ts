@@ -66,3 +66,11 @@ export async function apiFetch(path: string, init?: RequestInit): Promise<Respon
   }
   return response
 }
+
+export async function humanOperation(operation: string, input: Record<string, unknown> = {}): Promise<Response> {
+  return apiFetch('/api/human', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ operation, input }),
+  })
+}

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+if [[ ! -d "$ROOT/node_modules" ]]; then
+  npm ci
+fi
+
+if [[ ! -f "$ROOT/dist-collab/collab/launch.js" || ! -f "$ROOT/dist/index.html" ]]; then
+  npm run build
+fi
+
+exec node "$ROOT/dist-collab/collab/launch.js" --repo "$ROOT"

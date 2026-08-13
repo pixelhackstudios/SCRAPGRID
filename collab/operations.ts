@@ -1,3 +1,4 @@
+import { parseAttachmentInputs } from './attachments.js';
 import type { GitRepository } from './git.js';
 import { sessionDescriptorPath, writeSessionDescriptor } from './runtime.js';
 import { CollaborationError, type CollaborationService } from './service.js';
@@ -301,6 +302,15 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
         verifier: requiredString(input, 'verifier'),
       }),
   },
+  'task.cancel': {
+    mutating: true,
+    identity: 'actor',
+    invoke: ({ service }, input) =>
+      service.cancelTask({
+        taskId: requiredString(input, 'taskId'),
+        actor: requiredString(input, 'actor'),
+      }),
+  },
   'task.claim': {
     mutating: true,
     identity: 'agent',
@@ -366,6 +376,17 @@ export const OPERATIONS: Record<string, OperationDefinition> = {
         to: requiredString(input, 'to'),
         taskId: optionalString(input, 'taskId'),
         body: requiredString(input, 'body'),
+        files: parseAttachmentInputs(input['files']),
+      }),
+  },
+  'task.file.add': {
+    mutating: true,
+    identity: 'actor',
+    invoke: ({ service }, input) =>
+      service.addTaskFiles({
+        taskId: requiredString(input, 'taskId'),
+        actor: requiredString(input, 'actor'),
+        files: parseAttachmentInputs(input['files']),
       }),
   },
   'blocker.add': {

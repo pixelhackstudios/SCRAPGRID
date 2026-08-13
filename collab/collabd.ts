@@ -18,7 +18,9 @@ import {
   DaemonRuntimeError,
   mintToken,
   removeDaemonDescriptor,
+  removeFieldTerminalSidecar,
   writeDaemonDescriptor,
+  writeFieldTerminalSidecar,
 } from './runtime.js';
 import { SCHEMA_VERSION } from './schema.js';
 import { CollaborationService, SESSION_STALE_AFTER_MS } from './service.js';
@@ -109,6 +111,7 @@ async function start(): Promise<void> {
     await closed;
     db.close();
     try {
+      removeFieldTerminalSidecar(paths.fieldTerminalPath);
       removeDaemonDescriptor(paths.descriptorPath);
     } catch {
       // Leftover discovery data is harmless — it names a pid that is about to be gone — and must
@@ -151,9 +154,17 @@ async function start(): Promise<void> {
       agent_token: credentials.agent,
       started_at: daemon.started_at,
     });
+    writeFieldTerminalSidecar(paths.fieldTerminalPath, {
+      url: `${daemon.url}/#t=${credentials.browser}`,
+      token: credentials.browser,
+      pid: daemon.pid,
+      repository_identity: daemon.repository_identity,
+      started_at: daemon.started_at,
+    });
 
-    // The field terminal's credential is delivered only here, in the operator's own terminal. A URL
-    // fragment never reaches the server, an access log, or a Referer header.
+    // The field terminal credential is printed here and written only to the owner-only sidecar,
+    // never to the agent descriptor. A URL fragment never reaches the server, an access log, or a
+    // Referer header.
     process.stdout.write(
       [
         `SCRAPGRID collabd listening on ${daemon.url}`,

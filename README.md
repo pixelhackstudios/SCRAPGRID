@@ -80,8 +80,17 @@ architecture but is not treated as an unquestionable specification.
 
 The current implementation uses Node's built-in SQLite API and has been exercised with Node 26.
 
-Start the daemon first, in its own terminal. It is the only process that opens the collaboration database, and
-it must stay running for any `collab` command to work:
+The regular operator path is:
+
+```bash
+./scrapgrid
+```
+
+or `npm run harness`. That installs/builds if needed, starts `collabd` for this repository (or attaches to
+the one already running), bootstraps missing agent worktrees, prints their paths, and opens the Field
+Terminal. It does not launch Claude, Codex, or Grok.
+
+`collabd` can still be started directly when you want the daemon without the launcher:
 
 ```bash
 npm install
