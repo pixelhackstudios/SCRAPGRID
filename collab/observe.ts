@@ -13,7 +13,7 @@
 
 import { closeSync, openSync, readFileSync, readdirSync, readSync, readlinkSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { basename, join, resolve, sep } from 'node:path';
 
 export const MODEL_AGENTS = ['claude', 'codex', 'grok'] as const;
 export type ModelAgentId = (typeof MODEL_AGENTS)[number];
@@ -75,7 +75,7 @@ export interface ObserveHost {
   worktrees(): ObservedWorktree[];
   readFile(path: string): string | null;
   readDir(path: string): string[] | null;
-  readPartial(path: string, offset: number): { data: string; size: number } | null;
+  readPartial(path: string, offset: number): { data: Buffer; size: number } | null;
   listProcPids(): string[];
   processOf(pid: string): ObservedProcess | null;
 }
@@ -140,13 +140,13 @@ export function createFsObserveHost(options: {
     readPartial: (path, offset) => {
       try {
         const size = statSync(path).size;
-        if (size <= offset) return { data: '', size };
+        if (size <= offset) return { data: Buffer.alloc(0), size };
         const fd = openSync(path, 'r');
         try {
           const length = size - offset;
           const buffer = Buffer.alloc(length);
           const bytes = readSync(fd, buffer, 0, length, offset);
-          return { data: buffer.subarray(0, bytes).toString('utf8'), size };
+          return { data: buffer.subarray(0, bytes), size };
         } finally {
           closeSync(fd);
         }
@@ -201,15 +201,12 @@ export function parseClaudeRecord(raw: unknown): ParsedRecord | null {
     const message = isRecord(raw['message']) ? raw['message'] : {};
     const parts = Array.isArray(message['content']) ? message['content'] : [];
     const texts: string[] = [];
-    const thoughts: string[] = [];
     const tools: string[] = [];
     let activity: RuntimeActivity = 'thinking';
     for (const part of parts) {
       if (!isRecord(part)) continue;
       const partType = stringOf(part['type']);
       if (partType === 'thinking' || partType === 'reasoning') {
-        const text = stringOf(part['thinking']) || stringOf(part['text']);
-        if (text) thoughts.push(text);
         activity = 'thinking';
       } else if (partType === 'tool_use' || partType === 'toolUse') {
         const name = stringOf(part['name']) || 'tool';
@@ -239,17 +236,6 @@ export function parseClaudeRecord(raw: unknown): ParsedRecord | null {
         title: '',
         body: clip(texts.join('\n')),
         activity: 'writing',
-        timestamp,
-        sessionId,
-      };
-    }
-    if (thoughts.length > 0) {
-      return {
-        stream: true,
-        kind: 'thought',
-        title: 'Thinking',
-        body: clip(thoughts.join('\n')),
-        activity: 'thinking',
         timestamp,
         sessionId,
       };
@@ -461,9 +447,9 @@ export class RuntimeObserver {
 
     for (const agent of MODEL_AGENTS) {
       const live = processes.get(agent) ?? sidecars.get(agent)?.process ?? null;
-      const sessionId = sidecars.get(agent)?.sessionId ?? this.lastSession.get(agent) ?? null;
+      const sessionId = sidecars.get(agent)?.sessionId ?? null;
       const nativeStatus = sidecars.get(agent)?.status ?? null;
-      this.followTranscripts(agent, scoped, sessionId, now);
+      this.followTranscripts(agent, live, sessionId, now);
 
       const recent = (this.lastActivityAt.get(agent) ?? 0) > now - WORKING_MS;
       const working = nativeStatus === 'working' || nativeStatus === 'busy' || recent;
@@ -579,7 +565,7 @@ export class RuntimeObserver {
     const found = new Map<ModelAgentId, { sessionId?: string; status?: string; process?: ObservedProcess }>();
     this.discoverClaudeSidecars(scoped, processes, found);
     this.discoverGrokSidecars(scoped, processes, found);
-    this.discoverCodexSidecars(scoped, found);
+    this.discoverCodexSidecars(scoped, processes, found);
     return found;
   }
 
@@ -588,23 +574,47 @@ export class RuntimeObserver {
     processes: Map<ModelAgentId, ObservedProcess>,
     found: Map<ModelAgentId, { sessionId?: string; status?: string; process?: ObservedProcess }>,
   ): void {
+    const live = processes.get('claude');
     const dir = join(this.host.home(), '.claude', 'sessions');
-    const names = this.host.readDir(dir) ?? [];
-    for (const name of names) {
+    const candidates: Array<{
+      sessionId?: string;
+      status?: string;
+      process?: ObservedProcess;
+      pid: number;
+      updatedAt: number;
+    }> = [];
+    for (const name of this.host.readDir(dir) ?? []) {
       if (!name.endsWith('.json')) continue;
       const parsed = parseJson(this.host.readFile(join(dir, name)));
       if (!isRecord(parsed)) continue;
       const cwd = stringOf(parsed['cwd']);
       if (!cwd || !this.pathInScope(cwd, scoped)) continue;
       const pid = Number(parsed['pid']);
-      const live = Number.isInteger(pid) ? this.host.processOf(String(pid)) : null;
+      if (!Number.isInteger(pid)) continue;
+      const process = this.host.processOf(String(pid));
       const status = stringOf(parsed['status']);
-      found.set('claude', {
+      candidates.push({
         sessionId: stringOf(parsed['sessionId']) || undefined,
         status: status === 'idle' ? 'idle' : status || undefined,
-        process: live ?? processes.get('claude'),
+        process: process ?? undefined,
+        pid,
+        updatedAt: Number(parsed['updatedAt'] ?? parsed['startedAt'] ?? 0) || 0,
       });
     }
+    const matching = live
+      ? candidates.filter((row) => row.pid === live.pid && row.process)
+      : candidates.filter((row) => row.process);
+    if (matching.length === 0) return;
+    const selected = [...matching].sort((left, right) => {
+      if (left.updatedAt !== right.updatedAt) return right.updatedAt - left.updatedAt;
+      return (left.sessionId ?? '').localeCompare(right.sessionId ?? '');
+    })[0];
+    if (!selected) return;
+    found.set('claude', {
+      sessionId: selected.sessionId,
+      status: selected.status,
+      process: selected.process ?? live,
+    });
   }
 
   private discoverGrokSidecars(
@@ -612,70 +622,87 @@ export class RuntimeObserver {
     processes: Map<ModelAgentId, ObservedProcess>,
     found: Map<ModelAgentId, { sessionId?: string; status?: string; process?: ObservedProcess }>,
   ): void {
+    const live = processes.get('grok');
     const parsed = parseJson(this.host.readFile(join(this.host.home(), '.grok', 'active_sessions.json')));
     if (!Array.isArray(parsed)) return;
+    const candidates: Array<{ sessionId?: string; process?: ObservedProcess; pid: number; openedAt: number }> = [];
     for (const row of parsed) {
       if (!isRecord(row)) continue;
       const cwd = stringOf(row['cwd']);
       if (!cwd || !this.pathInScope(cwd, scoped)) continue;
       const pid = Number(row['pid']);
-      const live = Number.isInteger(pid) ? this.host.processOf(String(pid)) : null;
-      found.set('grok', {
+      if (!Number.isInteger(pid)) continue;
+      const process = this.host.processOf(String(pid));
+      const opened = Date.parse(stringOf(row['opened_at']));
+      candidates.push({
         sessionId: stringOf(row['session_id']) || undefined,
-        process: live ?? processes.get('grok'),
+        process: process ?? undefined,
+        pid,
+        openedAt: Number.isNaN(opened) ? 0 : opened,
       });
     }
+    const matching = live
+      ? candidates.filter((row) => row.pid === live.pid && row.process)
+      : candidates.filter((row) => row.process);
+    if (matching.length === 0) return;
+    const selected = [...matching].sort((left, right) => {
+      if (left.openedAt !== right.openedAt) return right.openedAt - left.openedAt;
+      return (left.sessionId ?? '').localeCompare(right.sessionId ?? '');
+    })[0];
+    if (!selected) return;
+    found.set('grok', { sessionId: selected.sessionId, process: selected.process ?? live });
   }
 
   private discoverCodexSidecars(
     scoped: string[],
+    processes: Map<ModelAgentId, ObservedProcess>,
     found: Map<ModelAgentId, { sessionId?: string; status?: string; process?: ObservedProcess }>,
   ): void {
-    const newest = this.newestCodexRollout(scoped);
+    const live = processes.get('codex');
+    const newest = this.newestCodexRollout(scoped, live?.cwd ?? null);
     if (!newest) return;
-    const current = found.get('codex') ?? {};
-    found.set('codex', { ...current, sessionId: newest.sessionId ?? current.sessionId });
+    found.set('codex', { ...(found.get('codex') ?? {}), sessionId: newest.sessionId, process: live });
   }
 
-  private followTranscripts(agent: ModelAgentId, scoped: string[], sessionId: string | null, now: number): void {
-    for (const path of this.transcriptPaths(agent, scoped, sessionId)) {
+  private followTranscripts(
+    agent: ModelAgentId,
+    live: ObservedProcess | null,
+    sessionId: string | null,
+    now: number,
+  ): void {
+    if (!live) return;
+    for (const path of this.transcriptPaths(agent, live, sessionId)) {
       this.consumeFile(agent, path, now);
     }
   }
 
-  private transcriptPaths(agent: ModelAgentId, scoped: string[], sessionId: string | null): string[] {
-    const paths: string[] = [];
+  private transcriptPaths(agent: ModelAgentId, live: ObservedProcess, sessionId: string | null): string[] {
     if (agent === 'claude') {
-      for (const cwd of scoped) {
-        const dir = claudeProjectDir(this.host.home(), cwd);
-        const names = this.host.readDir(dir) ?? [];
-        const jsonl = names.filter((name) => name.endsWith('.jsonl'));
-        const preferred = sessionId ? jsonl.filter((name) => name.startsWith(sessionId)) : jsonl;
-        const chosen = preferred.length > 0 ? preferred : jsonl;
-        for (const name of chosen) paths.push(join(dir, name));
-      }
+      if (!sessionId) return [];
+      const dir = claudeProjectDir(this.host.home(), live.cwd);
+      return (this.host.readDir(dir) ?? [])
+        .filter((name) => name.endsWith('.jsonl') && name.startsWith(sessionId))
+        .sort()
+        .map((name) => join(dir, name));
     }
     if (agent === 'grok') {
-      for (const cwd of scoped) {
-        const root = grokSessionRoot(this.host.home(), cwd);
-        const sessions = sessionId ? [sessionId] : (this.host.readDir(root) ?? []);
-        for (const id of sessions) {
-          paths.push(join(root, id, 'events.jsonl'));
-          paths.push(join(root, id, 'chat_history.jsonl'));
-        }
-      }
+      if (!sessionId) return [];
+      const root = join(grokSessionRoot(this.host.home(), live.cwd), sessionId);
+      return [join(root, 'events.jsonl'), join(root, 'chat_history.jsonl')];
     }
-    if (agent === 'codex') {
-      const newest = this.newestCodexRollout(scoped);
-      if (newest) paths.push(newest.path);
-    }
-    return paths;
+    const newest = this.newestCodexRollout(this.scopedPaths(), live.cwd);
+    return newest ? [newest.path] : [];
   }
 
-  private newestCodexRollout(scoped: string[]): { path: string; sessionId?: string } | null {
+  private newestCodexRollout(
+    scoped: string[],
+    processCwd: string | null,
+  ): { path: string; sessionId?: string } | null {
+    if (!processCwd) return null;
+    const wanted = resolve(processCwd);
     const root = join(this.host.home(), '.codex', 'sessions');
     const stamp = new Date(this.host.now());
-    const candidates: string[] = [];
+    const candidates: Array<{ path: string; sessionId?: string; timestamp: number }> = [];
     for (const delta of [0, 1, 2]) {
       const day = new Date(stamp.getTime() - delta * 86_400_000);
       const dir = join(
@@ -685,19 +712,26 @@ export class RuntimeObserver {
         String(day.getUTCDate()).padStart(2, '0'),
       );
       for (const name of this.host.readDir(dir) ?? []) {
-        if (name.startsWith('rollout-') && name.endsWith('.jsonl')) candidates.push(join(dir, name));
+        if (!name.startsWith('rollout-') || !name.endsWith('.jsonl')) continue;
+        const path = join(dir, name);
+        const first = firstJsonLine(this.host.readFile(path));
+        if (!isRecord(first)) continue;
+        const payload = isRecord(first['payload']) ? first['payload'] : first;
+        const cwd = stringOf(payload['cwd']);
+        if (!cwd || resolve(cwd) !== wanted || !this.pathInScope(cwd, scoped)) continue;
+        candidates.push({
+          path,
+          sessionId: stringOf(payload['session_id']) || stringOf(payload['id']) || undefined,
+          timestamp: rolloutSortKey(path, first, payload),
+        });
       }
     }
-    let best: { path: string; sessionId?: string } | null = null;
-    for (const path of candidates) {
-      const first = firstJsonLine(this.host.readFile(path));
-      if (!isRecord(first)) continue;
-      const payload = isRecord(first['payload']) ? first['payload'] : first;
-      const cwd = stringOf(payload['cwd']);
-      if (!cwd || !this.pathInScope(cwd, scoped)) continue;
-      best = { path, sessionId: stringOf(payload['session_id']) || stringOf(payload['id']) || undefined };
-    }
-    return best;
+    if (candidates.length === 0) return null;
+    candidates.sort((left, right) => {
+      if (left.timestamp !== right.timestamp) return right.timestamp - left.timestamp;
+      return left.path.localeCompare(right.path);
+    });
+    return candidates[0] ?? null;
   }
 
   private consumeFile(agent: ModelAgentId, path: string, now: number): void {
@@ -861,11 +895,26 @@ function firstJsonLine(text: string | null): unknown {
   return line ? parseJson(line) : null;
 }
 
-function takeCompleteLines(chunk: string): { lines: string[]; consumed: number } {
-  if (!chunk.includes('\n')) return { lines: [], consumed: 0 };
-  const parts = chunk.split('\n');
-  const complete = chunk.endsWith('\n') ? parts.slice(0, -1) : parts.slice(0, -1);
-  const consumed = complete.reduce((sum, line) => sum + line.length + 1, 0);
-  return { lines: complete.filter((line) => line.trim().length > 0), consumed };
+export function takeCompleteLines(chunk: Buffer): { lines: string[]; consumed: number } {
+  const newline = chunk.lastIndexOf(0x0a);
+  if (newline < 0) return { lines: [], consumed: 0 };
+  const complete = chunk.subarray(0, newline + 1);
+  const lines: string[] = [];
+  let start = 0;
+  for (let index = 0; index < complete.length; index += 1) {
+    if (complete[index] !== 0x0a) continue;
+    const line = complete.subarray(start, index);
+    if (line.length > 0) lines.push(line.toString('utf8'));
+    start = index + 1;
+  }
+  return { lines, consumed: complete.length };
+}
+
+function rolloutSortKey(path: string, first: Record<string, unknown>, payload: Record<string, unknown>): number {
+  const stamped = Date.parse(stringOf(first['timestamp']) || stringOf(payload['timestamp']));
+  if (!Number.isNaN(stamped)) return stamped;
+  const match = /rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})/.exec(basename(path));
+  if (!match?.[1]) return 0;
+  return Date.parse(match[1].replace(/T(\d{2})-(\d{2})-(\d{2})$/, 'T$1:$2:$3')) || 0;
 }
 

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -8,12 +8,14 @@ import { createCollaborationHttpServer } from '../collab/http.js';
 import {
   classifyNativeProcess,
   claudeProjectDir,
+  createFsObserveHost,
   grokSessionRoot,
   parseClaudeRecord,
   parseCodexRecord,
   parseGrokChatRecord,
   parseGrokEventRecord,
   RuntimeObserver,
+  takeCompleteLines,
   type ObserveHost,
   type ObservedProcess,
   type ObservedWorktree,
@@ -55,9 +57,10 @@ function memoryHost(options: {
     readPartial: (path: string, offset: number) => {
       const text = host.files.get(path);
       if (text === undefined) return null;
-      const size = text.length;
-      if (size <= offset) return { data: '', size };
-      return { data: text.slice(offset), size };
+      const buffer = Buffer.from(text, 'utf8');
+      const size = buffer.length;
+      if (size <= offset) return { data: Buffer.alloc(0), size };
+      return { data: buffer.subarray(offset), size };
     },
     listProcPids: () => host.processes.map((process) => String(process.pid)),
     processOf: (pid: string) => host.processes.find((process) => String(process.pid) === pid) ?? null,
@@ -103,6 +106,17 @@ test('transcript parsers extract thinking, tools, and assistant output', () => {
   assert.equal(claude?.kind, 'tool');
   assert.equal(claude?.activity, 'reading');
   assert.match(claude?.title ?? '', /read_file/);
+  assert.doesNotMatch(claude?.body ?? '', /Need to read App\.tsx/);
+
+  const thinkingOnly = parseClaudeRecord({
+    type: 'assistant',
+    timestamp: '2026-08-13T03:00:01.500Z',
+    sessionId: 'sess-1',
+    message: { content: [{ type: 'thinking', thinking: 'SECRET PRIVATE CHAIN OF THOUGHT' }] },
+  });
+  assert.equal(thinkingOnly?.stream, false);
+  assert.equal(thinkingOnly?.activity, 'thinking');
+  assert.equal(thinkingOnly?.body, '');
 
   const grokPhase = parseGrokEventRecord({ type: 'phase_changed', phase: 'thinking', ts: '2026-08-13T03:00:02.000Z' });
   assert.equal(grokPhase?.stream, false);
@@ -267,4 +281,197 @@ test('field terminal snapshot and /api/runtime expose the observation plane', as
     db.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('JSONL consumption uses byte offsets so emoji does not skip or duplicate lines', () => {
+  const first = Buffer.from(`${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'hello 🔥' }] } })}\n`, 'utf8');
+  const second = Buffer.from(`${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'next' }] } })}\n`, 'utf8');
+  assert.ok(first.length > first.toString('utf8').length, 'emoji must make UTF-8 bytes exceed JS string length');
+  const torn = takeCompleteLines(Buffer.concat([first, second.subarray(0, 8)]));
+  assert.equal(torn.consumed, first.length);
+  assert.equal(torn.lines.length, 1);
+  const whole = takeCompleteLines(Buffer.concat([first, second]));
+  assert.equal(whole.consumed, first.length + second.length);
+  assert.equal(whole.lines.length, 2);
+});
+
+test('real filesystem tail resumes after a multibyte line without duplicating it', () => {
+  const root = mkdtempSync(join(tmpdir(), 'scrapgrid-observe-bytes-'));
+  try {
+    const path = join(root, 'session.jsonl');
+    const first = `${JSON.stringify({ ok: '🔥' })}\n`;
+    writeFileSync(path, first);
+    const host = createFsObserveHost({ repoRoot: root, worktrees: () => [], home: root });
+    const start = host.readPartial(path, 0);
+    assert.ok(start);
+    const parsed = takeCompleteLines(start.data);
+    assert.equal(parsed.consumed, Buffer.byteLength(first));
+    appendFileSync(path, `${JSON.stringify({ ok: 'next' })}\n`);
+    const more = host.readPartial(path, parsed.consumed);
+    assert.ok(more);
+    const next = takeCompleteLines(more.data);
+    assert.equal(next.lines.length, 1);
+    assert.match(next.lines[0] ?? '', /next/);
+    assert.doesNotMatch(next.lines.join('\n'), /🔥/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('observer does not replay historical Claude transcripts from other sessions or worktrees', () => {
+  const repo = '/repo';
+  const worktree = '/repo/worktrees/claude';
+  const home = '/home/me';
+  const liveDir = claudeProjectDir(home, repo);
+  const staleDir = claudeProjectDir(home, worktree);
+  const host = memoryHost({
+    home,
+    repoRoot: repo,
+    worktrees: [{ agent_id: 'claude', path: worktree }],
+    processes: [{ pid: 42, cwd: repo, comm: 'claude', cmdline: 'claude' }],
+    files: {
+      [join(home, '.claude', 'sessions', '99.json')]: JSON.stringify({
+        pid: 99,
+        sessionId: 'sess-old',
+        cwd: worktree,
+        status: 'idle',
+        updatedAt: 9,
+      }),
+      [join(home, '.claude', 'sessions', '42.json')]: JSON.stringify({
+        pid: 42,
+        sessionId: 'sess-live',
+        cwd: repo,
+        status: 'idle',
+        updatedAt: 1,
+      }),
+      [join(staleDir, 'sess-old.jsonl')]: `${JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-08-12T03:00:00.000Z',
+        sessionId: 'sess-old',
+        message: { content: [{ type: 'text', text: 'yesterday leftover from another session' }] },
+      })}\n`,
+      [join(liveDir, 'unrelated.jsonl')]: `${JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-08-11T03:00:00.000Z',
+        sessionId: 'sess-other',
+        message: { content: [{ type: 'text', text: 'orphaned historical transcript' }] },
+      })}\n`,
+      [join(liveDir, 'sess-live.jsonl')]: `${JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-08-13T03:00:04.000Z',
+        sessionId: 'sess-live',
+        message: { content: [{ type: 'text', text: 'current live output' }] },
+      })}\n`,
+    },
+  });
+  const view = new RuntimeObserver(host).tick();
+  assert.equal(view.runtimes.find((row) => row.agent_id === 'claude')?.native_session_id, 'sess-live');
+  assert.ok(view.events.some((event) => event.body.includes('current live output')));
+  assert.equal(view.events.some((event) => event.body.includes('yesterday leftover')), false);
+  assert.equal(view.events.some((event) => event.body.includes('orphaned historical')), false);
+});
+
+test('observer reports Claude presence without replaying history when no current transcript is known', () => {
+  const repo = '/repo';
+  const home = '/home/me';
+  const project = claudeProjectDir(home, repo);
+  const host = memoryHost({
+    home,
+    repoRoot: repo,
+    processes: [{ pid: 42, cwd: repo, comm: 'claude', cmdline: 'claude' }],
+    files: {
+      [join(project, 'sess-old.jsonl')]: `${JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-08-11T03:00:00.000Z',
+        sessionId: 'sess-old',
+        message: { content: [{ type: 'text', text: 'stale session should stay buried' }] },
+      })}\n`,
+    },
+  });
+  const view = new RuntimeObserver(host).tick();
+  assert.equal(view.runtimes.find((row) => row.agent_id === 'claude')?.presence, 'connected');
+  assert.equal(view.runtimes.find((row) => row.agent_id === 'claude')?.native_session_id, null);
+  assert.equal(view.events.some((event) => event.body.includes('stale session should stay buried')), false);
+});
+
+test('observer tails the newest Codex rollout for the live process cwd, not readdir order', () => {
+  const repo = '/repo';
+  const home = '/home/me';
+  const day = join(home, '.codex', 'sessions', '2026', '08', '13');
+  const older = join(day, 'rollout-2026-08-13T01-00-00-aaaa.jsonl');
+  const newer = join(day, 'rollout-2026-08-13T02-00-00-bbbb.jsonl');
+  const otherCwd = join(day, 'rollout-2026-08-13T03-00-00-cccc.jsonl');
+  const host = memoryHost({
+    now: Date.parse('2026-08-13T03:00:00.000Z'),
+    home,
+    repoRoot: repo,
+    processes: [{ pid: 9, cwd: repo, comm: 'codex', cmdline: 'codex' }],
+    files: {
+      [newer]: `${JSON.stringify({
+        timestamp: '2026-08-13T02:00:00.000Z',
+        type: 'session_meta',
+        payload: { cwd: repo, session_id: 'new', timestamp: '2026-08-13T02:00:00.000Z' },
+      })}\n${JSON.stringify({
+        timestamp: '2026-08-13T02:00:01.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'from newest rollout' }] },
+      })}\n`,
+      [older]: `${JSON.stringify({
+        timestamp: '2026-08-13T01:00:00.000Z',
+        type: 'session_meta',
+        payload: { cwd: repo, session_id: 'old', timestamp: '2026-08-13T01:00:00.000Z' },
+      })}\n${JSON.stringify({
+        timestamp: '2026-08-13T01:00:01.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'from older rollout' }] },
+      })}\n`,
+      [otherCwd]: `${JSON.stringify({
+        timestamp: '2026-08-13T03:00:00.000Z',
+        type: 'session_meta',
+        payload: { cwd: '/elsewhere', session_id: 'other', timestamp: '2026-08-13T03:00:00.000Z' },
+      })}\n${JSON.stringify({
+        timestamp: '2026-08-13T03:00:01.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'from other cwd' }] },
+      })}\n`,
+    },
+  });
+  const view = new RuntimeObserver(host).tick();
+  assert.equal(view.runtimes.find((row) => row.agent_id === 'codex')?.native_session_id, 'new');
+  assert.ok(view.events.some((event) => event.body.includes('from newest rollout')));
+  assert.equal(view.events.some((event) => event.body.includes('from older rollout')), false);
+  assert.equal(view.events.some((event) => event.body.includes('from other cwd')), false);
+});
+
+test('observer streams assistant output and tools but not raw Claude thinking bodies', () => {
+  const repo = '/repo';
+  const home = '/home/me';
+  const transcript = join(claudeProjectDir(home, repo), 'sess-live.jsonl');
+  const host = memoryHost({
+    home,
+    repoRoot: repo,
+    processes: [{ pid: 42, cwd: repo, comm: 'claude', cmdline: 'claude' }],
+    files: {
+      [join(home, '.claude', 'sessions', '42.json')]: JSON.stringify({
+        pid: 42,
+        sessionId: 'sess-live',
+        cwd: repo,
+        status: 'busy',
+      }),
+      [transcript]: `${JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-08-13T03:00:04.000Z',
+        sessionId: 'sess-live',
+        message: { content: [{ type: 'thinking', thinking: 'do not leak this private reasoning' }] },
+      })}\n${JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-08-13T03:00:05.000Z',
+        sessionId: 'sess-live',
+        message: { content: [{ type: 'text', text: 'Visible answer only.' }] },
+      })}\n`,
+    },
+  });
+  const view = new RuntimeObserver(host).tick();
+  assert.ok(view.events.some((event) => event.kind === 'output' && event.body.includes('Visible answer only.')));
+  assert.equal(view.events.some((event) => event.body.includes('do not leak this private reasoning')), false);
 });
